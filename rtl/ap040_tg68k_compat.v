@@ -17,7 +17,13 @@ module ap040_tg68k_compat
 	parameter AP040_HAS_MMU      = 1,
 	parameter AP040_HAS_FPU      = 1,
 	parameter AP040_ENABLE_CACHE = 1,
-	parameter AP040_FAST_SIM     = 0
+	parameter AP040_FAST_SIM     = 0,
+	// X3.3 A2b-1: stores to cacheable pages are acknowledged early and
+	// drained by the cache.  0 is the synchronous-store A/B reference.
+	parameter AP040_POST_STORES  = 1,
+	// X3.4 A1: line fills over the fill channel when fill_ena says the
+	// wrapper serves it.  0 is the adapter-only A/B reference.
+	parameter AP040_FILL_CHANNEL = 1
 )
 (
 	input         clk,
@@ -53,6 +59,20 @@ module ap040_tg68k_compat
 	output        nresetout,
 	output [2:0]  fc,
 	output        nmi_ack_toggle,
+	// Line-fill channel to the wrapper (plan X3.4, A1).  The wrapper says
+	// which cacheable windows the channel serves: the Zorro windows live
+	// in DDR3 (fill_ena_zorro, always once ddram_ctrl has its port), the
+	// chip window in the SDRAM (fill_ena_chip, dual-SDRAM builds only).
+	// A fill outside a served window takes the adapter path as before.
+	// A request carries the physical line address; the answer is the
+	// whole line under a level-held ack, or a level-held error.
+	input         fill_ena_zorro,
+	input         fill_ena_chip,
+	output        fill_req,
+	output [31:4] fill_addr,
+	input [127:0] fill_data,
+	input         fill_ack,
+	input         fill_err,
 	// Cache-maintenance event for systems that compile out ap040_cache and
 	// use an external cache on the TG68K bus instead.
 	output        cache_maint_req,
@@ -87,6 +107,24 @@ module ap040_tg68k_compat
 	output [255:0] debug_status,
 	output [127:0] debug_status2
 );
+
+// Clock enable for everything above the bus adapter (plan X3.3, A2b-0).
+// cpu_wrapper's clkena_in is the BUS WAIT: idle, or a qualified
+// completion, or a bus error.  The adapter must keep it -- its outputs
+// change only on the wrapper's qualified edges and its 16-bit sub-cycle
+// sequencing is written against them.  The core, MMU and cache do not
+// need it: each of their FSMs polls its acknowledge, and every signal
+// that crosses from the adapter or the walker bridge (mem_ack, berr,
+// c_flt, walker s_ack) was already written so that a gated consumer
+// could not miss it, so a free-running one cannot either.  Gating them
+// froze the whole stack for the length of every external transaction,
+// which is what made a posted store worthless: the core would take one
+// step and stand still until the store's last half had landed.  With a
+// free enable, work that needs no port -- a released FPU op, a multiply,
+// the fetch queue's bookkeeping -- proceeds during the wait.  This is
+// the seed of P2's divider; a 4:1 enable on clk_114 drives the same
+// wire later.
+wire        ce_core = 1'b1;
 
 // core to MMU
 wire        mem_req;
@@ -143,6 +181,9 @@ wire [31:0] b_rdata;
 // CINV sideband
 wire        cinv_req, cinv_ic, cinv_dc, cinv_done;
 
+// posted-store sideband from the cache (A2b-1)
+wire        post_busy, post_err;
+
 // control registers and PTEST/PFLUSH sideband
 wire [31:0] w_tc, w_urp, w_srp, w_itt0, w_itt1, w_dtt0, w_dtt1;
 wire        pt_req, pt_write, pt_done;
@@ -161,7 +202,7 @@ ap040_core #(
 ) core (
 	.clk(clk),
 	.nreset(nreset),
-	.ce(clkena_in),
+	.ce(ce_core),
 
 	.mem_req(mem_req),
 	.mem_write(mem_write),
@@ -173,6 +214,8 @@ ap040_core #(
 	.mem_ack(mem_ack),
 	.mem_rdata(mem_rdata),
 	.mem_flt(mem_flt),
+	.post_busy(post_busy),
+	.post_err(post_err),
 
 	.tc_out(w_tc),
 	.urp_out(w_urp),
@@ -216,7 +259,7 @@ ap040_core #(
 ap040_mmu mmu (
 	.clk(clk),
 	.nreset(nreset),
-	.ce(clkena_in),
+	.ce(ce_core),
 
 	.tc(w_tc),
 	.urp(w_urp),
@@ -233,6 +276,7 @@ ap040_mmu mmu (
 	.c_addr(mem_addr),
 	.c_wdata(mem_wdata),
 	.c_fc(mem_fc),
+	.walk_hold(post_busy),
 	.c_ack(mem_ack),
 	.c_rdata(mem_rdata),
 	.c_flt(mem_flt_mmu),
@@ -339,10 +383,22 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		cache_chip;
 	wire cache_allow = cache_allow_all | cache_win;
 
-	ap040_cache cache (
+	ap040_cache #(
+		.POST_STORES(AP040_POST_STORES),
+		.FILL_CHANNEL(AP040_FILL_CHANNEL)
+	) cache (
 		.clk(clk),
 		.nreset(nreset),
-		.ce(clkena_in),
+		.ce(ce_core),
+		// the channel serves the cacheable windows the wrapper names;
+		// cache_allow_all (the benches) counts as the Zorro capability
+		.fill_ok((fill_ena_zorro & (cache_win & ~cache_chip | cache_allow_all)) |
+		         (fill_ena_chip & cache_chip)),
+		.fill_req(fill_req),
+		.fill_addr(fill_addr),
+		.fill_data(fill_data),
+		.fill_ack(fill_ack),
+		.fill_err(fill_err),
 
 		.ie(cacr_out[15]),
 		.de(cacr_out[31]),
@@ -375,7 +431,9 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.m_fc(b_fc),
 		.m_ack(b_ack),
 		.m_rdata(b_rdata),
-		.m_err(berr)
+		.m_err(berr),
+		.post_busy(post_busy),
+		.post_err(post_err)
 	);
 end
 else begin : g_nocache
@@ -393,6 +451,12 @@ else begin : g_nocache
 	assign mm_ack   = b_ack;
 	assign mm_rdata = b_rdata;
 	assign cinv_done = 1'b1;
+	assign post_busy = 1'b0;    // no cache, no buffer: stores are synchronous
+	assign post_err  = 1'b0;
+	assign fill_req  = 1'b0;    // no cache, no line fills
+	assign fill_addr = 28'd0;
+	wire unused_fill = fill_ena_zorro | fill_ena_chip | fill_ack | fill_err |
+	                   (|fill_data);
 	wire unused_nc = mm_nocache | cinv_req | cinv_ic | cinv_dc |
 	                 (|cacr_out);
 end

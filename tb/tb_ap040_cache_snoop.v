@@ -24,10 +24,18 @@
 //             must not validate the partly-filled line, and must leave
 //             the cache able to serve the exception handler's own
 //             accesses.  The error is swept across all four beats.
+//   T10 (X3.2) a store that hits a resident data line updates it in
+//             place: the read after it returns the stored value with NO
+//             bus read (the bench counts memory reads), byte and word
+//             lanes merge, a store to a non-resident line does not
+//             allocate, a misaligned store still invalidates, and a
+//             snoop swept across the store window leaves the value
+//             readable and a later DMA write visible.
 //
 // Every test reprograms memory behind the cache and requires the next
 // read to return the NEW value: a stale cached longword is the failure
-// signature throughout.
+// signature throughout (T10 adds the opposite direction: a value that
+// must be served WITHOUT going to memory).
 
 `timescale 1ns/1ps
 
@@ -53,7 +61,7 @@ wire [31:0] c_rdata;
 wire        m_req, m_write, m_instr;
 wire  [1:0] m_size;
 wire [31:0] m_addr, m_wdata;
-reg  [1:0]  mem_lat = 2'd2;   // cycles before m_ack; 0 models a
+reg  [2:0]  mem_lat = 3'd2;   // cycles before m_ack; 0 models a
                               // downstream controller-cache HIT, which is
                               // how fast this port can really answer
 reg         m_ack = 0;
@@ -62,6 +70,47 @@ reg         m_err = 0;
 
 reg         s_stb = 0;
 reg  [31:0] s_addr = 0;
+
+// POST=0 is the negative control for T11: every store synchronous,
+// which must FAIL the posted-store checks.
+parameter   POST = 1;
+wire        post_busy, post_err;
+
+// Line-fill channel model (plan X3.4, A1).  fill_ok is raised only by
+// T12; with it low every fill takes the adapter path and T1-T11 run as
+// before.  The responder answers a request after FILL_LAT cycles with
+// the four longwords of the line from mem, holding fill_ack until the
+// request drops -- or fill_err instead when ferr_arm matches the line.
+// FILLC=0 is T12's negative control: the channel is compiled out.
+parameter   FILLC = 1;
+parameter   FILL_LAT = 6;
+reg         fill_ok = 0;
+wire        fill_req;
+wire [31:4] fill_addr;
+reg [127:0] fill_data = 0;
+reg         fill_ack = 0;
+reg         fill_err = 0;
+reg         ferr_arm = 0;
+reg  [31:4] ferr_addr = 0;
+integer     f_count = 0;         // channel fills served
+integer     f_lat = 0;
+always @(posedge clk) begin
+	if (!fill_req) begin
+		fill_ack <= 0;
+		fill_err <= 0;
+		f_lat <= 0;
+	end
+	else if (!fill_ack && !fill_err) begin
+		if (f_lat != FILL_LAT) f_lat <= f_lat + 1;
+		else if (ferr_arm && fill_addr == ferr_addr) fill_err <= 1;
+		else begin
+			fill_data <= {mem[{fill_addr[15:4], 2'd0}], mem[{fill_addr[15:4], 2'd1}],
+			              mem[{fill_addr[15:4], 2'd2}], mem[{fill_addr[15:4], 2'd3}]};
+			fill_ack <= 1;
+			f_count = f_count + 1;
+		end
+	end
+end
 
 reg         snoop_storm = 0;
 reg         s_stb_storm = 0;
@@ -73,9 +122,12 @@ always @(negedge clk) begin
 	else             s_stb_storm <= 1'b0;
 end
 
-ap040_cache dut
+ap040_cache #(.POST_STORES(POST), .FILL_CHANNEL(FILLC)) dut
 (
 	.clk(clk), .nreset(nreset), .ce(ce),
+	.post_busy(post_busy), .post_err(post_err),
+	.fill_ok(fill_ok), .fill_req(fill_req), .fill_addr(fill_addr),
+	.fill_data(fill_data), .fill_ack(fill_ack), .fill_err(fill_err),
 	.ie(1'b1), .de(1'b1),
 	.cinv_req(cinv_req), .cinv_ic(cinv_ic), .cinv_dc(cinv_dc),
 	.cinv_done(cinv_done),
@@ -96,7 +148,15 @@ integer errors = 0;
 // their ack cycles are deterministic for the sweep offsets below
 //---------------------------------------------------------------------------
 reg [31:0] mem [0:16383];   // 64KB
-reg  [1:0] mlat = 0;
+reg  [2:0] mlat = 0;
+integer    m_read_count = 0; // memory reads served: a hit issues none
+// bus order: every acknowledged transfer takes the next sequence number,
+// so "the read reached memory after the store" is a comparison
+integer    bus_seq = 0;
+integer    last_wr_seq = -1;
+integer    last_rd_seq = -1;
+reg        post_err_seen = 0;
+always @(posedge clk) if (post_err) post_err_seen = 1;
 
 // Fault injection: while err_arm is set, an access whose address matches
 // err_addr (line-aligned, beat selected by err_beat) reports a bus error
@@ -124,10 +184,27 @@ always @(posedge clk) begin
 			else begin
 				m_ack <= 1;
 				if (m_write) begin
-					// longword stores only in this bench
-					mem[m_addr[15:2]] <= m_wdata;
+					// big-endian lanes, the adapter's view of a store
+					case (m_size)
+						2'd0: case (m_addr[1:0])
+							2'd0: mem[m_addr[15:2]][31:24] <= m_wdata[7:0];
+							2'd1: mem[m_addr[15:2]][23:16] <= m_wdata[7:0];
+							2'd2: mem[m_addr[15:2]][15:8]  <= m_wdata[7:0];
+							default: mem[m_addr[15:2]][7:0] <= m_wdata[7:0];
+						endcase
+						2'd1: if (m_addr[1]) mem[m_addr[15:2]][15:0]  <= m_wdata[15:0];
+						      else           mem[m_addr[15:2]][31:16] <= m_wdata[15:0];
+						default: mem[m_addr[15:2]] <= m_wdata;
+					endcase
+					last_wr_seq = bus_seq;
+					bus_seq = bus_seq + 1;
 				end
-				else m_rdata <= mem[m_addr[15:2]];
+				else begin
+					m_rdata <= mem[m_addr[15:2]];
+					m_read_count = m_read_count + 1;
+					last_rd_seq = bus_seq;
+					bus_seq = bus_seq + 1;
+				end
 			end
 		end
 	end
@@ -238,6 +315,107 @@ task cpu_ci_read_then_write;
 	end
 endtask
 
+// A store of the given size (0 byte, 1 word, 2 long), data right-aligned
+// the way the core presents it.
+task cpu_write_sz;
+	input [31:0] a;
+	input [31:0] d;
+	input  [1:0] sz;
+	integer guard;
+	begin
+		@(negedge clk);
+		c_req = 1; c_write = 1; c_size = sz; c_addr = a; c_wdata = d;
+		guard = 0;
+		while (!(c_ack && ce) && guard < 200) begin
+			@(posedge clk);
+			guard = guard + 1;
+		end
+		if (guard >= 200) begin
+			$display("FAIL: write timeout at %h", a);
+			errors = errors + 1;
+		end
+		@(negedge clk);
+		c_req = 0; c_write = 0; c_size = 2'b10;
+		@(posedge clk);
+	end
+endtask
+
+// A store that also reports whether the cache acknowledged it BEFORE
+// memory did: the posted-store signature.  Both acknowledges are sampled
+// with the same one-cycle skew, so a synchronous store (c_ack forwarded
+// from m_ack) reports 0 and a posted one reports 1.
+task cpu_write_watch;
+	input  [31:0] a;
+	input  [31:0] d;
+	input   [1:0] sz;
+	output        ack_first;
+	integer guard;
+	reg macked;
+	begin
+		@(negedge clk);
+		c_req = 1; c_write = 1; c_size = sz; c_addr = a; c_wdata = d;
+		guard = 0; macked = 0;
+		while (!(c_ack && ce) && guard < 200) begin
+			@(posedge clk);
+			guard = guard + 1;
+			if (m_ack) macked = 1;
+		end
+		if (guard >= 200) begin
+			$display("FAIL: watched write timeout at %h", a);
+			errors = errors + 1;
+		end
+		ack_first = !macked && !m_ack;
+		@(negedge clk);
+		c_req = 0; c_write = 0; c_size = 2'b10;
+		@(posedge clk);
+	end
+endtask
+
+// Wait until a posted store has reached memory.  A test that inspects
+// memory behind a store, or changes memory "underneath" it, must call
+// this first: the acknowledge no longer means the write has landed.
+task drain;
+	integer guard;
+	begin
+		guard = 0;
+		while (post_busy && guard < 300) begin
+			@(posedge clk); guard = guard + 1;
+		end
+		if (post_busy) begin
+			$display("FAIL: posted store never drained");
+			errors = errors + 1;
+		end
+		repeat (2) @(posedge clk);
+	end
+endtask
+
+// A read that also reports whether a posted store was still draining
+// when it was acknowledged: the decoupled-drain signature (A1-3a).
+task cpu_read_watch;
+	input  [31:0] a;
+	output [31:0] d;
+	output        busy_at_ack;
+	integer guard;
+	begin
+		@(negedge clk);
+		c_req = 1; c_write = 0; c_size = 2'b10; c_addr = a;
+		guard = 0;
+		while (!(c_ack && ce) && guard < 300) begin
+			@(posedge clk);
+			guard = guard + 1;
+		end
+		if (guard >= 300) begin
+			$display("FAIL: watched read timeout at %h", a);
+			errors = errors + 1;
+		end
+		d = c_rdata;
+		busy_at_ack = post_busy;
+		@(negedge clk);
+		c_req = 0;
+		@(posedge clk);
+	end
+endtask
+
 task cpu_write;
 	input [31:0] a;
 	input [31:0] d;
@@ -333,6 +511,8 @@ endtask
 
 integer i, off;
 integer guard5;
+integer rd0;
+reg     ackfirst;
 reg [31:0] d;
 reg [31:0] d2;
 
@@ -622,6 +802,429 @@ initial begin
 	cpu_ci_read_then_write(32'h0000_D800, 32'h0000_DC00);
 	snoop_storm = 0;
 	mem_lat = 2'd2;
+	repeat (6) @(posedge clk);
+
+	//------------------------------------------------------------------
+	// T10 (plan X3.2): a store that HITS a resident data line updates
+	// the line in place.  Write-through, no write-allocate -- but no
+	// eviction either: MC68040UM section 7, a write hit updates the
+	// cache line and always goes to memory.  The old cache cleared the
+	// whole row on every store, so each store to cached data cost the
+	// next load a full refill.
+	//
+	// The read after the store returns the stored value under BOTH
+	// models (write-through keeps memory right); what discriminates is
+	// that it must issue NO bus read.  The bench counts memory reads.
+	// On the pre-change cache the row was invalidated and the read
+	// refills: FAIL.
+	//
+	// Swept over both memory speeds: with the controller-hit latency
+	// the memory acknowledge lands in the cycle the merge is decided.
+	//------------------------------------------------------------------
+	for (off = 0; off < 2; off = off + 1) begin
+		mem_lat = off[0] ? 2'd0 : 2'd2;
+		cinv_req = 1; cinv_ic = 1; cinv_dc = 1;
+		@(negedge clk);
+		while (!cinv_done) @(posedge clk);
+		cinv_req = 0;
+		repeat (20) @(posedge clk);
+
+		// long store into a resident line
+		expect_read(32'h0000_E000, mem[32'hE000>>2], 10);
+		cpu_write_sz(32'h0000_E004, 32'hCAFE_1234, 2'd2);
+		drain;
+		if (mem[32'hE004>>2] !== 32'hCAFE_1234) begin
+			$display("FAIL test 10 (lat %0d): write-through lost the store, memory holds %h",
+			         mem_lat, mem[32'hE004>>2]);
+			errors = errors + 1;
+		end
+		rd0 = m_read_count;
+		expect_read(32'h0000_E004, 32'hCAFE_1234, 10);
+		if (m_read_count != rd0) begin
+			$display("FAIL test 10 (lat %0d): long store evicted its line -- the read after it refilled (%0d bus reads)",
+			         mem_lat, m_read_count - rd0);
+			errors = errors + 1;
+		end
+
+		// byte lane 1 and the low word: the merge must keep the other
+		// lanes.  Memory is the reference -- the adapter model merges
+		// lanes the same way the real bus does.
+		cpu_write_sz(32'h0000_E009, 32'h0000_00A5, 2'd0);
+		drain;
+		rd0 = m_read_count;
+		expect_read(32'h0000_E008, mem[32'hE008>>2], 10);
+		if (m_read_count != rd0) begin
+			$display("FAIL test 10 (lat %0d): byte store evicted its line", mem_lat);
+			errors = errors + 1;
+		end
+		cpu_write_sz(32'h0000_E00A, 32'h0000_BEEF, 2'd1);
+		drain;
+		rd0 = m_read_count;
+		expect_read(32'h0000_E008, mem[32'hE008>>2], 10);
+		if (m_read_count != rd0) begin
+			$display("FAIL test 10 (lat %0d): word store evicted its line", mem_lat);
+			errors = errors + 1;
+		end
+		if (mem[32'hE008>>2][23:16] !== 8'hA5 || mem[32'hE008>>2][15:0] !== 16'hBEEF) begin
+			$display("FAIL test 10 (lat %0d): lane merge reference wrong: memory %h",
+			         mem_lat, mem[32'hE008>>2]);
+			errors = errors + 1;
+		end
+
+		// no write-allocate: a store to a line that is NOT resident must
+		// not bring it in, so the read after it is a genuine refill
+		cpu_write_sz(32'h0000_E404, 32'h0E40_0000 + off, 2'd2);
+		rd0 = m_read_count;
+		expect_read(32'h0000_E404, 32'h0E40_0000 + off, 10);
+		if (m_read_count == rd0) begin
+			$display("FAIL test 10 (lat %0d): store to a non-resident line allocated it", mem_lat);
+			errors = errors + 1;
+		end
+
+		// a misaligned store keeps the invalidate path: the line it
+		// touches must be gone (memory changes underneath, refetch)
+		expect_read(32'h0000_E800, mem[32'hE800>>2], 10);
+		cpu_write_sz(32'h0000_E802, 32'h5A5A_A5A5, 2'd2);   // long at +2
+		drain;
+		mem[32'hE800>>2] = 32'h0E80_0000 + off;
+		mem[32'hE804>>2] = 32'h0E84_0000 + off;
+		expect_read(32'h0000_E800, 32'h0E80_0000 + off, 10);
+		expect_read(32'h0000_E804, 32'h0E84_0000 + off, 10);
+	end
+	mem_lat = 2'd2;
+
+	// T10b: a snoop swept across the store's acceptance and merge
+	// window, first on ANOTHER line of the same row (port B writes the
+	// row the lookup is reading), then on the store's own line.  The
+	// stored value must read back either way, and a DMA write that
+	// follows, announced by its snoop, must be visible.
+	for (off = 0; off < 10; off = off + 1) begin
+		expect_read(32'h0000_F000, mem[32'hF000>>2], 10);
+		expect_read(32'h0000_F400, mem[32'hF400>>2], 10);   // same row
+		fork
+			cpu_write_sz(32'h0000_F004, 32'hF0F0_0000 + off, 2'd2);
+			begin
+				repeat (off) @(negedge clk);
+				snoop(off[0] ? 32'h0000_F000 : 32'h0000_F400);
+			end
+		join
+		expect_read(32'h0000_F004, 32'hF0F0_0000 + off, 10);
+		expect_read(32'h0000_F400, mem[32'hF400>>2], 10);
+		drain;
+		mem[32'hF004>>2] = 32'hD3A0_0000 + off;
+		snoop(32'h0000_F000);
+		expect_read(32'h0000_F004, 32'hD3A0_0000 + off, 10);
+	end
+
+	// T10c: the same store under constant chipset traffic, both speeds
+	snoop_storm = 1;
+	expect_read(32'h0000_F800, mem[32'hF800>>2], 10);
+	cpu_write_sz(32'h0000_F808, 32'hF8F8_F8F8, 2'd2);
+	expect_read(32'h0000_F808, 32'hF8F8_F8F8, 10);
+	mem_lat = 2'd0;
+	cpu_write_sz(32'h0000_F80C, 32'hF80C_F80C, 2'd2);
+	expect_read(32'h0000_F80C, 32'hF80C_F80C, 10);
+	snoop_storm = 0;
+	mem_lat = 2'd2;
+	repeat (6) @(posedge clk);
+
+	//------------------------------------------------------------------
+	// T11 (plan X3.3, A2b-1): a store to a cacheable page is
+	// acknowledged before memory has taken it and drains from a latched
+	// copy.  POST=0 (the bench parameter) is the negative control: every
+	// store synchronous, and T11a must fail.
+	//------------------------------------------------------------------
+	// T11a: early acknowledge, then the drain lands the value -- at both
+	// memory speeds
+	for (off = 0; off < 2; off = off + 1) begin
+		mem_lat = off[0] ? 2'd0 : 2'd2;
+		cpu_write_watch(32'h0000_1F00, 32'h11A0_0000 + off, 2'd2, ackfirst);
+		if (!ackfirst) begin
+			$display("FAIL test 11 (lat %0d): store was not acknowledged before memory took it (not posted)",
+			         mem_lat);
+			errors = errors + 1;
+		end
+		guard5 = 0;
+		while (post_busy && guard5 < 300) begin
+			@(posedge clk); guard5 = guard5 + 1;
+		end
+		if (post_busy) begin
+			$display("FAIL test 11 (lat %0d): posted store never drained", mem_lat);
+			errors = errors + 1;
+		end
+		if (mem[32'h1F00>>2] !== 32'h11A0_0000 + off) begin
+			$display("FAIL test 11 (lat %0d): drained value %h expected %h",
+			         mem_lat, mem[32'h1F00>>2], 32'h11A0_0000 + off);
+			errors = errors + 1;
+		end
+	end
+	mem_lat = 2'd2;
+
+	// T11b: ordering.  A read presented right behind a posted store to
+	// a different, non-resident line must reach memory AFTER the store.
+	cpu_write_sz(32'h0000_1F40, 32'h11B0_1F40, 2'd2);
+	expect_read(32'h0000_1F80, mem[32'h1F80>>2], 11);
+	if (!(last_wr_seq >= 0 && last_rd_seq > last_wr_seq)) begin
+		$display("FAIL test 11: a read overtook the posted store on the bus (wr seq %0d, rd seq %0d)",
+		         last_wr_seq, last_rd_seq);
+		errors = errors + 1;
+	end
+	if (mem[32'h1F40>>2] !== 32'h11B0_1F40) begin
+		$display("FAIL test 11: posted store lost: memory %h", mem[32'h1F40>>2]);
+		errors = errors + 1;
+	end
+
+	// T11c: read after write to the SAME word of a resident line: the
+	// merged line serves it once the drain is over, with no bus read
+	expect_read(32'h0000_1FC0, mem[32'h1FC0>>2], 11);
+	cpu_write_sz(32'h0000_1FC4, 32'h11C0_1FC4, 2'd2);
+	rd0 = m_read_count;
+	expect_read(32'h0000_1FC4, 32'h11C0_1FC4, 11);
+	if (m_read_count != rd0) begin
+		$display("FAIL test 11: read after a posted store to a resident line refilled it");
+		errors = errors + 1;
+	end
+
+	// T11d: a cache-inhibited store is NOT posted: IO writes complete
+	// before the next instruction, as they must
+	c_nocache = 1;
+	cpu_write_watch(32'h0000_1E00, 32'h11D0_1E00, 2'd2, ackfirst);
+	c_nocache = 0;
+	if (ackfirst) begin
+		$display("FAIL test 11: cache-inhibited store was posted");
+		errors = errors + 1;
+	end
+
+	// T11e: a bus error on the drain arrives after the core was
+	// acknowledged: it must be reported as post_err, and the cache must
+	// release the bus and stay usable
+	err_arm = 1;
+	err_addr = 32'h0000_1E80;
+	err_beat = 2'd0;
+	err_count = 0;
+	post_err_seen = 0;
+	cpu_write_sz(32'h0000_1E80, 32'hBAD0_1E80, 2'd2);
+	guard5 = 0;
+	while (!post_err_seen && guard5 < 300) begin
+		@(posedge clk); guard5 = guard5 + 1;
+	end
+	err_arm = 0;
+	if (!post_err_seen) begin
+		$display("FAIL test 11: bus error on a posted store was not reported (post_err)");
+		errors = errors + 1;
+	end
+	expect_bus_idle(11);
+	expect_read(32'h0000_7100, mem[32'h7100>>2], 11);
+
+	// T11f: posted stores under constant chipset traffic, both speeds,
+	// then the values read back through the merged lines
+	expect_read(32'h0000_1D00, mem[32'h1D00>>2], 11);
+	snoop_storm = 1;
+	for (off = 0; off < 6; off = off + 1) begin
+		mem_lat = off[0] ? 2'd0 : 2'd2;
+		cpu_write_sz(32'h0000_1D00 + {off[2:0], 2'b00}, 32'h11F0_0000 + off, 2'd2);
+	end
+	snoop_storm = 0;
+	mem_lat = 2'd2;
+	for (off = 0; off < 6; off = off + 1)
+		expect_read(32'h0000_1D00 + {off[2:0], 2'b00}, 32'h11F0_0000 + off, 11);
+	repeat (6) @(posedge clk);
+
+	//------------------------------------------------------------------
+	// T12 (plan X3.4, A1): a miss whose line the channel serves takes the
+	// whole line from the channel: no adapter reads, correct data, and
+	// the same snoop and error rules as the adapter path.  FILLC=0 is
+	// the negative control (T12a must fail: the adapter fills instead).
+	//------------------------------------------------------------------
+	cinv_req = 1; cinv_ic = 1; cinv_dc = 1;
+	@(negedge clk);
+	while (!cinv_done) @(posedge clk);
+	cinv_req = 0;
+	repeat (20) @(posedge clk);
+
+	// T12a: served by the channel, no bus read, data right, then a hit
+	fill_ok = 1;
+	rd0 = m_read_count;
+	i = f_count;
+	expect_read(32'h0000_2A00, mem[32'h2A00>>2], 12);
+	if (f_count != i + 1 || m_read_count != rd0) begin
+		$display("FAIL test 12: miss not served by the channel (channel fills %0d->%0d, bus reads %0d->%0d)",
+		         i, f_count, rd0, m_read_count);
+		errors = errors + 1;
+	end
+	expect_read(32'h0000_2A04, mem[32'h2A04>>2], 12);   // resident now
+	expect_read(32'h0000_2A0C, mem[32'h2A0C>>2], 12);
+	if (f_count != i + 1 || m_read_count != rd0) begin
+		$display("FAIL test 12: the channel-filled line did not hit");
+		errors = errors + 1;
+	end
+	// every offset within the line, as the requested word
+	for (off = 0; off < 4; off = off + 1) begin
+		cinv_req = 1; cinv_ic = 1; cinv_dc = 1;
+		@(negedge clk);
+		while (!cinv_done) @(posedge clk);
+		cinv_req = 0;
+		repeat (8) @(posedge clk);
+		expect_read(32'h0000_2B00 + {off[1:0], 2'b00}, mem[(32'h2B00 >> 2) + off], 12);
+	end
+
+	// T12b: a snoop on ANOTHER line of the row during a channel fill
+	// must not be undone by the tag writeback (T2's rule), swept
+	for (off = 0; off < 14; off = off + 1) begin
+		cinv_req = 1; cinv_ic = 1; cinv_dc = 1;
+		@(negedge clk);
+		while (!cinv_done) @(posedge clk);
+		cinv_req = 0;
+		repeat (8) @(posedge clk);
+		expect_read(32'h0000_2C00, mem[32'h2C00>>2], 12);   // X valid
+		mem[32'h2C00>>2] = 32'h2CC0_0000 + off;              // X changes
+		fork
+			expect_read(32'h0000_3C00, mem[32'h3C00>>2], 12); // Y: same row, channel
+			begin
+				repeat (off + 1) @(negedge clk);
+				snoop(32'h0000_2C00);
+			end
+		join
+		expect_read(32'h0000_2C00, 32'h2CC0_0000 + off, 12);  // X must refetch
+	end
+
+	// T12c: a snoop on the FILLING line itself must leave it invalid:
+	// memory changes under it and the next read must refetch
+	for (off = 0; off < 14; off = off + 1) begin
+		cinv_req = 1; cinv_ic = 1; cinv_dc = 1;
+		@(negedge clk);
+		while (!cinv_done) @(posedge clk);
+		cinv_req = 0;
+		repeat (8) @(posedge clk);
+		fork
+			cpu_read(32'h0000_2D00, d);
+			begin
+				repeat (off + 1) @(negedge clk);
+				snoop(32'h0000_2D00);
+			end
+		join
+		mem[32'h2D00>>2] = 32'h2DD0_0000 + off;
+		snoop(32'h0000_2D00);
+		expect_read(32'h0000_2D00, 32'h2DD0_0000 + off, 12);
+	end
+
+	// T12d: a channel error abandons the fill, the line is not validated,
+	// and the cache keeps serving
+	ferr_arm = 1;
+	ferr_addr = 28'h000_2E0;
+	@(negedge clk);
+	c_req = 1; c_write = 0; c_size = 2'b10; c_addr = 32'h0000_2E00;
+	guard5 = 0;
+	while (!(fill_err && ce) && guard5 < 300) begin
+		@(posedge clk); guard5 = guard5 + 1;
+	end
+	if (guard5 >= 300) begin
+		$display("FAIL test 12: channel error never reported");
+		errors = errors + 1;
+	end
+	@(negedge clk);
+	c_req = 0;
+	@(posedge clk);
+	ferr_arm = 0;
+	repeat (4) @(posedge clk);
+	expect_read(32'h0000_7100, mem[32'h7100>>2], 12);
+	mem[32'h2E00>>2] = 32'h2EE0_2EE0;               // no snoop: only a
+	expect_read(32'h0000_2E00, 32'h2EE0_2EE0, 12);  // refetch sees it
+
+	// T12e: cache-inhibited reads still bypass, stores still merge
+	c_nocache = 1;
+	expect_read(32'h0000_2F00, mem[32'h2F00>>2], 12);
+	c_nocache = 0;
+	expect_read(32'h0000_2F40, mem[32'h2F40>>2], 12);
+	cpu_write_sz(32'h0000_2F44, 32'h2F44_2F44, 2'd2);
+	drain;
+	rd0 = m_read_count; i = f_count;
+	expect_read(32'h0000_2F44, 32'h2F44_2F44, 12);
+	if (f_count != i || m_read_count != rd0) begin
+		$display("FAIL test 12: store into a channel-filled line did not merge");
+		errors = errors + 1;
+	end
+	fill_ok = 0;
+	repeat (6) @(posedge clk);
+
+	//------------------------------------------------------------------
+	// T13 (plan X3.4, A1-3a): a posted store drains while the cache
+	// serves hits.  A hit issued right behind a store must be
+	// acknowledged while the drain is still in flight (post_busy high);
+	// a miss, a bypassed read and a second store must wait for it and
+	// reach memory after it.  Pre-change the cache sat in C_PASS for
+	// the whole drain, so the hit waited: FAIL.
+	//------------------------------------------------------------------
+	// a slow memory, so the drain is still in flight when the hit behind
+	// it is acknowledged -- at the bench's usual two cycles the drain
+	// ends first and the check cannot tell the two caches apart
+	mem_lat = 3'd6;
+	expect_read(32'h0000_1A00, mem[32'h1A00>>2], 13);   // line A resident
+	cpu_write_sz(32'h0000_1A40, 32'h13A0_1A40, 2'd2);   // posted, line B
+	cpu_read_watch(32'h0000_1A00, d, ackfirst);          // hit on A
+	if (!ackfirst) begin
+		$display("FAIL test 13: a hit waited for the posted store's drain");
+		errors = errors + 1;
+	end
+	if (d !== mem[32'h1A00>>2]) begin
+		$display("FAIL test 13: hit during a drain returned %h expected %h",
+		         d, mem[32'h1A00>>2]);
+		errors = errors + 1;
+	end
+	drain;
+	if (mem[32'h1A40>>2] !== 32'h13A0_1A40) begin
+		$display("FAIL test 13: the drain lost the store (memory %h)", mem[32'h1A40>>2]);
+		errors = errors + 1;
+	end
+
+	// a miss behind the drain waits and reaches memory after the store
+	cpu_write_sz(32'h0000_1A80, 32'h13A0_1A80, 2'd2);
+	expect_read(32'h0000_1AC0, mem[32'h1AC0>>2], 13);   // non-resident
+	if (!(last_wr_seq >= 0 && last_rd_seq > last_wr_seq)) begin
+		$display("FAIL test 13: a miss overtook the draining store on the bus");
+		errors = errors + 1;
+	end
+
+	// a bypassed read behind the drain waits and follows it
+	cpu_write_sz(32'h0000_1B00, 32'h13B0_1B00, 2'd2);
+	c_nocache = 1;
+	expect_read(32'h0000_1B40, mem[32'h1B40>>2], 13);
+	c_nocache = 0;
+	if (!(last_rd_seq > last_wr_seq)) begin
+		$display("FAIL test 13: a cache-inhibited read overtook the draining store");
+		errors = errors + 1;
+	end
+
+	// two stores back to back: the second waits for the slot, both land,
+	// in order
+	cpu_write_sz(32'h0000_1B80, 32'h13B8_0001, 2'd2);
+	cpu_write_sz(32'h0000_1B84, 32'h13B8_0002, 2'd2);
+	drain;
+	if (mem[32'h1B80>>2] !== 32'h13B8_0001 || mem[32'h1B84>>2] !== 32'h13B8_0002) begin
+		$display("FAIL test 13: back-to-back stores lost one (%h %h)",
+		         mem[32'h1B80>>2], mem[32'h1B84>>2]);
+		errors = errors + 1;
+	end
+
+	// under chipset traffic, both speeds: hits during drains stay right
+	snoop_storm = 1;
+	for (off = 0; off < 6; off = off + 1) begin
+		mem_lat = off[0] ? 3'd0 : 3'd6;
+		cpu_write_sz(32'h0000_1BC0 + {off[2:0], 2'b00}, 32'h13BC_0000 + off, 2'd2);
+		cpu_read_watch(32'h0000_1A00, d, ackfirst);
+		if (d !== mem[32'h1A00>>2]) begin
+			$display("FAIL test 13 (storm %0d): hit during a drain returned %h", off, d);
+			errors = errors + 1;
+		end
+	end
+	snoop_storm = 0;
+	mem_lat = 2'd2;
+	drain;
+	for (off = 0; off < 6; off = off + 1)
+		if (mem[(32'h1BC0 >> 2) + off] !== 32'h13BC_0000 + off) begin
+			$display("FAIL test 13: storm store %0d lost", off);
+			errors = errors + 1;
+		end
 	repeat (6) @(posedge clk);
 
 	if (errors == 0) $display("ALL TESTS PASSED");
