@@ -124,7 +124,25 @@ module ap040_tg68k_compat
 // the fetch queue's bookkeeping -- proceeds during the wait.  This is
 // the seed of P2's divider; a 4:1 enable on clk_114 drives the same
 // wire later.
-wire        ce_core = 1'b1;
+//
+// MinimigAGA_TC64 DIVERGES FROM UPSTREAM HERE: re-gated to clkena_in.
+// The paragraph above holds only where clkena_in is a PURE bus wait, as
+// it is in the MiSTer cpu_wrapper.v ("~cpu_req | bus_complete |
+// bus_berr", high on every idle cycle).  This project's wrapper --
+// rtl/soc/TG68K.vhd, signal clkena -- ANDs that bus wait with the SDRAM
+// controller's enaWRreg, so the enable is high on only 5 of every 16
+// clk_114 phases.  ap040_bus16_adapter clears mem_ack inside "else if
+// (clkena_in)", so under a duty-cycled enable the acknowledge is not a
+// one-clock pulse: it stays asserted for the whole three- or four-cycle
+// phase gap.  A gated cache samples it exactly once; a FREE-RUNNING
+// cache reads the stale level as the acknowledge of the NEXT request and
+// the machine desyncs at once.  Measured both ways on the core's own
+// bench with clkena_in gated to those phases: free-running fails
+// t_integer test 67 and runs away to pc=ffff6708, re-gated passes the
+// whole suite.  Freeing the core here is a later stage, together with
+// the multicycle island in fpga/openaars/aars_v5.0/xc7a100t/cpu.xdc,
+// which assumes every kernel register holds for at least three cycles.
+wire        ce_core = clkena_in;
 
 // core to MMU
 wire        mem_req;
