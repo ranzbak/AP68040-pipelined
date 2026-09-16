@@ -23,7 +23,10 @@ module ap040_tg68k_compat
 	parameter AP040_POST_STORES  = 1,
 	// X3.4 A1: line fills over the fill channel when fill_ena says the
 	// wrapper serves it.  0 is the adapter-only A/B reference.
-	parameter AP040_FILL_CHANNEL = 1
+	parameter AP040_FILL_CHANNEL = 1,
+	// MinimigAGA_TC64 Stage E2: 0 leaves the 16-bit adapter out and brings the
+	// cache's 32-bit master channel out on m_*, for a wrapper that owns the bus.
+	parameter AP040_BUS16        = 1
 )
 (
 	input         clk,
@@ -105,7 +108,19 @@ module ap040_tg68k_compat
 	output        debug_fault,
 	output        debug_halted,
 	output [255:0] debug_status,
-	output [127:0] debug_status2
+	output [127:0] debug_status2,
+
+	// Raw 32-bit master channel, for a wrapper that owns the bus itself
+	// (AP040_BUS16 = 0).  With the adapter in place these still mirror it.
+	output        m_req,
+	output        m_write,
+	output        m_instr,
+	output [1:0]  m_size,
+	output [31:0] m_addr,
+	output [31:0] m_wdata,
+	output [2:0]  m_fc,
+	input         m_ack,
+	input  [31:0] m_rdata
 );
 
 // Clock enable for everything above the bus adapter (plan X3.3, A2b-0).
@@ -480,6 +495,16 @@ else begin : g_nocache
 end
 endgenerate
 
+assign m_req   = b_req;
+assign m_write = b_write;
+assign m_instr = b_instr;
+assign m_size  = b_size;
+assign m_addr  = b_addr;
+assign m_wdata = b_wdata;
+assign m_fc    = b_fc;
+
+generate
+if (AP040_BUS16 != 0) begin : g_bus16
 ap040_bus16_adapter bus16 (
 	.clk(clk),
 	.nreset(nreset),
@@ -506,6 +531,22 @@ ap040_bus16_adapter bus16 (
 	.longword(longword),
 	.fc(fc)
 );
+wire unused_m = m_ack | (|m_rdata);
+end
+else begin : g_nobus16
+assign b_ack      = m_ack;
+assign b_rdata    = m_rdata;
+assign addr_out   = 32'd0;
+assign data_write = 16'd0;
+assign nwr        = 1'b1;
+assign nuds       = 1'b1;
+assign nlds       = 1'b1;
+assign busstate   = `AP040_BUS_IDLE;
+assign longword   = 1'b0;
+assign fc         = 3'd0;
+wire unused_d = |data_in;
+end
+endgenerate
 
 assign mmu_addr_log = mem_addr;
 assign cache_maint_req = cinv_req;
