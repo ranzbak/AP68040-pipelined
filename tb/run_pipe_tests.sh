@@ -42,4 +42,27 @@ for t in $TESTS; do
 	fi
 done
 
+# program benches: pipe_asm/<name>.s + <name>.exp through tb_ap040_pipe_prog.v
+# (needs vasmm68k_mot; the .exp files were made from a reference-core run
+# with findings/ap040-pipelined/tests/mkprog.sh and reviewed)
+if command -v vasmm68k_mot > /dev/null; then
+	iverilog -g2012 -I "$RTL" -o "$WORK/tb_pipe_prog.vvp" tb_ap040_pipe_prog.v $SRC > "$WORK/tb_pipe_prog.clog" 2>&1 || {
+		echo "  COMPILE-ERROR prog bench"; grep -v "constant selects" "$WORK/tb_pipe_prog.clog" | head -5; exit 1; }
+	for s in pipe_asm/*.s; do
+		n=$(basename "$s" .s)
+		[ -f "pipe_asm/$n.exp" ] || continue
+		( cd pipe_asm && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "../$WORK/$n.bin" "$n.s" ) || { echo "  FAIL  prog:$n (assembler)"; fail=1; continue; }
+		python3 bin2hex.py "$WORK/$n.bin" "$WORK/$n.hex"
+		if timeout 600 vvp "$WORK/tb_pipe_prog.vvp" +prog="$WORK/$n.hex" +expect="pipe_asm/$n.exp" > "$WORK/prog_$n.log" 2>&1 &&
+		   grep -q "ALL TESTS PASSED" "$WORK/prog_$n.log"; then
+			echo "  pass  prog:$n"
+		else
+			echo "  FAIL  prog:$n  (see $WORK/prog_$n.log)"
+			fail=1
+		fi
+	done
+else
+	echo "  (vasmm68k_mot not found: program benches skipped)"
+fi
+
 if [ $fail -eq 0 ]; then echo "AP040_PIPE: ALL TESTS PASSED"; else echo "AP040_PIPE: FAILURES"; exit 1; fi
