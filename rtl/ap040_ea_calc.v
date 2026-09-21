@@ -98,6 +98,7 @@ function automatic logic [33:0] fwd(input logic [4:0] r, input logic [31:0] rf,
                                     input logic xu1v, input logic [4:0] xu1r, input logic [31:0] xu1d);
 	// EA-fetch stage (youngest)
 	if (ev && e.w0_v && e.w0_r == r) return {1'b1, 1'b0, 32'd0};
+	if (ev && e.w1_v && e.w1_r == r) return {1'b1, 1'b0, 32'd0};
 	if (ev && e.u1_v && e.u1_r == r) return {1'b0, 1'b1, e.u1_val};
 	if (ev && e.u0_v && e.u0_r == r) return {1'b0, 1'b1, e.u0_val};
 	// execute stage
@@ -163,8 +164,10 @@ wire eares_t dres = eacomp(id_i.dst, id_i.size, r_db, db_v, di_v);
 // the result register this instruction will write (w0), for the stages behind
 function automatic logic w0_of(input id_t i);
 	case (i.cls)
-		CL_ALU:  return (i.dst.kind == EK_DREG || i.dst.kind == EK_AREG);
-		CL_DBCC, CL_SCC: return 1'b1;
+		CL_ALU:  return (i.dst.kind == EK_DREG || i.dst.kind == EK_AREG) && !i.nowrite;
+		CL_DBCC: return 1'b1;
+		CL_SCC, CL_MOVEFSR: return i.dst.kind == EK_DREG;
+		CL_LEA, CL_UNLK, CL_EXG: return 1'b1;
 		CL_MOVEC: return !i.imm[4] || i.imm[3:0] == CR_USP || i.imm[3:0] == CR_ISP || i.imm[3:0] == CR_MSP;
 		default: return 1'b0;
 	endcase
@@ -187,6 +190,29 @@ function automatic eac_t mk(input id_t i, input eares_t s, input eares_t d,
 	o.w0_v   = w0_of(i);
 	o.redirected = (i.cls == CL_JMP || i.cls == CL_JSR) && i.src.mi == MI_NONE && !s.ea[0];
 	o.w0_r   = rdb;
+	case (i.cls)
+		// LINK An,#d: An <- SP-4 (u0), SP <- SP-4+d (u1, wins if An is A7)
+		CL_LINK: begin
+			o.u0_v = 1'b1; o.u0_r = rsb; o.u0_val = d.nv;
+			o.u1_val = d.nv + i.imm;
+		end
+		// UNLK An: SP <- An+4 (u1); An <- (An) (w0, wins if An is A7)
+		CL_UNLK: begin
+			o.u1_v = 1'b1; o.u1_r = resolve_sp(R_A7L, sb, mb); o.u1_val = s.ea + 32'd4;
+		end
+		// RTD #d: SP <- SP+4+d
+		CL_RTD: o.u0_val = s.nv + i.imm;
+		// RTR: SP <- SP+6 (CCR word and PC long read from (SP) and 2(SP))
+		CL_RTR: begin
+			o.u1_v = 1'b1; o.u1_r = resolve_sp(R_A7L, sb, mb); o.u1_val = s.ea + 32'd6;
+		end
+		// EXG Rx,Ry: Rx <- Ry (w0), Ry <- Rx (w1; EA-fetch knows its value)
+		CL_EXG: begin
+			o.w0_r = rsb;
+			o.w1_v = 1'b1; o.w1_r = rdb;
+		end
+		default: ;
+	endcase
 	if (i.cls == CL_MOVEC)
 		o.w0_r = !i.imm[4] ? resolve_sp(i.src.reg_n, sb, mb) :
 		         (i.imm[3:0] == CR_USP) ? R_USP : (i.imm[3:0] == CR_ISP) ? R_ISP : R_MSP;
@@ -208,8 +234,8 @@ assign early   = first_rd(id_i, sres.ea, dres.ea);
 assign eac_redir_v  = id_valid && !hazard && !stall_in && !flush && o.redirected;
 assign eac_redir_pc = sres.ea;
 
-assign early_v = id_valid && !hazard && !stall_in && !flush &&
-                 !(p_eaf_v && stores(p_eaf.i)) && !p_ex_store;
+// (older stores are merged into the answer in EA-fetch, so no store hazard here)
+assign early_v = id_valid && !hazard && !stall_in && !flush;
 
 always @(posedge clk) begin
 	if (!nreset) begin

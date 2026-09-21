@@ -103,7 +103,10 @@ integer errors = 0;
 initial begin
 	#1;
 	// Mainline
-	dut.u_l1.mem[1] = 16'h0000;   // illegal (matches nothing)
+	// ILLEGAL ($4AFC).  Minimig plan M2: this was $0000, "illegal (matches
+	// nothing)" for the milestone-14 decoder -- but $0000 is ORI.B #,D0, a
+	// real instruction once the immediate group decodes.
+	dut.u_l1.mem[1] = 16'h4AFC;   // ILLEGAL
 	dut.u_l1.mem[2] = 16'h7263;   // MOVEQ #99,D1 (poison A, must not run)
 	dut.u_l1.mem[3] = 16'h4E45;   // TRAP #5 (vector 37)
 	dut.u_l1.mem[4] = 16'h7658;   // MOVEQ #88,D3 (poison B, must not run)

@@ -16,6 +16,7 @@
 //   sr <v>  ccr <v>      (ccr: the low 5 bits)                             //
 //   vbr <v>                                                                //
 //   m8|m16|m32 <addr> <v>  memory (big-endian)                             //
+//   noread <addr>        no data read may touch this byte (pure writes)     //
 //   # ...                comment (the # a word of its own)                 //
 // Prints "ALL TESTS PASSED" or one FAIL line per mismatch.                  //
 //--------------------------------------------------------------------------//
@@ -24,7 +25,7 @@
 module tb_ap040_pipe_prog;
 
 parameter [31:0] PC_RESET = 32'h0000_0400;
-parameter         L1_AW   = 12;
+parameter         L1_AW   = 15;     // 64K: the whole image (t_integer uses $3000-$3400 and $F100)
 localparam        L1_WORDS = (1 << L1_AW);
 
 reg clk = 0;
@@ -87,6 +88,21 @@ reg        done = 0;
 always @(posedge clk)
 	if (nreset && dbg_wb_valid && dbg_wb_pc == halt_pc) done = 1;
 
+// "noread <addr>": no data read may touch that byte (CLR and Scc to memory
+// are pure writes on the 68040)
+reg [31:0] noread [0:15];
+integer    n_noread = 0, reads_bad = 0, nr;
+reg [31:0] rlen;
+always @(posedge clk)
+	if (nreset && dut.u_l1.rd_req) begin
+		rlen = (dut.u_l1.rd_size == 2'd0) ? 1 : (dut.u_l1.rd_size == 2'd1) ? 2 : 4;
+		for (nr = 0; nr < n_noread; nr = nr + 1)
+			if (noread[nr] >= dut.u_l1.rd_addr && noread[nr] < dut.u_l1.rd_addr + rlen) begin
+				reads_bad = reads_bad + 1;
+				$display("FAIL: data read of %h (size %0d) touches noread byte %h", dut.u_l1.rd_addr, rlen, noread[nr]);
+			end
+	end
+
 initial begin
 	if (!$value$plusargs("prog=%s", progf) || !$value$plusargs("expect=%s", expf)) begin
 		$display("usage: +prog=<image.hex> +expect=<file.exp> [+cycles=N]");
@@ -112,7 +128,10 @@ initial begin
 				ch = 0;
 				while (ch != 10 && !$feof(fd)) ch = $fgetc(fd);
 			end else if (key == "m8" || key == "m16" || key == "m32") rc = $fscanf(fd, "%h %h", a, v);
-			else rc = $fscanf(fd, "%h", v);
+			else if (key == "noread") begin
+				rc = $fscanf(fd, "%h", a);
+				noread[n_noread] = a; n_noread = n_noread + 1;
+			end else rc = $fscanf(fd, "%h", v);
 		end
 	end
 	$fclose(fd);
@@ -131,6 +150,7 @@ initial begin
 		ok = ($fscanf(fd, "%s", key) == 1);
 		if (!ok) ;
 		else if (key == "halt") rc = $fscanf(fd, "%h", v);
+		else if (key == "noread") rc = $fscanf(fd, "%h", v);
 		else if (key == "#") begin : skipline2
 			integer ch;
 			ch = 0;
@@ -156,6 +176,7 @@ initial begin
 		end
 	end
 	$fclose(fd);
+	errors = errors + reads_bad;
 	if (errors == 0) $display("ALL TESTS PASSED (%0d checks, halt after %0d clocks)", nchk, cycles);
 	else $display("%0d CHECK(S) FAILED", errors);
 	$finish;

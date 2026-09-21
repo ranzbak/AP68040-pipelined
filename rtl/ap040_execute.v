@@ -28,6 +28,7 @@ module ap040_execute
 	input  ex_t       x,
 
 	input       [4:0] ccr_in,     // CCR with the WB write-through
+	input      [15:0] sr_in,      // SR with the WB write-through
 	input      [31:0] sfc_in, dfc_in, cacr_in, vbr_in,
 
 	output            ex_stall,
@@ -39,6 +40,10 @@ module ap040_execute
 
 	output            fw_ccr_v,
 	output      [4:0] fw_ccr,
+	output            fw_st_v,
+	output     [31:0] fw_st_addr,
+	output      [1:0] fw_st_size,
+	output     [31:0] fw_st_data,
 
 	output            ex_redirect,
 	output     [31:0] ex_redirect_pc,
@@ -52,12 +57,18 @@ assign ex_stall = stall_in;
 wire [31:0] alu_result;
 wire  [4:0] alu_flags;
 
+// An destination (MOVEA ADDA SUBA CMPA ADDQ/SUBQ to An): the operation is a
+// 32-bit one on the sign-extended word source (PRM ADDA 4-7 / CMPA 4-77)
+wire        an_dst = (x.dk == DK_REG) && (x.dr[4:3] != 2'b00);
+wire [31:0] alu_a  = (an_dst && x.size == SZ_W) ? sext16(x.a[15:0]) : x.a;
+wire  [1:0] alu_sz = an_dst ? SZ_L : x.size;
+
 ap040_pipe_alu alu
 (
 	.op        (x.alu),
-	.size      (x.size),
+	.size      (alu_sz),
 	.shcnt     (6'd1),
-	.a         (x.a),
+	.a         (alu_a),
 	.b         (x.b),
 	.flags_in  (ccr_in),
 	.result    (alu_result),
@@ -65,6 +76,9 @@ ap040_pipe_alu alu
 );
 
 wire cond = cond_true(x.cond, ccr_in);
+
+// MOVE from SR / CCR: the SR as the instructions ahead left it
+wire [31:0] sr_word = x.ccr_only ? {27'd0, ccr_in} : {16'd0, sr_in[15:5], ccr_in};
 
 // DBcc
 wire [15:0] dbcc_dec   = x.b[15:0] - 16'd1;
@@ -107,13 +121,42 @@ always @* begin
 	case (x.cls)
 		CL_ALU: begin
 			w.ccr_v = x.wr_ccr; w.ccr_val = alu_flags;
-			if (x.dk == DK_REG) begin
+			if (x.nowrite) ;                  // CMP CMPA CMPM CMPI TST
+			else if (x.dk == DK_REG) begin
 				w.w0_v = 1'b1; w.w0_r = x.dr;
-				if (x.dr[4:3] == 2'b00) w.w0_val = merge(x.b, alu_result, x.size);   // Dn
-				else w.w0_val = (x.size == SZ_W) ? sext16(x.a[15:0]) : x.a;       // MOVEA
+				w.w0_val = an_dst ? alu_result : merge(x.b, alu_result, x.size);
 			end else if (x.dk == DK_MEM) begin
 				w.st_v = 1'b1; w.st_addr = x.daddr; w.st_data = alu_result; w.st_size = x.size;
 			end
+		end
+		CL_CCROP: begin                   // ANDI/ORI/EORI #,CCR
+			w.ccr_v = 1'b1;
+			w.ccr_val = (x.alu == `AP040_ALU_AND) ? (ccr_in & x.a[4:0]) :
+			            (x.alu == `AP040_ALU_OR)  ? (ccr_in | x.a[4:0]) : (ccr_in ^ x.a[4:0]);
+		end
+		CL_SROP: begin                    // ANDI/ORI/EORI #,SR (EA-fetch set the redirect)
+			w.sr_v = 1'b1;
+			w.sr_val = ((x.alu == `AP040_ALU_AND) ? (sr_in & x.a[15:0]) :
+			            (x.alu == `AP040_ALU_OR)  ? (sr_in | x.a[15:0]) : (sr_in ^ x.a[15:0])) & `AP040_SR_MASK;
+		end
+		CL_PEA, CL_LINK: begin            // push the EA / An
+			w.st_v = 1'b1; w.st_addr = x.daddr; w.st_data = x.a; w.st_size = SZ_L;
+		end
+		CL_LEA, CL_UNLK: begin
+			w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = x.a;
+		end
+		CL_RTR, CL_MOVE2CCR: begin
+			w.ccr_v = 1'b1; w.ccr_val = x.a[4:0];
+		end
+		CL_MOVEFSR: begin                 // MOVE SR/CCR,<ea>: a word, the CCR untouched
+			if (x.dk == DK_REG) begin
+				w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = merge(x.b, sr_word, SZ_W);
+			end else if (x.dk == DK_MEM) begin
+				w.st_v = 1'b1; w.st_addr = x.daddr; w.st_data = sr_word; w.st_size = SZ_W;
+			end
+		end
+		CL_EXG: begin                     // Rx <- Ry here; Ry <- Rx came as u0
+			w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = x.b;
 		end
 		CL_BCC: begin
 			redir = 1'b0;            // resolved (and redirected) in EA-fetch
@@ -125,8 +168,12 @@ always @* begin
 			if (!x.cc) begin w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = {x.b[31:16], dbcc_dec}; end
 			redir = 1'b0;
 		end
-		CL_SCC: begin
-			w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = {x.b[31:8], {8{cond}}};
+		CL_SCC: begin                     // Scc: Dn byte, or a byte store (no read on the 68040)
+			if (x.dk == DK_REG) begin
+				w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = {x.b[31:8], {8{cond}}};
+			end else if (x.dk == DK_MEM) begin
+				w.st_v = 1'b1; w.st_addr = x.daddr; w.st_data = {24'd0, {8{cond}}}; w.st_size = SZ_B;
+			end
 		end
 		CL_MOVE2SR: begin
 			w.sr_v = 1'b1; w.sr_val = x.a[15:0] & `AP040_SR_MASK;
@@ -143,6 +190,12 @@ always @* begin
 		default: ;
 	endcase
 end
+
+// this micro-op's store, for EA-fetch's store-to-load forwarding
+assign fw_st_v    = eaf_valid && w.st_v;
+assign fw_st_addr = w.st_addr;
+assign fw_st_size = w.st_size;
+assign fw_st_data = w.st_data;
 
 // the CCR this micro-op leaves, for EA-fetch's branch resolution
 assign fw_ccr_v  = eaf_valid && (w.ccr_v || w.sr_v);

@@ -193,6 +193,9 @@ wire  [4:0] fw_w0_r;
 wire [31:0] fw_w0_val;
 wire        fw_ccr_v;
 wire  [4:0] fw_ccr;
+wire        fw_st_v;
+wire [31:0] fw_st_addr, fw_st_data;
+wire  [1:0] fw_st_size;
 wire ex_w0_pend = eaf_valid && (eaf_o.dk == DK_REG || eaf_o.cls == CL_DBCC || eaf_o.cls == CL_SCC);
 
 ap040_ea_calc u_eac
@@ -232,7 +235,9 @@ ap040_ea_fetch u_eaf
 	.ex_u1_v(eaf_valid && eaf_o.u1_v), .ex_u1_r(eaf_o.u1_r), .ex_u1_val(eaf_o.u1_val),
 	.ex_ccr_v(fw_ccr_v), .ex_ccr(fw_ccr),
 	.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size),
-	.rd_ack(d_rd_ack), .rd_data(d_rd_data),
+	.rd_ack(d_rd_ack), .rd_data_raw(d_rd_data),
+	.wb_st_v(commit && exe_o.st_v), .wb_st_addr(exe_o.st_addr), .wb_st_size(exe_o.st_size), .wb_st_data(exe_o.st_data),
+	.ex_st_v(fw_st_v), .ex_st_addr(fw_st_addr), .ex_st_size(fw_st_size), .ex_st_data(fw_st_data),
 	.eaf_stall(eaf_stall), .eaf_blk(eaf_blk),
 	.eaf_valid(eaf_valid), .eaf_o(eaf_o),
 	.halted(eaf_halted),
@@ -243,11 +248,12 @@ ap040_execute u_ex
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(1'b0),
 	.eaf_valid(eaf_valid), .x(eaf_o),
-	.ccr_in(sr_now[4:0]),
+	.ccr_in(sr_now[4:0]), .sr_in(sr_now),
 	.sfc_in({29'd0, sfc}), .dfc_in({29'd0, dfc}), .cacr_in(cacr), .vbr_in(vbr),
 	.ex_stall(ex_stall),
 	.fw_w0_v(fw_w0_v), .fw_w0_r(fw_w0_r), .fw_w0_val(fw_w0_val),
 	.fw_ccr_v(fw_ccr_v), .fw_ccr(fw_ccr),
+	.fw_st_v(fw_st_v), .fw_st_addr(fw_st_addr), .fw_st_size(fw_st_size), .fw_st_data(fw_st_data),
 	.ex_redirect(ex_redirect), .ex_redirect_pc(ex_redirect_pc),
 	.exe_valid(exe_valid), .exe_o(exe_o)
 );

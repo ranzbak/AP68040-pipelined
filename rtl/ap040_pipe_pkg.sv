@@ -82,7 +82,18 @@ typedef enum logic [5:0] {
 	CL_MOVE2SR = 6'd11,  // MOVE <ea>,SR
 	CL_MOVEC   = 6'd12,
 	CL_RESET   = 6'd13,  // internal: the reset vector fetch (ISP/PC)
-	CL_INJECT  = 6'd14   // internal: an exception raised past EAF, re-entered
+	CL_INJECT  = 6'd14,  // internal: an exception raised past EAF, re-entered
+	CL_CCROP   = 6'd15,  // ANDI/ORI/EORI #,CCR
+	CL_SROP    = 6'd16,  // ANDI/ORI/EORI #,SR
+	CL_PEA     = 6'd17,
+	CL_LEA     = 6'd18,
+	CL_LINK    = 6'd19,
+	CL_UNLK    = 6'd20,
+	CL_RTD     = 6'd21,
+	CL_RTR     = 6'd22,
+	CL_MOVEFSR = 6'd23,  // MOVE SR,<ea> / MOVE CCR,<ea> (ccr_only)
+	CL_MOVE2CCR= 6'd24,
+	CL_EXG     = 6'd25
 } cls_t;
 
 typedef struct packed {
@@ -99,6 +110,8 @@ typedef struct packed {
 	ea_t         dst;
 	logic        wr_ccr;       // result writes CCR (by the ALU's flag rule)
 	logic        rmw;          // memory destination is read before it is written
+	logic        nowrite;      // flags only: CMP, CMPA, CMPM, CMPI, TST
+	logic        ccr_only;     // MOVE from CCR (vs SR)
 	logic        priv;         // privileged: user mode -> vector 8
 	logic        serialize;    // waits in EAF for EX/WB to drain
 	logic [7:0]  exc_vec;      // CL_EXC: vector number
@@ -125,6 +138,8 @@ typedef struct packed {
 	logic        w0_v;         // the result register it will write (not known before EX)
 	logic [4:0]  w0_r;
 	logic        redirected;   // EA-calc already redirected IF to the JMP/JSR target
+	logic        w1_v;         // a second result register (EXG)
+	logic [4:0]  w1_r;
 } eac_t;
 
 // a data read: {valid, tag, byte address, size}.  Tags name what EA-fetch
@@ -140,19 +155,42 @@ function automatic rdreq_t first_rd(input id_t i, input logic [31:0] src_ea, inp
 	rdreq_t r;
 	logic ld_src, ld_dst;
 	r = '0; r.sz = SZ_L;
-	ld_src = (i.src.kind == EK_MEM) && !(i.cls == CL_JMP || i.cls == CL_JSR);
+	ld_src = (i.src.kind == EK_MEM) && !(i.cls == CL_JMP || i.cls == CL_JSR || i.cls == CL_LEA || i.cls == CL_PEA);
 	ld_dst = (i.dst.kind == EK_MEM) && i.rmw;
 	if (i.serialize) return r;
 	if (i.src.kind == EK_MEM && i.src.mi != MI_NONE)      begin r.v = 1'b1; r.t = T_SMI; r.a = src_ea; end
 	else if (i.dst.kind == EK_MEM && i.dst.mi != MI_NONE) begin r.v = 1'b1; r.t = T_DMI; r.a = dst_ea; end
 	else if (ld_src) begin r.v = 1'b1; r.t = T_SLD; r.a = src_ea; r.sz = i.size; end
-	else if (ld_dst) begin r.v = 1'b1; r.t = T_DLD; r.a = dst_ea; r.sz = i.size; end
+	else if (ld_dst) begin r.v = 1'b1; r.t = T_DLD; r.a = dst_ea; r.sz = (i.cls == CL_RTR) ? SZ_L : i.size; end
+	return r;
+endfunction
+
+// Store-to-load forwarding: the bytes of a load (right-aligned, big-endian,
+// at address la, size lsz) that an older store (sa, ssz, sd) covers are
+// replaced by the store's bytes.
+function automatic logic [31:0] st_merge(input logic [31:0] ld, input logic [31:0] la, input logic [1:0] lsz,
+                                         input logic sv, input logic [31:0] sa, input logic [1:0] ssz,
+                                         input logic [31:0] sd);
+	logic [31:0] r, off;
+	int ln, sn, k, j;
+	r  = ld;
+	ln = (lsz == SZ_B) ? 1 : (lsz == SZ_W) ? 2 : 4;
+	sn = (ssz == SZ_B) ? 1 : (ssz == SZ_W) ? 2 : 4;
+	if (sv)
+		for (k = 0; k < 4; k = k + 1)
+			if (k < ln) begin
+				off = (la + k) - sa;
+				if (off < sn) begin
+					j = off;
+					r[8 * (ln - 1 - k) +: 8] = sd[8 * (sn - 1 - j) +: 8];
+				end
+			end
 	return r;
 endfunction
 
 // does an instruction store (for the read-after-write hazard of early reads)
 function automatic logic stores(input id_t i);
-	return (i.dst.kind == EK_MEM) || i.cls == CL_BSR || i.cls == CL_JSR || i.serialize;
+	return ((i.dst.kind == EK_MEM) && i.cls != CL_RTR) || i.cls == CL_BSR || i.cls == CL_JSR || i.serialize;
 endfunction
 
 // what EX does with its result
@@ -192,6 +230,8 @@ typedef struct packed {
 	logic        creg_to;      // MOVEC Rn,Rc
 	logic        exc;          // exception-entry final micro-op (trace/X stream)
 	logic        cc;           // Bcc/DBcc/Scc condition, evaluated in EA-fetch
+	logic        nowrite;      // flags only (CMP family, TST)
+	logic        ccr_only;     // MOVE from CCR
 } ex_t;
 
 typedef struct packed {

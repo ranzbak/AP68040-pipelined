@@ -71,7 +71,11 @@ module ap040_ea_fetch
 	output     [31:0] rd_addr,
 	output      [1:0] rd_size,
 	input             rd_ack,
-	input      [31:0] rd_data,
+	input      [31:0] rd_data_raw,
+	// the older stores not yet in memory when a read sampled it: the one in
+	// WB now (it was in EX then) and the one in EX now (it was here then)
+	input             wb_st_v, input [31:0] wb_st_addr, input [1:0] wb_st_size, input [31:0] wb_st_data,
+	input             ex_st_v, input [31:0] ex_st_addr, input [1:0] ex_st_size, input [31:0] ex_st_data,
 
 	output            eaf_stall,  // to EA-calc: the current instruction is not done
 	output            eaf_blk,    // current instruction is serialising / sequenced
@@ -153,7 +157,8 @@ wire [31:0] op_b = (eac_i.u0_v && eac_i.u0_r == ra_b) ? eac_i.u0_val :
                        ex_u1_v, ex_u1_r, ex_u1_val);
 
 //--------------------------------------------------------------- ordinary instructions
-wire needs_ld_src = (i.src.kind == EK_MEM) && !(i.cls == CL_JMP || i.cls == CL_JSR);
+wire addr_only    = (i.cls == CL_JMP || i.cls == CL_JSR || i.cls == CL_LEA || i.cls == CL_PEA);
+wire needs_ld_src = (i.src.kind == EK_MEM) && !addr_only;
 wire needs_ld_dst = (i.dst.kind == EK_MEM) && i.rmw;
 wire need_smi = (i.src.kind == EK_MEM) && (i.src.mi != MI_NONE);
 wire need_dmi = (i.dst.kind == EK_MEM) && (i.dst.mi != MI_NONE);
@@ -165,18 +170,32 @@ wire [31:0] d_addr_now = done_dmi ? d_addr : eac_i.dst_ea;
 function automatic rdreq_t next_rd(input logic nsmi, input logic dsmi, input logic ndmi, input logic ddmi,
                                    input logic nsld, input logic dsld, input logic ndld, input logic ddld,
                                    input logic [31:0] sea, input logic [31:0] dea,
-                                   input logic [31:0] sa, input logic [31:0] da, input logic [1:0] sz);
+                                   input logic [31:0] sa, input logic [31:0] da, input logic [1:0] sz,
+                                   input logic [1:0] dsz);
 	rdreq_t r;
 	r = '0; r.sz = SZ_L;
 	if (nsmi && !dsmi)      begin r.v = 1'b1; r.t = T_SMI; r.a = sea; end
 	else if (ndmi && !ddmi) begin r.v = 1'b1; r.t = T_DMI; r.a = dea; end
 	else if (nsld && !dsld) begin r.v = 1'b1; r.t = T_SLD; r.a = sa; r.sz = sz; end
-	else if (ndld && !ddld) begin r.v = 1'b1; r.t = T_DLD; r.a = da; r.sz = sz; end
+	else if (ndld && !ddld) begin r.v = 1'b1; r.t = T_DLD; r.a = da; r.sz = dsz; end
 	return r;
 endfunction
 
+// RTR's second read (the PC at 2(SP)) is a long, its first (the CCR) a word
 wire rdreq_t nx = next_rd(need_smi, done_smi, need_dmi, done_dmi, needs_ld_src, done_sld, needs_ld_dst, done_dld,
-                          eac_i.src_ea, eac_i.dst_ea, s_addr_now, d_addr_now, i.size);
+                          eac_i.src_ea, eac_i.dst_ea, s_addr_now, d_addr_now, i.size,
+                          (i.cls == CL_RTR) ? SZ_L : i.size);
+
+// Store-to-load forwarding.  The memory answers with what it held at the
+// clock edge ending the read's issue clock (a store committing on that edge
+// included, write first).  Older stores still in flight then are now in WB
+// and EX; their bytes are merged in, WB's first, then EX's (the younger).
+// So a load never waits for an older store (M68040UM 10.6: ADD Dn,(An) one
+// clock back to back).
+reg  [31:0] rd_a_q;        // address and size of the outstanding read
+reg   [1:0] rd_sz_q;
+wire [31:0] rd_data = st_merge(st_merge(rd_data_raw, rd_a_q, rd_sz_q, wb_st_v, wb_st_addr, wb_st_size, wb_st_data),
+                               rd_a_q, rd_sz_q, ex_st_v, ex_st_addr, ex_st_size, ex_st_data);
 
 // the capture in this cycle, as the dispatch sees it
 wire        cap      = rd_pend && rd_ack && !rd_drop;
@@ -193,7 +212,8 @@ wire ops_done = (!need_smi || dn_smi) && (!need_dmi || dn_dmi) &&
 
 // odd control-flow targets (M68040UM 8.2.2; reference ap040_core.v S_JMP1/S_JSR1/S_RET2)
 wire jmp_odd = (i.cls == CL_JMP || i.cls == CL_JSR) && s_addr_c[0];
-wire rts_odd = (i.cls == CL_RTS) && s_val_c[0];
+wire rts_odd = (i.cls == CL_RTS || i.cls == CL_RTD) && s_val_c[0];
+wire rtr_odd = (i.cls == CL_RTR) && d_val_c[0];
 wire indexed_mode = (i.src.mode == 3'd6) || (i.src.mode == 3'd7 && i.src.mreg == 3'd3);
 
 //--------------------------------------------------------------- micro-op build
@@ -215,11 +235,13 @@ function automatic ex_t xord(input eac_t e, input logic [31:0] opa, input logic 
 	id_t i;
 	i = e.i;
 	x = base_uop(i);
-	x.wr_ccr = i.wr_ccr;
+	x.wr_ccr   = i.wr_ccr;
+	x.nowrite  = i.nowrite;
+	x.ccr_only = i.ccr_only;
 	case (i.src.kind)
 		EK_DREG, EK_AREG: x.a = opa;
 		EK_IMM:           x.a = i.src.bd;
-		EK_MEM:           x.a = (i.cls == CL_JMP || i.cls == CL_JSR) ? sa : sv;
+		EK_MEM:           x.a = (i.cls == CL_JMP || i.cls == CL_JSR || i.cls == CL_LEA || i.cls == CL_PEA) ? sa : sv;
 		default:          x.a = 32'd0;
 	endcase
 	case (i.dst.kind)
@@ -232,8 +254,17 @@ function automatic ex_t xord(input eac_t e, input logic [31:0] opa, input logic 
 	case (i.cls)
 		// JMP/JSR/RTS were redirected before EX (EA-calc, or this stage)
 		CL_JMP, CL_JSR: begin x.target = sa; x.redirect = 1'b0; end
-		CL_RTS:         begin x.target = sv; x.redirect = 1'b0; end
-		CL_MOVE2SR:     begin x.target = i.next_pc; x.redirect = 1'b1; end
+		CL_RTS, CL_RTD: begin x.target = sv; x.redirect = 1'b0; end
+		CL_RTR:         begin x.target = dv; x.redirect = 1'b0; x.dk = DK_NONE; end
+		CL_MOVE2SR, CL_SROP: begin x.target = i.next_pc; x.redirect = 1'b1; end
+		// LINK A7: the value pushed is the decremented SP (PRM LINK: SP-4 -> SP;
+		// An -> (SP)), i.e. the push address
+		CL_LINK:        x.a = (e.src_r == e.dst_r) ? da : opa;
+		// EXG: Rx <- Ry (w0), Ry <- Rx (u0: the value is known here)
+		CL_EXG: begin
+			x.dk = DK_REG; x.dr = e.src_r;
+			x.u0_v = 1'b1; x.u0_r = e.dst_r; x.u0_val = opa;
+		end
 		CL_MOVEC: begin
 			x.creg_sel = i.imm[3:0];
 			x.creg_to  = i.imm[4];
@@ -344,8 +375,9 @@ function automatic stp_t stepf(
 	input logic [3:0] ph, input logic ev_valid, input logic rstp, input id_t i,
 	input logic older_busy, input logic can_rd, input logic rd_pend, input logic rd_ack, input logic cap,
 	input logic s_bit, input logic stall,
-	input rdreq_t nx, input logic ops_done, input logic jmp_odd, input logic rts_odd, input logic indexed,
-	input logic [31:0] s_addr_c, input logic [31:0] s_val_c,
+	input rdreq_t nx, input logic ops_done, input logic jmp_odd, input logic rts_odd, input logic rtr_odd,
+	input logic indexed,
+	input logic [31:0] s_addr_c, input logic [31:0] s_val_c, input logic [31:0] d_val_c,
 	input logic [2:0] x_step, input logic [31:0] vbr, input logic [7:0] x_vec, input logic [31:0] x_target,
 	input logic [2:0] r_step, input logic [31:0] sp_now, input logic fmt_ok, input logic rte_goes);
 	stp_t s;
@@ -376,6 +408,14 @@ function automatic stp_t stepf(
 						// the pop is backed out (reference S_RET2): no micro-op, SP untouched
 						s.exc_go = 1'b1; s.ev = 8'd3; s.ef = 4'd2;
 						s.epc = i.pc; s.eaddr = {s_val_c[31:1], 1'b0};
+					end else if (rtr_odd) begin
+						// RTR to an odd PC: the popped CCR stands, SP does not move, and
+						// the frame stacks the SR with that CCR (reference S_RET3)
+						if (!stall) begin
+							s.disp = 1'b1; s.dsel = 3'd5;
+							s.exc_go = 1'b1; s.ev = 8'd3; s.ef = 4'd2;
+							s.epc = i.pc; s.eaddr = {d_val_c[31:1], 1'b0};
+						end
 					end else if (!stall) begin
 						s.disp = 1'b1; s.dsel = 3'd0; s.fin = 1'b1;
 					end
@@ -423,17 +463,26 @@ function automatic stp_t stepf(
 	return s;
 endfunction
 
-wire stp_t st = stepf(ph, eac_valid, rst_pending, i, older_busy, !older_store, rd_pend, rd_ack, cap,
-                      s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, indexed_mode, s_addr_c, s_val_c,
-                      x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes);
+// reads never wait for older stores (store-to-load forwarding, above)
+wire stp_t st = stepf(ph, eac_valid, rst_pending, i, older_busy, 1'b1, rd_pend, rd_ack, cap,
+                      s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, indexed_mode, s_addr_c, s_val_c,
+                      d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes);
+
+// RTR to an odd PC: the CCR alone commits
+function automatic ex_t ccr_only_uop(input ex_t x);
+	ex_t y;
+	y = x; y.u0_v = 1'b0; y.u1_v = 1'b0; y.redirect = 1'b0; y.last = 1'b0;
+	return y;
+endfunction
 
 function automatic ex_t dmux(input logic [2:0] sel, input ex_t o, input ex_t f, input ex_t e,
-                             input ex_t r, input ex_t z);
+                             input ex_t r, input ex_t z, input ex_t c);
 	case (sel)
 		3'd0: return o;
 		3'd1: return f;
 		3'd2: return e;
 		3'd3: return r;
+		3'd5: return c;
 		default: return z;
 	endcase
 endfunction
@@ -442,7 +491,8 @@ wire ex_t disp_x = dmux(st.dsel, x_ord,
                         exc_uop(i, x_step, x_sp, x_sr, x_pc, x_fmt, x_vec, x_addr),
                         exc_final(i, x_bank, x_sp, x_sr, x_target),
                         rte_final(i, bank_now, rd_a, r_fv, r_sr, r_pc),
-                        reset_final(i, x_sp, r_pc));
+                        reset_final(i, x_sp, r_pc),
+                        ccr_only_uop(x_ord));
 
 // the early read goes out when this stage leaves the port free and is
 // taking the next instruction (its current one finishes, or it is empty)
@@ -464,9 +514,11 @@ wire [15:0] dbc_dec = op_b[15:0] - 16'd1;
 wire       br_taken = (i.cls == CL_BCC) ? br_cc : (!br_cc && dbc_dec != 16'hFFFF);
 
 assign eaf_redir_v  = st.disp && st.dsel == 3'd0 && !flush &&
-                      (i.cls == CL_RTS || ((i.cls == CL_JMP || i.cls == CL_JSR) && !eac_i.redirected) ||
+                      (i.cls == CL_RTS || i.cls == CL_RTD || i.cls == CL_RTR ||
+                       ((i.cls == CL_JMP || i.cls == CL_JSR) && !eac_i.redirected) ||
                        ((i.cls == CL_BCC || i.cls == CL_DBCC) && !br_taken));
-assign eaf_redir_pc = (i.cls == CL_RTS) ? s_val_c :
+assign eaf_redir_pc = (i.cls == CL_RTS || i.cls == CL_RTD) ? s_val_c :
+                      (i.cls == CL_RTR) ? d_val_c :
                       (i.cls == CL_BCC || i.cls == CL_DBCC) ? i.next_pc : s_addr_c;
 
 //--------------------------------------------------------------- registers
@@ -489,7 +541,7 @@ always @(posedge clk) begin
 		end
 		// read bookkeeping.  A read still outstanding when a flush arrives
 		// is answered later; rd_drop throws that answer away.
-		if (rd_req) begin rd_pend <= 1'b1; rd_tag <= rd_t; end
+		if (rd_req) begin rd_pend <= 1'b1; rd_tag <= rd_t; rd_a_q <= rd_addr; rd_sz_q <= rd_size; end
 		else if (rd_ack) begin rd_pend <= 1'b0; rd_drop <= 1'b0; end
 		if (flush) begin
 			ph <= P_START;
