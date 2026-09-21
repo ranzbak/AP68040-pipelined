@@ -1,186 +1,199 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 17: address error)       //
+// AP040_PIPE - MC68040-style pipelined core                                //
 //                                                                          //
-// ap040_ea_calc.v - EA-calc stage                                         //
+// ap040_ea_calc.v - <ea> calculate stage (rewritten for Minimig plan M1)   //
 //                                                                          //
-// MOVEQ, register-direct MOVE.L/ADD.L, Bcc/BRA (any displacement width),   //
-// Scc, DBcc, JMP, BSR, and JSR all have no memory effective address to     //
-// compute, so this is still a pure pass-through -- it exists to occupy the //
-// register slot a real address calculation will use once an EA mode that   //
-// actually needs arithmetic is added, rather than being spliced in later   //
-// and reshaping the pipeline. id_is_branch/id_is_scc/id_cond/              //
-// id_writes_ccr/id_next_pc ride through unchanged for the same reason --   //
-// this stage has nothing to compute for any of them; only                  //
-// ap040_execute.v actually evaluates a condition or merges a byte, per its //
-// header comment. id_next_pc is just one more field in the same            //
-// pass-through shape.                                                     //
+// Computes both effective addresses of the instruction in one clock:      //
+//   EA = base + bd + Xn*scale     (memory indirect: the pointer address,   //
+//                                   and what EA-fetch adds to the pointer) //
+// and the (An)+ / -(An) updates (step = operand size, A7 byte = 2).  The   //
+// destination EA sees the source EA's update of the same register (MOVE   //
+// (A0)+,(A0)+, CMPM, ADDX -(A0),-(A0)).                                    //
 //                                                                          //
-// MOVE.L (An),Dn (milestone 9b) and JMP (An)/(d16,An) (milestone 11) are    //
-// ALSO pure pass-throughs here, deliberately: their effective addresses     //
-// are An's raw value (plus id_imm's displacement for the (d16,An) forms),   //
-// no arithmetic -- id_is_mem_src/id_is_jmp thread through unchanged, same   //
-// shape as every other flag above. This is why the EA-calc/EA-fetch split   //
-// exists as two stages already (per the original plan): the day an EA mode  //
-// needs real arithmetic (indexed modes, etc.), it lands HERE, and EA-       //
-// fetch's memory-access/stall logic (see its header) doesn't need to        //
-// change at all -- it already just consumes whatever address EA-calc        //
-// resolved.                                                                 //
+// Registers: four read ports (src base, src index, dst base, dst index).   //
+// A7 is resolved to USP/ISP/MSP here from the architectural SR.  Values    //
+// still in flight are forwarded from the instructions ahead:               //
+//   an (An)+/-(An) update  -> its value is known (computed here) -> forward //
+//   a result (w0)          -> not known until EX -> stall this stage until  //
+//                             it is in WB, where the regfile write-through  //
+//                             supplies it                                  //
+// Youngest producer wins.  A serialising instruction in EA-fetch stalls    //
+// this stage (it may write registers in ways the pending-write bookkeeping //
+// does not describe: stack pointers, SR).                                  //
 //                                                                          //
-// BSR/JSR (milestone 13, new) are the SAME story one level further: the     //
-// push address (A7-4) and the memory write itself are both computed and     //
-// issued entirely in ap040_ea_fetch.v, from id_dest_reg's register value    //
-// (port B) -- id_is_bsr/id_is_jsr just thread through here unchanged, same  //
-// as every other flag.                                                     //
+// The An update is NOT written here: it travels with the instruction and   //
+// commits in WB (plan M1: never earlier), so a fault in EA-fetch leaves    //
+// the register untouched.                                                  //
 //                                                                          //
-// TRAP #n / illegal instruction (milestone 14, new): same story a third     //
-// time. Both need A7's value (port B, id_dest_reg already pointed at A7 by   //
-// ap040_decode.v, same trick BSR/JSR use) and nothing else EA-calc could      //
-// compute -- the frame contents, the multi-beat push, and the vector-table    //
-// read all live in ap040_ea_fetch.v's new exception-entry sequencer. id_is_    //
-// trap/id_is_illegal just thread through unchanged, same shape as every       //
-// other flag above.                                                          //
-//                                                                          //
-// MOVE to SR / MOVEC (milestone 15, new): a fourth and fifth flavor of the    //
-// same story, PLUS a genuinely dynamic wrinkle this stage still doesn't       //
-// need to know about -- whether either one actually FAULTS (privilege         //
-// violation) depends on the live, forwarded S bit, which doesn't exist         //
-// until ap040_ea_fetch.v/ap040_execute.v. id_is_movesr/id_is_movec thread       //
-// through unchanged either way; the fault decision and its consequences         //
-// (suppressing the normal SR/control-register write, rerouting port B to         //
-// A7 for the exception's own push) are entirely ap040_ea_fetch.v's job -- see     //
-// its header.                                                                     //
-//                                                                          //
-// RTS / RTE (milestone 16, new): a sixth and seventh flavor, same story        //
-// again. RTS reuses id_is_mem_src (ap040_decode.v now sets it for RTS too,       //
-// same FSM MOVE.L (An),Dn already uses) so it needs NO new pass-through field       //
-// at all beyond id_is_rts itself, purely for ap040_execute.v's redirect/commit       //
-// classification. RTE gets its own new sequencer entirely in ap040_ea_fetch.v         //
-// (two reads, not one, plus a dynamic privilege check) -- this stage still has          //
-// nothing to compute for it either.                                                      //
-//                                                                          //
-// flush: when ap040_execute.v detects a mispredicted branch, everything     //
-// speculatively fetched behind it -- including whatever is sitting here -- //
-// must be discarded. Same shape as stall_in but forces a bubble instead     //
-// of holding.                                                              //
+// Coding rule (Icarus): combinational logic is pure functions of their     //
+// arguments, assigned with assign -- see ap040_decode.v.                   //
 //--------------------------------------------------------------------------//
 
 module ap040_ea_calc
+	import ap040_pipe_pkg::*;
 (
 	input             clk,
 	input             nreset,
 	input             ce,
 	input             stall_in,   // EA-fetch cannot accept this cycle
-	input             flush,      // EX detected a misprediction: force a bubble
+	input             flush,
 
 	input             id_valid,
-	input      [31:0] id_pc,
-	input      [31:0] id_next_pc,
-	input       [3:0] id_dest_reg,
-	input       [3:0] id_src_reg,
-	input      [31:0] id_imm,
-	input       [5:0] id_alu_op,
-	input             id_src_a_is_imm,
-	input             id_writes_reg,
-	input             id_writes_ccr,
-	input             id_is_branch,
-	input             id_is_scc,
-	input             id_is_dbcc,
-	input             id_is_mem_src,
-	input             id_is_jmp,
-	input             id_is_bsr,
-	input             id_is_jsr,
-	input             id_is_trap,
-	input             id_is_illegal,
-	input             id_is_movesr,
-	input             id_is_movec,
-	input             id_is_rts,
-	input             id_is_rte,
-	input       [3:0] id_cond,
+	input  id_t       id_i,
 
-	output            ea_stall,   // to ID: no local stall of its own yet
+	input      [15:0] sr_in,      // architectural SR (WB write-through)
+
+	// register reads
+	output      [4:0] ra_sb, ra_si, ra_db, ra_di,
+	input      [31:0] rd_sb, rd_si, rd_db, rd_di,
+
+	// pending writes of the instructions ahead
+	input             p_eaf_v,    // EA-fetch stage
+	input  eac_t      p_eaf,
+	input             p_eaf_blk,  // EA-fetch holds a serialising/sequenced instruction
+	input             p_ex_v,     // execute stage
+	input             p_ex_w0_v,
+	input       [4:0] p_ex_w0_r,
+	input             p_ex_u0_v, input [4:0] p_ex_u0_r, input [31:0] p_ex_u0_val,
+	input             p_ex_u1_v, input [4:0] p_ex_u1_r, input [31:0] p_ex_u1_val,
+
+	output            ea_stall,   // to ID
 
 	output reg        eac_valid,
-	output reg [31:0] eac_pc,
-	output reg [31:0] eac_next_pc,
-	output reg  [3:0] eac_dest_reg,
-	output reg  [3:0] eac_src_reg,
-	output reg [31:0] eac_imm,
-	output reg  [5:0] eac_alu_op,
-	output reg        eac_src_a_is_imm,
-	output reg        eac_writes_reg,
-	output reg        eac_writes_ccr,
-	output reg        eac_is_branch,
-	output reg        eac_is_scc,
-	output reg        eac_is_dbcc,
-	output reg        eac_is_mem_src,
-	output reg        eac_is_jmp,
-	output reg        eac_is_bsr,
-	output reg        eac_is_jsr,
-	output reg        eac_is_trap,
-	output reg        eac_is_illegal,
-	output reg        eac_is_movesr,
-	output reg        eac_is_movec,
-	output reg        eac_is_rts,
-	output reg        eac_is_rte,
-	output reg  [3:0] eac_cond
+	output eac_t      eac_o
 );
 
-assign ea_stall = stall_in;
+wire s_bit = sr_in[13];
+wire m_bit = sr_in[12];
+
+// resolved register numbers
+wire [4:0] r_sb = resolve_sp(id_i.src.reg_n, s_bit, m_bit);
+wire [4:0] r_si = resolve_sp(id_i.src.idx_reg, s_bit, m_bit);
+wire [4:0] r_db = resolve_sp(id_i.dst.reg_n, s_bit, m_bit);
+wire [4:0] r_di = resolve_sp(id_i.dst.idx_reg, s_bit, m_bit);
+
+assign ra_sb = r_sb; assign ra_si = r_si; assign ra_db = r_db; assign ra_di = r_di;
+
+// which registers this instruction reads in this stage
+wire use_sb = (id_i.src.kind == EK_MEM) && id_i.src.base_en;
+wire use_si = (id_i.src.kind == EK_MEM) && id_i.src.idx_en;
+wire use_db = (id_i.dst.kind == EK_MEM) && id_i.dst.base_en;
+wire use_di = (id_i.dst.kind == EK_MEM) && id_i.dst.idx_en;
+
+// forwarding: returns {stall, hit, value}
+function automatic logic [33:0] fwd(input logic [4:0] r, input logic [31:0] rf,
+                                    input logic ev, input eac_t e,
+                                    input logic xv, input logic xw0v, input logic [4:0] xw0r,
+                                    input logic xu0v, input logic [4:0] xu0r, input logic [31:0] xu0d,
+                                    input logic xu1v, input logic [4:0] xu1r, input logic [31:0] xu1d);
+	// EA-fetch stage (youngest)
+	if (ev && e.w0_v && e.w0_r == r) return {1'b1, 1'b0, 32'd0};
+	if (ev && e.u1_v && e.u1_r == r) return {1'b0, 1'b1, e.u1_val};
+	if (ev && e.u0_v && e.u0_r == r) return {1'b0, 1'b1, e.u0_val};
+	// execute stage
+	if (xv && xw0v && xw0r == r) return {1'b1, 1'b0, 32'd0};
+	if (xv && xu1v && xu1r == r) return {1'b0, 1'b1, xu1d};
+	if (xv && xu0v && xu0r == r) return {1'b0, 1'b1, xu0d};
+	// register file (WB write-through inside it)
+	return {1'b0, 1'b0, rf};
+endfunction
+
+wire [33:0] f_sb = fwd(r_sb, rd_sb, p_eaf_v, p_eaf, p_ex_v, p_ex_w0_v, p_ex_w0_r,
+                       p_ex_u0_v, p_ex_u0_r, p_ex_u0_val, p_ex_u1_v, p_ex_u1_r, p_ex_u1_val);
+wire [33:0] f_si = fwd(r_si, rd_si, p_eaf_v, p_eaf, p_ex_v, p_ex_w0_v, p_ex_w0_r,
+                       p_ex_u0_v, p_ex_u0_r, p_ex_u0_val, p_ex_u1_v, p_ex_u1_r, p_ex_u1_val);
+wire [33:0] f_db = fwd(r_db, rd_db, p_eaf_v, p_eaf, p_ex_v, p_ex_w0_v, p_ex_w0_r,
+                       p_ex_u0_v, p_ex_u0_r, p_ex_u0_val, p_ex_u1_v, p_ex_u1_r, p_ex_u1_val);
+wire [33:0] f_di = fwd(r_di, rd_di, p_eaf_v, p_eaf, p_ex_v, p_ex_w0_v, p_ex_w0_r,
+                       p_ex_u0_v, p_ex_u0_r, p_ex_u0_val, p_ex_u1_v, p_ex_u1_r, p_ex_u1_val);
+
+wire hazard = id_valid && (p_eaf_blk ||
+                           (use_sb && f_sb[33]) || (use_si && f_si[33]) ||
+                           (use_db && f_db[33]) || (use_di && f_di[33]));
+
+assign ea_stall = stall_in || hazard;
+
+function automatic logic [31:0] step(input logic [1:0] sz, input logic [4:0] r);
+	if (sz == SZ_B) return (r == R_USP || r == R_ISP || r == R_MSP) ? 32'd2 : 32'd1;
+	return (sz == SZ_W) ? 32'd2 : 32'd4;
+endfunction
+
+function automatic logic [31:0] scaled(input logic [31:0] v, input logic l, input logic [1:0] sc);
+	logic [31:0] x;
+	x = l ? v : sext16(v[15:0]);
+	return x << sc;
+endfunction
+
+// one EA: {ea, add (memory indirect), new An value, update?}
+typedef struct packed { logic [31:0] ea; logic [31:0] add; logic [31:0] nv; logic upd; } eares_t;
+
+function automatic eares_t eacomp(input ea_t e, input logic [1:0] sz, input logic [4:0] rb,
+                                  input logic [31:0] base_v, input logic [31:0] idx_v);
+	eares_t r;
+	logic [31:0] base, idx;
+	base  = e.base_en ? base_v : 32'd0;
+	idx   = e.idx_en ? scaled(idx_v, e.idx_l, e.scale) : 32'd0;
+	r.upd = (e.kind == EK_MEM) && (e.upd != UPD_NONE);
+	r.nv  = (e.upd == UPD_PRE) ? base - step(sz, rb) : base + step(sz, rb);
+	r.add = 32'd0;
+	case (e.mi)
+		MI_PRE:  begin r.ea = base + e.bd + idx; r.add = e.od; end
+		MI_POST: begin r.ea = base + e.bd;       r.add = e.od + idx; end
+		default: r.ea = (e.upd == UPD_PRE) ? r.nv : base + e.bd + idx;
+	endcase
+	return r;
+endfunction
+
+wire eares_t sres = eacomp(id_i.src, id_i.size, r_sb, f_sb[31:0], f_si[31:0]);
+// the destination sees the source's update of the same register
+wire [31:0]  db_v = (sres.upd && r_sb == r_db) ? sres.nv : f_db[31:0];
+wire [31:0]  di_v = (sres.upd && r_sb == r_di) ? sres.nv : f_di[31:0];
+wire eares_t dres = eacomp(id_i.dst, id_i.size, r_db, db_v, di_v);
+
+// the result register this instruction will write (w0), for the stages behind
+function automatic logic w0_of(input id_t i);
+	case (i.cls)
+		CL_ALU:  return (i.dst.kind == EK_DREG || i.dst.kind == EK_AREG);
+		CL_DBCC, CL_SCC: return 1'b1;
+		CL_MOVEC: return !i.imm[4] || i.imm[3:0] == CR_USP || i.imm[3:0] == CR_ISP || i.imm[3:0] == CR_MSP;
+		default: return 1'b0;
+	endcase
+endfunction
+
+function automatic eac_t mk(input id_t i, input eares_t s, input eares_t d,
+                            input logic [4:0] rsb, input logic [4:0] rdb, input logic sb, input logic mb);
+	eac_t o;
+	o = '0;
+	o.i      = i;
+	o.src_ea = s.ea;  o.src_add = s.add;
+	o.dst_ea = d.ea;  o.dst_add = d.add;
+	o.src_r  = rsb;
+	o.dst_r  = rdb;
+	o.u0_v   = s.upd;  o.u0_r = rsb; o.u0_val = s.nv;
+	o.u1_v   = d.upd;  o.u1_r = rdb; o.u1_val = d.nv;
+	// the source's own update of a register the destination also updates
+	// is superseded (the destination was computed from it)
+	if (s.upd && d.upd && rsb == rdb) o.u0_v = 1'b0;
+	o.w0_v   = w0_of(i);
+	o.w0_r   = rdb;
+	if (i.cls == CL_MOVEC)
+		o.w0_r = !i.imm[4] ? resolve_sp(i.src.reg_n, sb, mb) :
+		         (i.imm[3:0] == CR_USP) ? R_USP : (i.imm[3:0] == CR_ISP) ? R_ISP : R_MSP;
+	return o;
+endfunction
+
+wire eac_t o = mk(id_i, sres, dres, r_sb, r_db, s_bit, m_bit);
 
 always @(posedge clk) begin
 	if (!nreset) begin
-		eac_valid        <= 1'b0;
-		eac_pc           <= 32'h0;
-		eac_next_pc      <= 32'h0;
-		eac_dest_reg     <= 4'h0;
-		eac_src_reg      <= 4'h0;
-		eac_imm          <= 32'h0;
-		eac_alu_op       <= 6'h0;
-		eac_src_a_is_imm <= 1'b0;
-		eac_writes_reg   <= 1'b0;
-		eac_writes_ccr   <= 1'b0;
-		eac_is_branch    <= 1'b0;
-		eac_is_scc       <= 1'b0;
-		eac_is_dbcc      <= 1'b0;
-		eac_is_mem_src   <= 1'b0;
-		eac_is_jmp       <= 1'b0;
-		eac_is_bsr       <= 1'b0;
-		eac_is_jsr       <= 1'b0;
-		eac_is_trap      <= 1'b0;
-		eac_is_illegal   <= 1'b0;
-		eac_is_movesr    <= 1'b0;
-		eac_is_movec     <= 1'b0;
-		eac_is_rts       <= 1'b0;
-		eac_is_rte       <= 1'b0;
-		eac_cond         <= 4'h0;
+		eac_valid <= 1'b0;
+		eac_o     <= '0;
 	end else if (ce) begin
 		if (flush) begin
 			eac_valid <= 1'b0;
 		end else if (!stall_in) begin
-			eac_valid        <= id_valid;
-			eac_pc           <= id_pc;
-			eac_next_pc      <= id_next_pc;
-			eac_dest_reg     <= id_dest_reg;
-			eac_src_reg      <= id_src_reg;
-			eac_imm          <= id_imm;
-			eac_alu_op       <= id_alu_op;
-			eac_src_a_is_imm <= id_src_a_is_imm;
-			eac_writes_reg   <= id_writes_reg;
-			eac_writes_ccr   <= id_writes_ccr;
-			eac_is_branch    <= id_is_branch;
-			eac_is_scc       <= id_is_scc;
-			eac_is_dbcc      <= id_is_dbcc;
-			eac_is_mem_src   <= id_is_mem_src;
-			eac_is_jmp       <= id_is_jmp;
-			eac_is_bsr       <= id_is_bsr;
-			eac_is_jsr       <= id_is_jsr;
-			eac_is_trap      <= id_is_trap;
-			eac_is_illegal   <= id_is_illegal;
-			eac_is_movesr    <= id_is_movesr;
-			eac_is_movec     <= id_is_movec;
-			eac_is_rts       <= id_is_rts;
-			eac_is_rte       <= id_is_rte;
-			eac_cond         <= id_cond;
+			eac_valid <= id_valid && !hazard;
+			if (id_valid && !hazard) eac_o <= o;
 		end
 	end
 end

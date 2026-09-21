@@ -141,11 +141,18 @@ initial begin
 	dut.u_l1.mem[128] = 16'h7A99; // MOVEQ #$99,D5
 	dut.u_l1.mem[129] = 16'h4E71; // NOP (drain)
 
-	// Vector table: vector 8 (privilege violation) -> $500. Word index
-	// computed the same PC_RESET-relative-wraparound way every exception
-	// test since milestone 14 has used -- see ap040_ea_fetch.v's header.
+	// Vector table: vector 8 (privilege violation) -> $500.  Minimig plan
+	// M1: the vector is fetched from VBR + 4*vector (M68040UM 8.1, p. 8-4),
+	// and this program set VBR = $40 in phase 1, so vector 8 lives at $60
+	// (word index 3632), not at $20 (3600) where the milestone-15 core --
+	// which ignored VBR, plan s.6 2b -- read it.  Both are written: the
+	// handler address at $60 is the one a correct core uses; $20 holds an
+	// odd address, so a core that ignores VBR takes a double fault instead
+	// of passing by accident.
+	dut.u_l1.mem[3632] = 16'h0000;
+	dut.u_l1.mem[3633] = 16'h0500;
 	dut.u_l1.mem[3600] = 16'h0000;
-	dut.u_l1.mem[3601] = 16'h0500;
+	dut.u_l1.mem[3601] = 16'h0501;
 end
 
 initial begin

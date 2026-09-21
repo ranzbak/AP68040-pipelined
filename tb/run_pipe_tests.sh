@@ -1,13 +1,15 @@
 #!/bin/sh
-# AP040_PIPE self-test suite -- the pipelined core under active development
-# (rtl/ap040_pipe_core.v and its stage files). Needs only iverilog: every
-# tb_ap040_pipe_*.v bench pokes its own tiny program directly into
-# ap040_inst_fetch.v's ROM (dut.u_if.rom[...]) at time 0, so there is no
-# assembler dependency here the way run_tests.sh has for the rtl_old suite.
+# AP040_PIPE self-test suite -- the pipelined core (rtl/ap040_pipe_core.v and
+# its stage files).  Needs only iverilog.  Most benches poke their program
+# straight into the L1 array (dut.u_l1.mem[...]) at time 0.
 #
-# rtl/ap040_pipe_core.v is deliberately self-contained (see its header) --
-# this is the complete source list, no other rtl/ or rtl_old/ file is ever
-# needed to build it.
+# The source list is rtl/ap040_pipe_pkg.sv (a package: compiled first) plus
+# every rtl/ap040_*.v -- rtl_old/ is never needed.
+#
+# Minimig plan M1: the milestone-12 unit bench tb_ap040_pipe_l1_wbuf.v is
+# retired with the one-entry write buffer it tested (ap040_pipe_l1.v was
+# rewritten with byte-granular read/write ports; tb_ap040_pipe_l1_bytes.v
+# tests those).
 set -eu
 cd "$(dirname "$0")"
 
@@ -15,42 +17,29 @@ RTL=../rtl
 WORK=build
 mkdir -p "$WORK"
 
-SRC="$RTL/ap040_pipe_core.v $RTL/ap040_inst_fetch.v $RTL/ap040_decode.v \
-     $RTL/ap040_ea_calc.v $RTL/ap040_ea_fetch.v $RTL/ap040_execute.v \
-     $RTL/ap040_writeback.v $RTL/ap040_pipe_alu.v $RTL/ap040_pipe_regfile.v \
-     $RTL/ap040_pipe_l1.v"
+SRC="$RTL/ap040_pipe_pkg.sv $(ls $RTL/ap040_*.v | tr '\n' ' ')"
 
-# tb_ap040_pipe_l1_wbuf.v tests ap040_pipe_l1.v standalone, not through
-# ap040_pipe_core.v (no pipeline instruction drives wren_b yet) -- give it
-# just the one file it needs. Compiling it against the full SRC above would
-# put two top-level-instantiable modules (this tb AND ap040_pipe_core.v
-# itself) in one compilation unit, which iverilog treats as two independent
-# simulation roots -- not wrong exactly, just pointless and confusing.
-L1_SRC="$RTL/ap040_pipe_l1.v"
-
+# milestone benches (1-17)
 TESTS="nop moveq add bra bcc bccw bccl scc dbcc move_mem move_disp jmp bsr jsr exc sup rts_rte addrerr"
+# Minimig plan benches, by milestone
+TESTS="$TESTS red_movew red_rte_fmt2 red_vbr red_aline_fline"               # M0 red legs, green since M1
+TESTS="$TESTS ${PIPE_EXTRA_TESTS:-}"
 
 echo "== compiling pipe benches =="
 for t in $TESTS; do
-	iverilog -g2012 -I "$RTL" -o "$WORK/tb_pipe_$t.vvp" "tb_ap040_pipe_$t.v" $SRC
+	iverilog -g2012 -I "$RTL" -o "$WORK/tb_pipe_$t.vvp" "tb_ap040_pipe_$t.v" $SRC > "$WORK/tb_pipe_$t.clog" 2>&1 || {
+		echo "  COMPILE-ERROR $t"; grep -v "sorry: constant selects" "$WORK/tb_pipe_$t.clog" | head -5; exit 1; }
 done
-iverilog -g2012 -I "$RTL" -o "$WORK/tb_pipe_l1_wbuf.vvp" tb_ap040_pipe_l1_wbuf.v $L1_SRC
 
 echo "== running =="
 fail=0
 for t in $TESTS; do
-	if vvp "$WORK/tb_pipe_$t.vvp" 2>&1 | tee "$WORK/pipe_$t.log" | grep -q "ALL TESTS PASSED"; then
+	if timeout 600 vvp "$WORK/tb_pipe_$t.vvp" > "$WORK/pipe_$t.log" 2>&1 && grep -q "ALL TESTS PASSED" "$WORK/pipe_$t.log"; then
 		echo "  pass  $t"
 	else
 		echo "  FAIL  $t  (see $WORK/pipe_$t.log)"
 		fail=1
 	fi
 done
-if vvp "$WORK/tb_pipe_l1_wbuf.vvp" 2>&1 | tee "$WORK/pipe_l1_wbuf.log" | grep -q "ALL TESTS PASSED"; then
-	echo "  pass  l1_wbuf"
-else
-	echo "  FAIL  l1_wbuf  (see $WORK/pipe_l1_wbuf.log)"
-	fail=1
-fi
 
 if [ $fail -eq 0 ]; then echo "AP040_PIPE: ALL TESTS PASSED"; else echo "AP040_PIPE: FAILURES"; exit 1; fi

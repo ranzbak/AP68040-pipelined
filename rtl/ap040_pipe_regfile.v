@@ -1,36 +1,26 @@
 //--------------------------------------------------------------------------//
-// AP040_PIPE - MC68040-style pipelined core (milestone 6: folder           //
-// independence + Scc.B)                                                    //
+// AP040_PIPE - MC68040-style pipelined core                                //
 //                                                                          //
-// ap040_pipe_regfile.v - D0-D7, A0-A6 and the three stack pointers        //
+// ap040_pipe_regfile.v - D0-D7, A0-A6, USP, ISP, MSP (Minimig plan M1)     //
 //                                                                          //
-// This is the pipe's own fork of rtl/ap040/ap040_regfile.v, not a shared   //
-// instantiation of it: milestones 2 and 5 had added a WRITE_THROUGH        //
-// parameter and a dbg_d3 tap to the shared file, on the reasoning that     //
-// both were safe/inert additions for the working sequential core. The     //
-// user decided that's not the structure wanted -- rtl/ap040/ stays        //
-// completely untouched from here on, and rtl/ap040_pipe/ is fully self-    //
-// contained, so deleting either directory can never affect the other.      //
-// Both prior additions are folded in permanently here instead of carried   //
-// as an opt-in: WRITE_THROUGH is unconditional (no parameter -- this core   //
-// always needs the same-cycle write-then-read bypass, see                  //
-// ap040_pipe_core.v's header comment), and the debug taps cover all eight   //
-// data registers (dbg_d0-dbg_d7) rather than growing one at a time -- this  //
-// exact file had already needed a one-more-register tap addition twice,    //
-// and the taps are zero-risk pure wires.                                   //
+// Physical register numbers (ap040_pipe_pkg.sv): 0-7 D0-D7, 8-14 A0-A6,    //
+// 16 USP, 17 ISP, 18 MSP.  (15, "A7 as written", is resolved to one of the  //
+// three stack pointers before it gets here; reading it returns 0.)         //
 //                                                                          //
-// Named ap040_pipe_regfile, not ap040_regfile, for the same reason         //
-// ap040_pipe_core is never ap040_core (see its header comment): it must    //
-// never collide with, or be silently substitutable for, the shared         //
-// sequential-core module of the same shape.                                //
+// Three write ports, all committed by WB in the same clock:                //
+//   w0  the instruction's result                                           //
+//   u1  the destination EA's (An)+/-(An) update                             //
+//   u0  the source EA's update, or a sequenced stack-pointer write          //
+// Priority when two name the same register: w0 > u1 > u0 (MOVEA (A0)+,A0   //
+// loads A0, the increment is lost; MOVE (A0)+,(A0)+ -- EA-calc already     //
+// folded the two updates into u1).                                        //
 //                                                                          //
-// Register index encoding on both read ports and the write port:          //
-//   0..7  = D0..D7                                                         //
-//   8..14 = A0..A6                                                         //
-//   15    = A7, banked to USP/ISP/MSP by the current SR.S/SR.M state       //
+// Six asynchronous read ports (EA-calc 4, EA-fetch 2), each with the       //
+// write-through of all three write ports, so an instruction reading a      //
+// register in the clock its producer commits sees the new value.          //
 //                                                                          //
-// Writes are full 32-bit; the core performs read-modify-write merging for  //
-// byte and word register destinations.                                     //
+// The arrays keep the names dreg/areg/usp/isp/msp the milestone benches    //
+// poke hierarchically.                                                     //
 //--------------------------------------------------------------------------//
 
 module ap040_pipe_regfile
@@ -39,41 +29,19 @@ module ap040_pipe_regfile
 	input             ce,
 	input             nreset,
 
-	// active stack pointer selection
-	input             sr_s,
-	input             sr_m,
+	input             w0_we, input [4:0] w0_r, input [31:0] w0_d,
+	input             u1_we, input [4:0] u1_r, input [31:0] u1_d,
+	input             u0_we, input [4:0] u0_r, input [31:0] u0_d,
 
-	// write port
-	input             we,
-	input       [3:0] waddr,
-	input      [31:0] wdata,
+	input       [4:0] ra0, ra1, ra2, ra3, ra4, ra5,
+	output     [31:0] rd0, rd1, rd2, rd3, rd4, rd5,
 
-	// read ports
-	input       [3:0] raddr_a,
-	output     [31:0] rdata_a,
-	input       [3:0] raddr_b,
-	output     [31:0] rdata_b,
-
-	// direct stack pointer access for MOVEC/MOVE USP, independent of the
-	// currently active bank (never asserted together with the main write)
-	input             aux_we,
-	input       [1:0] aux_sel,     // 0=USP 1=ISP 2=MSP
-	input      [31:0] aux_wdata,
 	output     [31:0] usp_q,
 	output     [31:0] isp_q,
 	output     [31:0] msp_q,
 
-	// debug taps (registered values, no extra logic on the write path)
-	output     [31:0] dbg_d0,
-	output     [31:0] dbg_d1,
-	output     [31:0] dbg_d2,
-	output     [31:0] dbg_d3,
-	output     [31:0] dbg_d4,
-	output     [31:0] dbg_d5,
-	output     [31:0] dbg_d6,
-	output     [31:0] dbg_d7,
-	output     [31:0] dbg_a0,
-	output     [31:0] dbg_a7
+	output     [31:0] dbg_d0, dbg_d1, dbg_d2, dbg_d3,
+	output     [31:0] dbg_d4, dbg_d5, dbg_d6, dbg_d7
 );
 
 reg [31:0] dreg [0:7];
@@ -82,23 +50,38 @@ reg [31:0] usp;
 reg [31:0] isp;
 reg [31:0] msp;
 
-// A7 resolves to the active stack pointer
-wire [1:0] sp_sel = !sr_s ? 2'd0 : (sr_m ? 2'd2 : 2'd1); // 0=USP 1=ISP 2=MSP
-wire [31:0] sp_active = (sp_sel == 2'd0) ? usp : (sp_sel == 2'd1) ? isp : msp;
+// Read ports as direct expressions, not a function: a function that reads
+// the arrays breaks continuous-assignment sensitivity in Icarus (the
+// milestone-2 note, still true).  The 32 registers' flat view is built once.
+wire [31:0] flat [0:31];
+genvar g;
+generate
+	for (g = 0; g < 8; g = g + 1) begin : gd assign flat[g] = dreg[g]; end
+	for (g = 0; g < 7; g = g + 1) begin : ga assign flat[8 + g] = areg[g]; end
+	for (g = 19; g < 32; g = g + 1) begin : gz assign flat[g] = 32'd0; end
+endgenerate
+assign flat[15] = 32'd0;
+assign flat[16] = usp;
+assign flat[17] = isp;
+assign flat[18] = msp;
 
-// direct expressions, not a function: a function referencing the register
-// arrays breaks continuous-assign sensitivity on some simulators.
-//
-// Same-cycle write-then-read bypass, unconditional (this core can have a
-// write and a same-address read of the same register committing in the
-// same cycle -- the WB-forward case -- and needs the read to see it; see
-// ap040_pipe_core.v's header comment for the full picture).
-assign rdata_a = (we && (waddr == raddr_a)) ? wdata :
-                 !raddr_a[3]            ? dreg[raddr_a[2:0]] :
-                 (raddr_a[2:0] == 3'd7) ? sp_active : areg[raddr_a[2:0]];
-assign rdata_b = (we && (waddr == raddr_b)) ? wdata :
-                 !raddr_b[3]            ? dreg[raddr_b[2:0]] :
-                 (raddr_b[2:0] == 3'd7) ? sp_active : areg[raddr_b[2:0]];
+`define AP040_RF_RD(ra) ((w0_we && w0_r == (ra)) ? w0_d : (u1_we && u1_r == (ra)) ? u1_d : \
+                         (u0_we && u0_r == (ra)) ? u0_d : flat[(ra)])
+assign rd0 = `AP040_RF_RD(ra0);
+assign rd1 = `AP040_RF_RD(ra1);
+assign rd2 = `AP040_RF_RD(ra2);
+assign rd3 = `AP040_RF_RD(ra3);
+assign rd4 = `AP040_RF_RD(ra4);
+assign rd5 = `AP040_RF_RD(ra5);
+`undef AP040_RF_RD
+
+task automatic wr(input [4:0] r, input [31:0] v);
+	if (r[4:3] == 2'b00)                      dreg[r[2:0]] <= v;
+	else if (r[4:3] == 2'b01 && r[2:0] != 7)  areg[r[2:0]] <= v;
+	else if (r == 5'd16)                      usp <= v;
+	else if (r == 5'd17)                      isp <= v;
+	else if (r == 5'd18)                      msp <= v;
+endtask
 
 integer i;
 always @(posedge clk) begin
@@ -108,26 +91,11 @@ always @(posedge clk) begin
 		usp <= 0;
 		isp <= 0;
 		msp <= 0;
-	end
-	else if (ce) begin
-		if (we) begin
-			if (!waddr[3])            dreg[waddr[2:0]] <= wdata;
-			else if (waddr[2:0] != 7) areg[waddr[2:0]] <= wdata;
-			else begin
-				case (sp_sel)
-					2'd0:    usp <= wdata;
-					2'd1:    isp <= wdata;
-					default: msp <= wdata;
-				endcase
-			end
-		end
-		if (aux_we) begin
-			case (aux_sel)
-				2'd0:    usp <= aux_wdata;
-				2'd1:    isp <= aux_wdata;
-				default: msp <= aux_wdata;
-			endcase
-		end
+	end else if (ce) begin
+		// lowest priority first: the later nonblocking write wins
+		if (u0_we) wr(u0_r, u0_d);
+		if (u1_we) wr(u1_r, u1_d);
+		if (w0_we) wr(w0_r, w0_d);
 	end
 end
 
@@ -143,7 +111,5 @@ assign dbg_d4 = dreg[4];
 assign dbg_d5 = dreg[5];
 assign dbg_d6 = dreg[6];
 assign dbg_d7 = dreg[7];
-assign dbg_a0 = areg[0];
-assign dbg_a7 = sp_active;
 
 endmodule
