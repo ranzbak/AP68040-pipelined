@@ -47,23 +47,32 @@ module ap040_pipe_core
 );
 
 //--------------------------------------------------------------- stage wires
-wire        if_valid;  wire [31:0] if_pc;  wire [15:0] if_opcode;
+wire        q_v0, q_v1;  wire [31:0] q_pc0;  wire [15:0] q_w0, q_w1;  wire [1:0] id_consume;
 wire        id_valid;  id_t id_o;
 wire        eac_valid; eac_t eac_o;
 wire        eaf_valid; ex_t eaf_o;
 wire        exe_valid; wb_t exe_o;
 wire        wb_valid;  wire [31:0] wb_pc;
 
-wire id_stall, ea_stall, eaf_stall, ex_stall;
+wire ea_stall, eaf_stall, ex_stall;
 wire eaf_blk, eaf_halted;
 
 wire        id_redirect_valid;
 wire [31:0] id_redirect_pc;
 wire        ex_redirect;
 wire [31:0] ex_redirect_pc;
-wire flush = ex_redirect;
-wire        redirect_valid = ex_redirect || id_redirect_valid;
-wire [31:0] redirect_pc    = ex_redirect ? ex_redirect_pc : id_redirect_pc;
+wire        eac_redir_v, eaf_redir_v;
+wire [31:0] eac_redir_pc, eaf_redir_pc;
+// Redirects, oldest first: EX (not-taken branch, RTE, MOVE to SR, exception
+// entry), EA-fetch (RTS, memory-indirect JMP/JSR), EA-calc (JMP/JSR), ID
+// (guessed-taken Bcc/BSR/DBcc).  Each flushes the stages in front of it.
+wire flush     = ex_redirect;                                   // EA-fetch
+wire flush_eac = ex_redirect || eaf_redir_v;                    // EA-calc
+wire flush_id  = ex_redirect || eaf_redir_v || eac_redir_v;     // ID
+wire        redirect_valid = ex_redirect || eaf_redir_v || eac_redir_v || id_redirect_valid;
+wire [31:0] redirect_pc    = ex_redirect ? ex_redirect_pc :
+                             eaf_redir_v ? eaf_redir_pc :
+                             eac_redir_v ? eac_redir_pc : id_redirect_pc;
 
 //--------------------------------------------------------------- commit (WB)
 wire commit = exe_valid;
@@ -123,7 +132,7 @@ ap040_pipe_regfile u_regfile
 //--------------------------------------------------------------- memory
 wire [L1_AW-1:0] l1_addr_a;
 wire             l1_en_a;
-wire      [15:0] l1_rdata_a;
+wire      [31:0] l1_rdata_a;
 wire             d_rd_req, d_rd_ack;
 wire      [31:0] d_rd_addr, d_rd_data;
 wire       [1:0] d_rd_size;
@@ -156,30 +165,39 @@ ap040_inst_fetch #(
 	.FETCH_AT_RESET(RESET_FROM_VECTORS ? 0 : 1)
 ) u_if
 (
-	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(id_stall),
-	.redirect_valid(redirect_valid), .redirect_pc(redirect_pc), .ex_redirect(ex_redirect),
+	.clk(clk), .nreset(nreset), .ce(ce),
+	.redirect_valid(redirect_valid), .redirect_pc(redirect_pc),
+	.consume(id_consume),
 	.l1_addr_a(l1_addr_a), .l1_en_a(l1_en_a), .l1_rdata_a(l1_rdata_a),
-	.if_valid(if_valid), .if_pc(if_pc), .if_opcode(if_opcode)
+	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1)
 );
 
 ap040_decode u_id
 (
-	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ea_stall), .flush(flush),
-	.if_valid(if_valid), .if_pc(if_pc), .if_opcode(if_opcode),
-	.id_stall(id_stall),
+	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ea_stall), .flush(flush_id),
+	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1),
+	.consume(id_consume),
 	.id_redirect_valid(id_redirect_valid), .id_redirect_pc(id_redirect_pc),
 	.id_valid(id_valid), .id_o(id_o)
 );
+
+wire older_busy  = eaf_valid || exe_valid;
+wire older_store = eaf_valid && (eaf_o.st_v || eaf_o.dk == DK_MEM ||
+                                 eaf_o.cls == CL_BSR || eaf_o.cls == CL_JSR);
+wire    early_v;
+rdreq_t early_rd;
 
 // EX-stage pending writes for EA-calc
 wire        fw_w0_v;
 wire  [4:0] fw_w0_r;
 wire [31:0] fw_w0_val;
+wire        fw_ccr_v;
+wire  [4:0] fw_ccr;
 wire ex_w0_pend = eaf_valid && (eaf_o.dk == DK_REG || eaf_o.cls == CL_DBCC || eaf_o.cls == CL_SCC);
 
 ap040_ea_calc u_eac
 (
-	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(eaf_stall), .flush(flush),
+	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(eaf_stall), .flush(flush_eac),
 	.id_valid(id_valid), .id_i(id_o),
 	.sr_in(sr_now),
 	.ra_sb(ra_sb), .ra_si(ra_si), .ra_db(ra_db), .ra_di(ra_di),
@@ -190,13 +208,14 @@ ap040_ea_calc u_eac
 	.p_ex_u0_v(eaf_o.u0_v || eaf_o.sp_v), .p_ex_u0_r(eaf_o.sp_v ? eaf_o.sp_r : eaf_o.u0_r),
 	.p_ex_u0_val(eaf_o.sp_v ? eaf_o.sp_val : eaf_o.u0_val),
 	.p_ex_u1_v(eaf_o.u1_v), .p_ex_u1_r(eaf_o.u1_r), .p_ex_u1_val(eaf_o.u1_val),
+	.p_ex_store(older_store),
 	.ea_stall(ea_stall),
+	.early_v(early_v), .early(early_rd),
+	.eac_redir_v(eac_redir_v), .eac_redir_pc(eac_redir_pc),
 	.eac_valid(eac_valid), .eac_o(eac_o)
 );
 
-wire older_busy  = eaf_valid || exe_valid;
-wire older_store = eaf_valid && (eaf_o.st_v || eaf_o.dk == DK_MEM ||
-                                 eaf_o.cls == CL_BSR || eaf_o.cls == CL_JSR);
+
 
 ap040_ea_fetch u_eaf
 (
@@ -205,16 +224,19 @@ ap040_ea_fetch u_eaf
 	.sr_in(sr_now), .vbr_in(vbr),
 	.older_busy(older_busy), .older_store(older_store),
 	.reset_seq(RESET_FROM_VECTORS != 0),
+	.early_v(early_v), .early(early_rd),
 	.ra_a(ra_a), .ra_b(ra_b), .rd_a(rd_a), .rd_b(rd_b),
 	.ex_w0_v(fw_w0_v), .ex_w0_r(fw_w0_r), .ex_w0_val(fw_w0_val),
 	.ex_u0_v(eaf_valid && (eaf_o.u0_v || eaf_o.sp_v)), .ex_u0_r(eaf_o.sp_v ? eaf_o.sp_r : eaf_o.u0_r),
 	.ex_u0_val(eaf_o.sp_v ? eaf_o.sp_val : eaf_o.u0_val),
 	.ex_u1_v(eaf_valid && eaf_o.u1_v), .ex_u1_r(eaf_o.u1_r), .ex_u1_val(eaf_o.u1_val),
+	.ex_ccr_v(fw_ccr_v), .ex_ccr(fw_ccr),
 	.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size),
 	.rd_ack(d_rd_ack), .rd_data(d_rd_data),
 	.eaf_stall(eaf_stall), .eaf_blk(eaf_blk),
 	.eaf_valid(eaf_valid), .eaf_o(eaf_o),
-	.halted(eaf_halted)
+	.halted(eaf_halted),
+	.eaf_redir_v(eaf_redir_v), .eaf_redir_pc(eaf_redir_pc)
 );
 
 ap040_execute u_ex
@@ -225,6 +247,7 @@ ap040_execute u_ex
 	.sfc_in({29'd0, sfc}), .dfc_in({29'd0, dfc}), .cacr_in(cacr), .vbr_in(vbr),
 	.ex_stall(ex_stall),
 	.fw_w0_v(fw_w0_v), .fw_w0_r(fw_w0_r), .fw_w0_val(fw_w0_val),
+	.fw_ccr_v(fw_ccr_v), .fw_ccr(fw_ccr),
 	.ex_redirect(ex_redirect), .ex_redirect_pc(ex_redirect_pc),
 	.exe_valid(exe_valid), .exe_o(exe_o)
 );
@@ -236,7 +259,7 @@ ap040_writeback u_wb
 	.wb_stall(), .wb_valid(wb_valid), .wb_pc(wb_pc)
 );
 
-assign dbg_if_valid  = if_valid;  assign dbg_if_pc  = if_pc;
+assign dbg_if_valid  = q_v0;      assign dbg_if_pc  = q_pc0;
 assign dbg_id_valid  = id_valid;  assign dbg_id_pc  = id_o.pc;
 assign dbg_eac_valid = eac_valid; assign dbg_eac_pc = eac_o.i.pc;
 assign dbg_eaf_valid = eaf_valid; assign dbg_eaf_pc = eaf_o.pc;

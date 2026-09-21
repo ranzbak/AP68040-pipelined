@@ -11,7 +11,8 @@
 //   destination EA's.  The length of a brief/full-format EA is only known  //
 //   once its first extension word is in (full format: base and outer       //
 //   displacement sizes), so the length is re-evaluated as words arrive.    //
-// A single-word instruction is emitted in the clock it arrives, as before. //
+// Up to two words are taken per clock from IF's queue, so an instruction  //
+// of one or two words is emitted in the clock it arrives.                  //
 //                                                                          //
 // Both EAs are normalised to ea_t (ap040_pipe_pkg.sv); PC-relative modes   //
 // fold the extension word's address into bd here.                          //
@@ -39,11 +40,14 @@ module ap040_decode
 	input             stall_in,   // EA-calc cannot accept this cycle
 	input             flush,      // redirect from EX: abandon everything
 
-	input             if_valid,
-	input      [31:0] if_pc,
-	input      [15:0] if_opcode,
+	// the head of IF's prefetch queue: up to two words
+	input             q_v0,
+	input             q_v1,
+	input      [31:0] q_pc0,
+	input      [15:0] q_w0,
+	input      [15:0] q_w1,
 
-	output            id_stall,   // to IF
+	output      [1:0] consume,    // words taken from the queue this clock
 
 	output            id_redirect_valid,
 	output     [31:0] id_redirect_pc,
@@ -52,7 +56,6 @@ module ap040_decode
 	output id_t       id_o
 );
 
-assign id_stall = stall_in;
 
 //------------------------------------------------------------------ helpers
 
@@ -266,17 +269,20 @@ reg       [31:0] g_pc;     // address of word 0
 
 // the buffer as it will be with the incoming word appended
 function automatic logic [10:0][15:0] view(input logic [10:0][15:0] wb, input logic [3:0] n,
-                                           input logic tk, input logic [15:0] w);
+                                           input logic [1:0] tk, input logic [15:0] w0,
+                                           input logic [15:0] w1);
 	logic [10:0][15:0] v;
 	v = wb;
-	if (tk) v[n] = w;
+	if (tk >= 2'd1 && n <= 4'd10) v[n] = w0;
+	if (tk == 2'd2 && n <= 4'd9)  v[n + 1] = w1;
 	return v;
 endfunction
 
-wire              take   = if_valid;
-wire        [3:0] vcnt   = wcnt + (take ? 4'd1 : 4'd0);
-wire [10:0][15:0] vbuf   = view(wbuf, wcnt, take, if_opcode);
-wire       [31:0] vpc    = (wcnt == 4'd0) ? if_pc : g_pc;
+// words available this clock (the queue hands them out in order)
+wire        [1:0] avail  = q_v0 ? (q_v1 ? 2'd2 : 2'd1) : 2'd0;
+wire        [3:0] vcnt   = wcnt + {2'd0, avail};
+wire [10:0][15:0] vbuf   = view(wbuf, wcnt, avail, q_w0, q_w1);
+wire       [31:0] vpc    = (wcnt == 4'd0) ? q_pc0 : g_pc;
 
 // total length of the instruction in the view, if known
 typedef struct packed {
@@ -443,6 +449,13 @@ wire id_t d = decf(vbuf, vpc, sh, tot, ln.ea_bad);
 
 wire emit = complete && !flush && !stall_in;
 
+// words taken: on emit, only this instruction's (the next one's first word
+// may be the second word offered); while gathering, all of them; nothing
+// while EA-calc is stalled
+wire [4:0] need = tot - {1'b0, wcnt};
+assign consume = (flush || stall_in) ? 2'd0 :
+                 complete ? need[1:0] : avail;
+
 // guess taken: Bcc/BRA/BSR redirect IF the clock they are emitted
 assign id_redirect_valid = emit && (d.cls == CL_BCC || d.cls == CL_BSR || d.cls == CL_DBCC);
 assign id_redirect_pc    = d.btarget;
@@ -465,10 +478,10 @@ always @(posedge clk) begin
 				wcnt     <= 4'd0;
 			end else begin
 				id_valid <= 1'b0;
-				if (take) begin
-					wbuf[wcnt] <= if_opcode;
-					if (wcnt == 4'd0) g_pc <= if_pc;
-					wcnt <= wcnt + 4'd1;
+				if (avail != 2'd0) begin
+					wbuf <= vbuf;
+					if (wcnt == 4'd0) g_pc <= q_pc0;
+					wcnt <= vcnt;
 				end
 			end
 		end

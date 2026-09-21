@@ -52,6 +52,10 @@ module ap040_ea_fetch
 	input             older_busy, // EX or WB holds an instruction
 	input             older_store,// EX holds a store that has not reached memory
 	input             reset_seq,  // run the reset vector fetch first
+	// EA-calc's early read for the instruction moving in at the end of this
+	// clock (issued when this stage does not use the port itself)
+	input             early_v,
+	input  rdreq_t    early,
 
 	// register reads (with the regfile's WB write-through)
 	output      [4:0] ra_a, ra_b,
@@ -60,6 +64,7 @@ module ap040_ea_fetch
 	input             ex_w0_v, input [4:0] ex_w0_r, input [31:0] ex_w0_val,
 	input             ex_u0_v, input [4:0] ex_u0_r, input [31:0] ex_u0_val,
 	input             ex_u1_v, input [4:0] ex_u1_r, input [31:0] ex_u1_val,
+	input             ex_ccr_v, input [4:0] ex_ccr,   // the CCR EX's micro-op leaves
 
 	// data read port
 	output            rd_req,
@@ -73,7 +78,12 @@ module ap040_ea_fetch
 
 	output reg        eaf_valid,
 	output ex_t       eaf_o,
-	output            halted
+	output            halted,
+
+	// redirect from this stage: RTS (its return address is loaded here) and
+	// a JMP/JSR whose target needed a memory-indirect pointer
+	output            eaf_redir_v,
+	output     [31:0] eaf_redir_pc
 );
 
 wire id_t i = eac_i.i;
@@ -85,9 +95,6 @@ localparam [3:0] P_START = 4'd0,  // examine / wait for serialisation
                  P_RTE   = 4'd3,
                  P_RESET = 4'd4,
                  P_HALT  = 4'd5;
-
-localparam [2:0] T_SMI = 3'd0, T_DMI = 3'd1, T_SLD = 3'd2, T_DLD = 3'd3,
-                 T_SEQ0 = 3'd4, T_SEQ1 = 3'd5, T_SEQ2 = 3'd6, T_VEC = 3'd7;
 
 reg  [3:0] ph;
 reg        rd_pend;        // a read is outstanding
@@ -155,7 +162,6 @@ wire [31:0] s_addr_now = done_smi ? s_addr : eac_i.src_ea;
 wire [31:0] d_addr_now = done_dmi ? d_addr : eac_i.dst_ea;
 
 // next read the instruction needs: {valid, tag, addr, size}
-typedef struct packed { logic v; logic [2:0] t; logic [31:0] a; logic [1:0] sz; } rdreq_t;
 function automatic rdreq_t next_rd(input logic nsmi, input logic dsmi, input logic ndmi, input logic ddmi,
                                    input logic nsld, input logic dsld, input logic ndld, input logic ddld,
                                    input logic [31:0] sea, input logic [31:0] dea,
@@ -224,8 +230,9 @@ function automatic ex_t xord(input eac_t e, input logic [31:0] opa, input logic 
 	x.u0_v = e.u0_v; x.u0_r = e.u0_r; x.u0_val = e.u0_val;
 	x.u1_v = e.u1_v; x.u1_r = e.u1_r; x.u1_val = e.u1_val;
 	case (i.cls)
-		CL_JMP, CL_JSR: begin x.target = sa; x.redirect = 1'b1; end
-		CL_RTS:         begin x.target = sv; x.redirect = 1'b1; end
+		// JMP/JSR/RTS were redirected before EX (EA-calc, or this stage)
+		CL_JMP, CL_JSR: begin x.target = sa; x.redirect = 1'b0; end
+		CL_RTS:         begin x.target = sv; x.redirect = 1'b0; end
 		CL_MOVE2SR:     begin x.target = i.next_pc; x.redirect = 1'b1; end
 		CL_MOVEC: begin
 			x.creg_sel = i.imm[3:0];
@@ -245,7 +252,15 @@ function automatic ex_t xord(input eac_t e, input logic [31:0] opa, input logic 
 	return x;
 endfunction
 
-wire ex_t x_ord = xord(eac_i, op_a, op_b, s_addr_c, s_val_c, d_addr_c, d_val_c);
+wire ex_t x_ord0 = xord(eac_i, op_a, op_b, s_addr_c, s_val_c, d_addr_c, d_val_c);
+function automatic ex_t with_cc(input ex_t x, input logic c);
+	ex_t y;
+	y = x; y.cc = c;
+	return y;
+endfunction
+wire [4:0] ex_ccr_here = ex_ccr_v ? ex_ccr : sr_in[4:0];
+wire       br_cc       = cond_true(i.cond, ex_ccr_here);
+wire ex_t  x_ord       = with_cc(x_ord0, br_cc);
 
 function automatic logic [31:0] fsize(input logic [3:0] f);
 	case (f)
@@ -429,12 +444,30 @@ wire ex_t disp_x = dmux(st.dsel, x_ord,
                         rte_final(i, bank_now, rd_a, r_fv, r_sr, r_pc),
                         reset_final(i, x_sp, r_pc));
 
-assign rd_req    = st.issue && !flush;
-assign rd_addr   = st.ia;
-assign rd_size   = st.isz;
+// the early read goes out when this stage leaves the port free and is
+// taking the next instruction (its current one finishes, or it is empty)
+wire   use_early = early_v && early.v && !st.issue && (!rd_pend || rd_ack) &&
+                   (st.fin || !eac_valid) && !rst_pending;
+assign rd_req    = (st.issue || use_early) && !flush;
+assign rd_addr   = st.issue ? st.ia  : early.a;
+assign rd_size   = st.issue ? st.isz : early.sz;
+wire [2:0] rd_t  = st.issue ? st.it  : early.t;
 assign eaf_stall = eac_valid && !st.fin;
 assign eaf_blk   = eac_valid && (i.serialize || (ph != P_START && ph != P_OPS));
 assign halted    = (ph == P_HALT);
+
+// Bcc/DBcc were guessed taken by ID; a not-taken one is corrected here,
+// with the CCR the instruction ahead of it (in EX, or committing in WB)
+// leaves -- a two-clock correction instead of the four a redirect from EX
+// costs (M68040UM 10.5 p. 10-11: Bcc not taken 3, DBcc 3/4).
+wire [15:0] dbc_dec = op_b[15:0] - 16'd1;
+wire       br_taken = (i.cls == CL_BCC) ? br_cc : (!br_cc && dbc_dec != 16'hFFFF);
+
+assign eaf_redir_v  = st.disp && st.dsel == 3'd0 && !flush &&
+                      (i.cls == CL_RTS || ((i.cls == CL_JMP || i.cls == CL_JSR) && !eac_i.redirected) ||
+                       ((i.cls == CL_BCC || i.cls == CL_DBCC) && !br_taken));
+assign eaf_redir_pc = (i.cls == CL_RTS) ? s_val_c :
+                      (i.cls == CL_BCC || i.cls == CL_DBCC) ? i.next_pc : s_addr_c;
 
 //--------------------------------------------------------------- registers
 always @(posedge clk) begin
@@ -456,7 +489,7 @@ always @(posedge clk) begin
 		end
 		// read bookkeeping.  A read still outstanding when a flush arrives
 		// is answered later; rd_drop throws that answer away.
-		if (rd_req) begin rd_pend <= 1'b1; rd_tag <= st.it; end
+		if (rd_req) begin rd_pend <= 1'b1; rd_tag <= rd_t; end
 		else if (rd_ack) begin rd_pend <= 1'b0; rd_drop <= 1'b0; end
 		if (flush) begin
 			ph <= P_START;

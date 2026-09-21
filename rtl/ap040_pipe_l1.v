@@ -8,9 +8,9 @@
 // maps to word (a - PC_RESET) >> 1 (wrapped to the array), the convention  //
 // every milestone bench pokes mem[] with.                                  //
 //                                                                          //
-//   port A  instruction fetch: word index in, registered word out (as      //
-//           milestone 9a: address_a combinational, q_a one clock later,    //
-//           held while en_a is low)                                        //
+//   port A  instruction fetch: word index in, the two words at index and   //
+//           index+1 out one clock later (32 bits, IF's two words a clock),  //
+//           held while en_a is low                                         //
 //   port R  data read: rd_req (one clock) with byte address and size       //
 //           B/W/L; rd_ack and the right-aligned data one clock later.  Any //
 //           alignment: an odd word or long is assembled from its bytes (the //
@@ -36,7 +36,7 @@ module ap040_pipe_l1
 
 	input      [AW-1:0]  address_a,
 	input                en_a,
-	output reg [DW-1:0]  q_a,
+	output reg [31:0]    q_a,
 
 	input                rd_req,
 	input       [31:0]   rd_addr,
@@ -84,7 +84,7 @@ reg   [7:0] b;
 integer     k, n;
 
 always @(posedge clock) begin
-	if (en_a) q_a <= mem[address_a];
+	if (en_a) q_a <= {mem[address_a], mem[address_a + 1'b1]};
 	if (!nreset) begin
 		rd_ack <= 1'b0;
 	end else begin

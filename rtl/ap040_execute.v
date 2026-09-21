@@ -37,6 +37,9 @@ module ap040_execute
 	output      [4:0] fw_w0_r,
 	output     [31:0] fw_w0_val,
 
+	output            fw_ccr_v,
+	output      [4:0] fw_ccr,
+
 	output            ex_redirect,
 	output     [31:0] ex_redirect_pc,
 
@@ -113,14 +116,14 @@ always @* begin
 			end
 		end
 		CL_BCC: begin
-			redir = !cond; redir_pc = x.next_pc;
+			redir = 1'b0;            // resolved (and redirected) in EA-fetch
 		end
 		CL_BSR, CL_JSR: begin
 			w.st_v = 1'b1; w.st_addr = x.daddr; w.st_data = x.next_pc; w.st_size = SZ_L;
 		end
-		CL_DBCC: begin
-			if (!cond) begin w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = {x.b[31:16], dbcc_dec}; end
-			redir = !dbcc_taken; redir_pc = x.next_pc;
+		CL_DBCC: begin               // the branch was resolved in EA-fetch; EX decrements
+			if (!x.cc) begin w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = {x.b[31:16], dbcc_dec}; end
+			redir = 1'b0;
 		end
 		CL_SCC: begin
 			w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = {x.b[31:8], {8{cond}}};
@@ -140,6 +143,10 @@ always @* begin
 		default: ;
 	endcase
 end
+
+// the CCR this micro-op leaves, for EA-fetch's branch resolution
+assign fw_ccr_v  = eaf_valid && (w.ccr_v || w.sr_v);
+assign fw_ccr    = w.sr_v ? w.sr_val[4:0] : w.ccr_val;
 
 assign fw_w0_v   = eaf_valid && w.w0_v;
 assign fw_w0_r   = w.w0_r;

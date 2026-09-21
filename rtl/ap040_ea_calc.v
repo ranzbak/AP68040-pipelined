@@ -57,7 +57,17 @@ module ap040_ea_calc
 	input             p_ex_u0_v, input [4:0] p_ex_u0_r, input [31:0] p_ex_u0_val,
 	input             p_ex_u1_v, input [4:0] p_ex_u1_r, input [31:0] p_ex_u1_val,
 
+	input             p_ex_store, // EX holds a store that has not reached memory
+
 	output            ea_stall,   // to ID
+
+	// the early read (first memory read of the instruction moving to EA-fetch)
+	output            early_v,
+	output rdreq_t    early,
+
+	// JMP/JSR redirect from this stage
+	output            eac_redir_v,
+	output     [31:0] eac_redir_pc,
 
 	output reg        eac_valid,
 	output eac_t      eac_o
@@ -175,6 +185,7 @@ function automatic eac_t mk(input id_t i, input eares_t s, input eares_t d,
 	// is superseded (the destination was computed from it)
 	if (s.upd && d.upd && rsb == rdb) o.u0_v = 1'b0;
 	o.w0_v   = w0_of(i);
+	o.redirected = (i.cls == CL_JMP || i.cls == CL_JSR) && i.src.mi == MI_NONE && !s.ea[0];
 	o.w0_r   = rdb;
 	if (i.cls == CL_MOVEC)
 		o.w0_r = !i.imm[4] ? resolve_sp(i.src.reg_n, sb, mb) :
@@ -183,6 +194,22 @@ function automatic eac_t mk(input id_t i, input eares_t s, input eares_t d,
 endfunction
 
 wire eac_t o = mk(id_i, sres, dres, r_sb, r_db, s_bit, m_bit);
+
+// Early read: issued in the clock the instruction moves into EA-fetch, so
+// its answer arrives with it (an operand load then costs EA-fetch one clock,
+// M68040UM 10.1 p. 10-3: "one clock in the <ea> fetch stage for each memory
+// access").  Not while an older store has yet to reach memory: the one in
+// EA-fetch (it stores two clocks later) or the one in EX.
+assign early   = first_rd(id_i, sres.ea, dres.ea);
+// JMP/JSR: the target is this stage's source EA, so IF is redirected from
+// here (a memory-indirect target waits for EA-fetch; an odd one takes the
+// address error there, no redirect).  M68040UM 10.6 p. 10-20: JMP (An)
+// <ea> calculate 3, execute 2L+1.
+assign eac_redir_v  = id_valid && !hazard && !stall_in && !flush && o.redirected;
+assign eac_redir_pc = sres.ea;
+
+assign early_v = id_valid && !hazard && !stall_in && !flush &&
+                 !(p_eaf_v && stores(p_eaf.i)) && !p_ex_store;
 
 always @(posedge clk) begin
 	if (!nreset) begin

@@ -124,7 +124,36 @@ typedef struct packed {
 	logic [4:0]  dst_r;
 	logic        w0_v;         // the result register it will write (not known before EX)
 	logic [4:0]  w0_r;
+	logic        redirected;   // EA-calc already redirected IF to the JMP/JSR target
 } eac_t;
+
+// a data read: {valid, tag, byte address, size}.  Tags name what EA-fetch
+// does with the answer.
+localparam [2:0] T_SMI = 3'd0, T_DMI = 3'd1, T_SLD = 3'd2, T_DLD = 3'd3,
+                 T_SEQ0 = 3'd4, T_SEQ1 = 3'd5, T_SEQ2 = 3'd6, T_VEC = 3'd7;
+typedef struct packed { logic v; logic [2:0] t; logic [31:0] a; logic [1:0] sz; } rdreq_t;
+
+// the first read an ordinary instruction needs (EA-calc issues it early, in
+// the clock the instruction moves into EA-fetch, so the answer is there
+// when EA-fetch looks for it)
+function automatic rdreq_t first_rd(input id_t i, input logic [31:0] src_ea, input logic [31:0] dst_ea);
+	rdreq_t r;
+	logic ld_src, ld_dst;
+	r = '0; r.sz = SZ_L;
+	ld_src = (i.src.kind == EK_MEM) && !(i.cls == CL_JMP || i.cls == CL_JSR);
+	ld_dst = (i.dst.kind == EK_MEM) && i.rmw;
+	if (i.serialize) return r;
+	if (i.src.kind == EK_MEM && i.src.mi != MI_NONE)      begin r.v = 1'b1; r.t = T_SMI; r.a = src_ea; end
+	else if (i.dst.kind == EK_MEM && i.dst.mi != MI_NONE) begin r.v = 1'b1; r.t = T_DMI; r.a = dst_ea; end
+	else if (ld_src) begin r.v = 1'b1; r.t = T_SLD; r.a = src_ea; r.sz = i.size; end
+	else if (ld_dst) begin r.v = 1'b1; r.t = T_DLD; r.a = dst_ea; r.sz = i.size; end
+	return r;
+endfunction
+
+// does an instruction store (for the read-after-write hazard of early reads)
+function automatic logic stores(input id_t i);
+	return (i.dst.kind == EK_MEM) || i.cls == CL_BSR || i.cls == CL_JSR || i.serialize;
+endfunction
 
 // what EX does with its result
 localparam [2:0] DK_NONE = 3'd0, DK_REG = 3'd1, DK_MEM = 3'd2;
@@ -162,6 +191,7 @@ typedef struct packed {
 	logic [3:0]  creg_sel;     // MOVEC
 	logic        creg_to;      // MOVEC Rn,Rc
 	logic        exc;          // exception-entry final micro-op (trace/X stream)
+	logic        cc;           // Bcc/DBcc/Scc condition, evaluated in EA-fetch
 } ex_t;
 
 typedef struct packed {

@@ -1,23 +1,23 @@
 //--------------------------------------------------------------------------//
 // AP040_PIPE - MC68040-style pipelined core                                //
 //                                                                          //
-// ap040_inst_fetch.v - IF stage                                            //
+// ap040_inst_fetch.v - IF stage with a prefetch queue (Minimig plan M1)    //
 //                                                                          //
-// A PC register driving L1 port A; one 16-bit word per clock to ID.        //
-// redirect_valid/redirect_pc select the next PC instead of +2.             //
+// Fetches two 16-bit words per clock (one 32-bit read of L1 port A) into  //
+// a six-word queue; ID takes 0, 1 or 2 words from its head per clock.     //
+// Two words a clock is what lets an instruction with one extension word   //
+// (MOVE.L (d16,An),Dn) pass ID in one clock, as on the 68040 (M68040UM     //
+// 10.4, p. 10-9: <ea> calculate 1, execute 1) -- the M0.5 cycle checker   //
+// measured 3 clocks with the one-word IF.                                  //
 //                                                                          //
-// Minimig plan M1 changes:                                                 //
-//  * ex_redirect (EX's flush) is taken even while ID is stalled.  Before,   //
-//    a redirect arriving in a stalled clock was dropped and IF carried on   //
-//    down the wrong path (found by the M0.5 cycle checker: back-to-back    //
-//    JSRs with the write buffer busy).  ID's own redirect is only raised    //
-//    when ID is not stalled, so it needs no such rule.                     //
-//  * FETCH_AT_RESET = 0: IF stays idle after reset until the first         //
-//    redirect (the reset vector fetch in EA-fetch supplies it).  1 keeps    //
-//    the milestone benches' PC_RESET start.                               //
+// A redirect (EX's flush, or ID's guessed-taken branch) empties the queue, //
+// drops the fetch in flight, and fetches at the target in the same clock. //
 //                                                                          //
-// PROG_WORDS still bounds how many words are issued (the milestone benches' //
-// drain checks rely on it).                                                //
+// FETCH_AT_RESET = 0: idle after reset until the first redirect (the reset //
+// vector fetch in EA-fetch supplies it).  PROG_WORDS bounds how many words //
+// are fetched (the milestone benches' drain checks rely on it).           //
+//                                                                          //
+// Debug view (dbg_if_*): valid/pc of the queue head, i.e. the word ID sees. //
 //--------------------------------------------------------------------------//
 
 module ap040_inst_fetch
@@ -31,47 +31,91 @@ module ap040_inst_fetch
 	input             clk,
 	input             nreset,
 	input             ce,
-	input             stall_in,     // ID cannot accept a new word this cycle
 
 	input             redirect_valid,
 	input      [31:0] redirect_pc,
-	input             ex_redirect,  // redirect_valid is EX's flush: honour it through a stall
+
+	input       [1:0] consume,      // words ID takes from the head this clock
 
 	output [L1_AW-1:0] l1_addr_a,
 	output             l1_en_a,
-	input       [15:0] l1_rdata_a,
+	input       [31:0] l1_rdata_a,  // {word at addr, word at addr+2}
 
-	output reg        if_valid,
-	output reg [31:0] if_pc,
-	output     [15:0] if_opcode
+	output            q_v0,         // head word valid
+	output            q_v1,         // second word valid
+	output     [31:0] q_pc0,        // address of the head word
+	output     [15:0] q_w0,
+	output     [15:0] q_w1
 );
 
-reg [31:0] pc;
-reg [31:0] issued;
+localparam QN = 6;
+
+reg [15:0] q [0:QN-1];
+reg  [2:0] qcnt;
+reg [31:0] qpc;           // address of q[0]
+reg [31:0] fpc;           // next fetch address
+reg        infl;          // a fetch is in flight (data next clock)
+reg  [1:0] infl_n;        // how many words it carries
+reg [31:0] issued;        // words handed to ID so far
 reg        running;
-wire       have_more = (issued < PROG_WORDS) && (running || redirect_valid);
 
-wire [31:0] fetch_pc = redirect_valid ? redirect_pc : pc;
-wire        step     = ce && (!stall_in || ex_redirect);
+// PROG_WORDS bounds the words handed to ID (as the milestone-4 IF counted
+// the words it presented), not the words fetched
+assign q_v0  = (qcnt >= 3'd1) && (issued < PROG_WORDS);
+assign q_v1  = (qcnt >= 3'd2) && (issued + 32'd1 < PROG_WORDS);
+assign q_pc0 = qpc;
+assign q_w0  = q[0];
+assign q_w1  = q[1];
 
-assign l1_addr_a = (fetch_pc - PC_RESET) >> 1;
-assign l1_en_a   = step;
-assign if_opcode = l1_rdata_a;
+wire  [1:0] want      = 2'd2;
+wire  [2:0] after_c   = redirect_valid ? 3'd0 : (qcnt - {1'b0, consume});
+wire  [2:0] pend      = (!redirect_valid && infl) ? {1'b0, infl_n} : 3'd0;
+wire        can_issue = ce && (running || redirect_valid) && (want != 2'd0) &&
+                        (after_c + pend + 3'd2 <= QN);
+wire [31:0] f_addr    = redirect_valid ? redirect_pc : fpc;
+
+assign l1_addr_a = (f_addr - PC_RESET) >> 1;
+assign l1_en_a   = can_issue;
+
+integer k;
+reg [15:0] nq [0:QN-1];
+reg  [2:0] ncnt;
 
 always @(posedge clk) begin
 	if (!nreset) begin
-		pc        <= PC_RESET;
-		issued    <= 32'd0;
-		if_valid  <= 1'b0;
-		if_pc     <= PC_RESET;
-		running   <= (FETCH_AT_RESET != 0);
-	end else if (step) begin
-		if_valid <= have_more;
-		if (redirect_valid) running <= 1'b1;
-		if (have_more) begin
-			if_pc     <= fetch_pc;
-			pc        <= fetch_pc + 32'd2;
-			issued    <= issued + 32'd1;
+		qcnt    <= 3'd0;
+		qpc     <= PC_RESET;
+		fpc     <= PC_RESET;
+		infl    <= 1'b0;
+		infl_n  <= 2'd0;
+		issued  <= 32'd0;
+		running <= (FETCH_AT_RESET != 0);
+		for (k = 0; k < QN; k = k + 1) q[k] <= 16'h4E71;
+	end else if (ce) begin
+		// pop what ID took, append what arrives (not after a redirect)
+		for (k = 0; k < QN; k = k + 1)
+			nq[k] = (k + consume < QN) ? q[k + consume] : 16'h4E71;
+		ncnt = after_c;
+		if (!redirect_valid && infl) begin
+			nq[ncnt] = l1_rdata_a[31:16];
+			if (infl_n == 2'd2) nq[ncnt + 1] = l1_rdata_a[15:0];
+			ncnt = ncnt + {1'b0, infl_n};
+		end
+		for (k = 0; k < QN; k = k + 1) q[k] <= nq[k];
+		qcnt <= ncnt;
+		if (redirect_valid) begin
+			qpc     <= redirect_pc;
+			running <= 1'b1;
+		end else begin
+			qpc <= qpc + {29'd0, consume, 1'b0};
+		end
+		infl   <= can_issue;
+		infl_n <= want;
+		issued <= issued + {30'd0, consume};
+		if (can_issue) begin
+			fpc    <= f_addr + {29'd0, want, 1'b0};
+		end else if (redirect_valid) begin
+			fpc    <= redirect_pc;
 		end
 	end
 end
