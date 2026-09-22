@@ -232,8 +232,11 @@ integer i, fd, rc, ok, max_cycles, cycles, errors, nchk;
 reg [31:0] halt_pc, a, v, got;
 reg        done = 0;
 
+// "halted": the program must end in a double fault (the core halts,
+// M68040UM 7.6.3), not at the halt label
+reg want_halt = 0;
 always @(posedge clk)
-	if (nreset && dbg_wb_valid && dbg_wb_pc == halt_pc) done = 1;
+	if (nreset && ((dbg_wb_valid && dbg_wb_pc == halt_pc && !want_halt) || (want_halt && dut.dbg_halted))) done = 1;
 
 // "noread <addr>": no data read may touch that byte (CLR and Scc to memory
 // are pure writes on the 68040)
@@ -376,6 +379,7 @@ initial begin
 			end else if (key == "inimage") inimage = 1;
 			else if (key == "readonce") begin rc = $fscanf(fd, "%h", a); ro_at[n_ro] = a; ro_n[n_ro] = 0; n_ro = n_ro + 1; end
 			else if (key == "rbcount") rc = $fscanf(fd, "%d", want_rb);
+			else if (key == "halted") want_halt = 1;
 			else if (key == "syncpc") begin rc = $fscanf(fd, "%h", a); sync_at[n_sync] = a; n_sync = n_sync + 1; end
 			else if (key == "berr") begin
 				rc = $fscanf(fd, "%h %s", a, key);
@@ -411,6 +415,7 @@ initial begin
 		else if (key == "inimage") ;
 		else if (key == "readonce") rc = $fscanf(fd, "%h", v);
 		else if (key == "rbcount") rc = $fscanf(fd, "%d", v);
+		else if (key == "halted") ;
 		else if (key == "syncpc") rc = $fscanf(fd, "%h", v);
 		else if (key == "berr") rc = $fscanf(fd, "%h %s", v, key);
 		else if (key == "fc") rc = $fscanf(fd, "%h %d", a, v);

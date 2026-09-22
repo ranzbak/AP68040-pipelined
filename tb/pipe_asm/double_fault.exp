@@ -1,0 +1,5 @@
+# double_fault: bus mode, by hand -- the TRAP's frame push faults, the core halts; nothing after runs
+halt 00000000
+berr 00001efc w
+halted
+m32 00007000 11111111
