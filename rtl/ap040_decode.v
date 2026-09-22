@@ -70,8 +70,54 @@ module ap040_decode
 // have0; need0 is returned when the answer depends on an ext0 we do not yet
 // have.  bad = reserved full-format encoding.
 typedef struct packed { logic [3:0] n; logic need0; logic bad; } elen_t;
+
+// A floating-point instruction's immediate operand is sized by the source
+// specifier in its extension word, not by the integer size field (PRM, the
+// "Source Specifier field" paragraph that every FP instruction page carries,
+// e.g. FABS).  Words in the instruction stream:
+function automatic logic [3:0] fp_imm_words(input logic [2:0] spec);
+	case (spec)
+		3'b000: return 4'd2;   // long-word integer
+		3'b001: return 4'd2;   // single precision
+		3'b010: return 4'd6;   // extended precision
+		3'b011: return 4'd6;   // packed decimal (the 040's unsupported type: still sized)
+		3'b100: return 4'd1;   // word integer
+		3'b101: return 4'd4;   // double precision
+		3'b110: return 4'd1;   // byte integer (the low half of one word)
+		default: return 4'd0;  // 111: FMOVECR as a source -- no EA at all
+	endcase
+endfunction
+
+// An FP opmode that no 68040 implements.  1 = the encoding is not a floating-
+// point instruction at all and takes the ordinary F-line (vector 11, format
+// $0); 2 = $78..$7F, which take the ILLEGAL vector 4; 0 = a real FP opmode.
+// Ported verbatim from lib/AP68040 rtl/ap040_core.v:1299-1319, whose table is
+// the reference core's and is what WinUAE's fault_if_nonexisting_opmode
+// checks before it asks whether an FPU is present (PLAN.md D18).
+function automatic logic [1:0] fp_opmode_class(input logic [6:0] om);
+	case (om)
+		7'h05, 7'h07, 7'h0B, 7'h13, 7'h17, 7'h1B,
+		7'h29, 7'h2A, 7'h2B, 7'h2C, 7'h2D, 7'h2E, 7'h2F,
+		7'h39, 7'h3B, 7'h3C, 7'h3D, 7'h3E, 7'h3F,
+		7'h42, 7'h43, 7'h46, 7'h47,
+		7'h48, 7'h49, 7'h4A, 7'h4B, 7'h4C, 7'h4D, 7'h4E, 7'h4F,
+		7'h50, 7'h51, 7'h52, 7'h53, 7'h54, 7'h55, 7'h56, 7'h57,
+		7'h59, 7'h5B, 7'h5D, 7'h5F,
+		7'h61, 7'h65, 7'h69, 7'h6A, 7'h6B, 7'h6D, 7'h6E, 7'h6F,
+		7'h70, 7'h71, 7'h72, 7'h73, 7'h74, 7'h75, 7'h76, 7'h77:
+			return 2'd1;
+		7'h78, 7'h79, 7'h7A, 7'h7B, 7'h7C, 7'h7D, 7'h7E, 7'h7F:
+			return 2'd2;
+		default:
+			return 2'd0;
+	endcase
+endfunction
+
+// fpw != 0 overrides the length of a mode 7 / register 4 (#imm) operand with
+// that many words: the FP sizes above.  Every other mode's length is the same
+// for integer and floating-point operands.
 function automatic elen_t ea_len(input logic [2:0] m, input logic [2:0] r, input logic [1:0] sz,
-                                 input logic [15:0] ext0, input logic have0);
+                                 input logic [15:0] ext0, input logic have0, input logic [3:0] fpw);
 	logic full;
 	int bdw, odw, n;
 	logic need0, bad;
@@ -86,7 +132,7 @@ function automatic elen_t ea_len(input logic [2:0] m, input logic [2:0] r, input
 			3'd1: n = 2;
 			3'd2: n = 1;
 			3'd3: full = 1'b1;
-			3'd4: n = (sz == SZ_L) ? 2 : 1;
+			3'd4: n = (fpw != 4'd0) ? int'(fpw) : ((sz == SZ_L) ? 2 : 1);
 			default: n = 0;
 		endcase
 		default: n = 0;
@@ -217,11 +263,14 @@ localparam [5:0]
 	F_CHK = 6'd43, F_TAS = 6'd44, F_NBCD = 6'd45, F_MDW = 6'd46, F_MDL = 6'd47,
 	F_TRAPCC = 6'd48, F_BCD = 6'd49, F_PACK = 6'd50, F_UNPK = 6'd51, F_SHR = 6'd52,
 	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55, F_MOVEUSP = 6'd56, F_MOVEP = 6'd57, F_MOVE16 = 6'd58, F_MOVES = 6'd59, F_CINV = 6'd60, F_PMMU = 6'd61, F_STOP = 6'd62, F_RESET = 6'd63;
+// M10.0: the coprocessor-id-1 (floating-point) space.  Wider than the rest,
+// which is why shape_t's form field is 7 bits.
+localparam [6:0] F_FP = 7'd64;
 
 // What an opcode word implies about the words that follow it.
 typedef struct packed {
 	logic       ok;        // implemented and legal as far as the opcode word says
-	logic [5:0] form;
+	logic [6:0] form;
 	logic [5:0] alu;
 	logic [1:0] npre;      // words before the EAs
 	logic       has_src;
@@ -229,6 +278,8 @@ typedef struct packed {
 	logic       has_dst;
 	logic [2:0] dm, dr;    // destination EA mode/reg
 	logic [1:0] sz;        // operand size (sizes #imm and the EA length)
+	logic [3:0] fpw;       // (F_FP) an immediate operand's width in words, 0 = the integer rule
+	logic       need_x1;   // the shape depends on the extension word, which is not in the view yet
 } shape_t;
 
 // the ALU op of the two-operand groups
@@ -252,7 +303,7 @@ function automatic logic [5:0] shift_alu(input logic [1:0] t, input logic left);
 	endcase
 endfunction
 
-function automatic shape_t shape(input logic [15:0] op);
+function automatic shape_t shape(input logic [15:0] op, input logic [15:0] x1, input logic have_x1);
 	shape_t s;
 	logic [1:0] ss;
 	logic an_ok;
@@ -430,6 +481,39 @@ function automatic shape_t shape(input logic [15:0] op);
 		16'b1111_0100_???0_1???, 16'b1111_0100_???1_0???, 16'b1111_0100_???1_1???: begin
 			s.ok = 1'b1; s.form = F_CINV;
 		end
+		//---------------------------------------- line F, coprocessor id 1: the FPU
+		// With AP040_HAS_FPU = 0 every one of these is an UNIMPLEMENTED
+		// floating-point instruction and takes vector 11 -- but it is decoded to
+		// its full LENGTH and its effective address all the same, because the
+		// MC68LC040's eight-word format $4 frame stacks the PC of the NEXT
+		// instruction and the calculated effective address (M68040UM Appendix
+		// A.5.2, Table 12-1).  Plan M10.0; decf turns F_FP into the exception.
+		16'b1111_0010_00??_????: begin            // general: FMOVE, arithmetic, FMOVEM, FMOVECR
+			s.ok = 1'b1; s.form = F_FP; s.npre = 2'd1;
+			if (!have_x1) s.need_x1 = 1'b1;
+			else if (x1[15:13] == 3'b010 && x1[12:10] != 3'b111) begin
+				s.has_src = 1'b1; s.fpw = fp_imm_words(x1[12:10]);   // <ea>{fmt} -> FPn
+			end else if (x1[15:13] == 3'b011) begin
+				s.has_src = 1'b1; s.fpw = fp_imm_words(x1[12:10]);   // FPn -> <ea>{fmt}
+			end else if (x1[15:14] == 2'b11) begin
+				s.has_src = 1'b1;                                     // FMOVEM, control registers
+			end
+			// x1[15:13] = 000 (FPm -> FPn), 001 (undefined opclass) and
+			// 010 with specifier 111 (FMOVECR) have no effective address
+		end
+		16'b1111_0010_01??_????: begin            // FScc / FDBcc / FTRAPcc
+			s.ok = 1'b1; s.form = F_FP; s.npre = 2'd1;
+			if (op[5:3] == 3'b001)                       s.npre = 2'd2;   // FDBcc: + displacement
+			else if (op[5:0] == 6'b111_010)              s.npre = 2'd2;   // FTRAPcc.W
+			else if (op[5:0] == 6'b111_011)              s.npre = 2'd3;   // FTRAPcc.L
+			else if (op[5:0] == 6'b111_100)              s.npre = 2'd1;   // FTRAPcc
+			else                                         s.has_src = 1'b1; // FScc <ea>
+		end
+		16'b1111_0010_10??_????: begin s.ok = 1'b1; s.form = F_FP; s.npre = 2'd1; end   // FBcc.W
+		16'b1111_0010_11??_????: begin s.ok = 1'b1; s.form = F_FP; s.npre = 2'd2; end   // FBcc.L
+		16'b1111_0011_00??_????, 16'b1111_0011_01??_????: begin                          // FSAVE / FRESTORE
+			s.ok = 1'b1; s.form = F_FP; s.has_src = 1'b1;
+		end
 		16'b1111_0110_0010_0???: begin s.ok = 1'b1; s.form = F_MOVE16; s.npre = 2'd1; s.sz = SZ_L; end  // (Ax)+,(Ay)+
 		16'b1111_0110_000?_????: begin s.ok = 1'b1; s.form = F_MOVE16; s.npre = 2'd2; s.sz = SZ_L; end  // abs.L forms
 		16'h4E71: begin s.ok = 1'b1; s.form = F_NOP; end
@@ -575,16 +659,18 @@ typedef struct packed {
 function automatic len_t lenf(input logic [10:0][15:0] vb, input logic [3:0] vc);
 	len_t l; elen_t e; int k;
 	l = '0;
-	l.sh = shape(vb[0]);
+	l.sh = shape(vb[0], vb[1], vc > 4'd1);
 	k = 1 + l.sh.npre;
-	if (l.sh.ok && l.sh.has_src) begin
-		e = ea_len(l.sh.sm, l.sh.sr, l.sh.sz, vb[k], (vc > k));
+	// an FP opcode is sized by its extension word: wait for it (M10.0)
+	if (l.sh.need_x1) l.more = 1'b1;
+	if (l.sh.ok && l.sh.has_src && !l.more) begin
+		e = ea_len(l.sh.sm, l.sh.sr, l.sh.sz, vb[k], (vc > k), l.sh.fpw);
 		if (e.need0) l.more = 1'b1;
 		l.ea_bad = l.ea_bad | e.bad;
 		k = k + e.n;
 	end
 	if (l.sh.ok && l.sh.has_dst && !l.more) begin
-		e = ea_len(l.sh.dm, l.sh.dr, l.sh.sz, vb[k], (vc > k));
+		e = ea_len(l.sh.dm, l.sh.dr, l.sh.sz, vb[k], (vc > k), 4'd0);
 		if (e.need0) l.more = 1'b1;
 		l.ea_bad = l.ea_bad | e.bad;
 		k = k + e.n;
@@ -652,7 +738,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 	ipre = (sh.sz == SZ_L) ? {x1, vbuf[2]} : (sh.sz == SZ_W) ? {16'd0, x1} : {24'd0, x1[7:0]};
 	// EA words
 	ks = 1 + sh.npre;
-	e = ea_len(sh.sm, sh.sr, sh.sz, vbuf[ks], 1'b1);
+	e = ea_len(sh.sm, sh.sr, sh.sz, vbuf[ks], 1'b1, sh.fpw);
 	kd = ks + (sh.has_src ? int'(e.n) : 0);
 	if (sh.has_src) d.src = ea_build(sh.sm, sh.sr, sh.sz, vbuf, ks, vpc + 32'(2 * ks));
 	if (sh.has_dst) d.dst = ea_build(sh.dm, sh.dr, sh.sz, vbuf, kd, vpc + 32'(2 * kd));
@@ -942,6 +1028,47 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 			// (ir[7]/ir[6]); the scope field (ir[4:3]) is widened to ALL,
 			// which is safe, and 00 is not a CINV encoding at all (shape():
 			// it falls through to the F-line trap, as M68040UM 4.5 requires)
+			F_FP: begin
+				// Coprocessor id 1 with no FPU: the MC68LC040 configuration.
+				// Which frame this gets is PLAN.md divergence D18:
+				//   * a well-formed floating-point instruction -> vector 11
+				//     with the eight-word FORMAT $4 frame, the PC of the next
+				//     instruction, the calculated effective address and the
+				//     faulted instruction's own PC (M68040UM Appendix A.5.2,
+				//     Table 12-1);
+				//   * the reserved opclass (x1[15:13] = 001), and an opmode in
+				//     fp_opmode_class()'s F-line class -> vector 11 with the
+				//     ordinary format $0 frame and the instruction's own PC:
+				//     the encoding is rejected BEFORE the FPU is asked about;
+				//   * an opmode in $78..$7F -> vector 4.
+				// A coprocessor id that is not 1 never reaches here: it is not
+				// an F_FP shape and keeps the format $0 default above.
+				d.cls = CL_EXC; d.exc_vec = 8'd11; d.exc_fmt = 4'd4; d.exc_next = 1'b1;
+				if (op[8:6] == 3'b000) begin
+					if (x1[15:13] == 3'b001) begin
+						d.exc_fmt = 4'd0; d.exc_next = 1'b0;         // reserved opclass
+					end else if (x1[15:13] == 3'b000 ||
+					             (x1[15:13] == 3'b010 && x1[12:10] != 3'b111)) begin
+						// the opmode field means something only for these two
+						// (x1[15:13] = 010 with specifier 111 is FMOVECR, whose
+						// low bits are a ROM offset)
+						case (fp_opmode_class(x1[6:0]))
+							2'd1: begin d.exc_fmt = 4'd0; d.exc_next = 1'b0; end
+							2'd2: begin d.exc_fmt = 4'd0; d.exc_next = 1'b0; d.exc_vec = 8'd4; end
+							default: ;
+						endcase
+					end
+				end
+				// The source EA is kept ONLY for a format $4 frame, which
+				// stacks it: EA-calc computes the address, EA-fetch takes it
+				// from there and no operand is ever read.  D18: the field is 0
+				// whenever there is no memory operand -- a register, FMOVECR,
+				// FBcc, FTRAPcc, and an immediate source (NOT the address of
+				// the immediate data).
+				if (d.exc_fmt != 4'd4 || d.src.kind != EK_MEM) begin
+					d.src = '0; d.src.reg_n = R_NONE; d.src.idx_reg = R_NONE;
+				end
+			end
 			F_CINV: begin
 				d.cls = CL_CINV; d.priv = 1'b1; d.serialize = 1'b1;
 				d.imm = {30'd0, op[7], op[6]};

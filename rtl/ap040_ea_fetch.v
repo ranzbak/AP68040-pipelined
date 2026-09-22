@@ -712,7 +712,12 @@ function automatic ex_t exc_uop(input id_t i, input logic [3:0] k, input logic [
 	case (k)
 		4'd0:    x.st_data = {sr, pc[31:16]};
 		4'd1:    x.st_data = {pc[15:0], fmt, 2'b00, vec, 2'b00};
-		default: x.st_data = (fmt == 4'd7) ? x7w : addr;
+		// format $4 (the LC040's unimplemented-floating-point frame, M10.0):
+		// longword 2 is the calculated effective address, longword 3 the PC of
+		// the faulted instruction (M68040UM Appendix A.5.2, Table 12-1).  `i`
+		// is still that instruction here: EA-fetch holds it through P_EXC.
+		default: x.st_data = (fmt == 4'd7)                  ? x7w  :
+		                     (fmt == 4'd4 && k == 4'd3)     ? i.pc : addr;
 	endcase
 	return x;
 endfunction
@@ -797,7 +802,12 @@ function automatic stp_t stepf(
 				s.exc_go = 1'b1; s.ev = 8'd8; s.ef = 4'd0; s.epc = i.pc;
 			end else if (i.cls == CL_EXC) begin
 				s.exc_go = 1'b1; s.ev = i.exc_vec; s.ef = i.exc_fmt;
-				s.epc = i.exc_next ? i.next_pc : i.pc; s.eaddr = i.exc_addr;
+				s.epc = i.exc_next ? i.next_pc : i.pc;
+				// A format $4 frame stacks the CALCULATED effective address,
+				// which EA-calc has already produced -- no operand is read.
+				// It is 0 when the instruction has no memory operand (D18).
+				s.eaddr = (i.exc_fmt == 4'd4) ? ((i.src.kind == EK_MEM) ? s_addr_c : 32'd0)
+				                              : i.exc_addr;
 			end else if (i.cls == CL_RTE) begin
 				// the sequence runs in P_RTE
 			end else if (i.cls == CL_PMMU) begin
