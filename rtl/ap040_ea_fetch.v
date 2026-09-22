@@ -98,7 +98,8 @@ localparam [3:0] P_START = 4'd0,  // examine / wait for serialisation
                  P_EXC   = 4'd2,  // exception entry
                  P_RTE   = 4'd3,
                  P_RESET = 4'd4,
-                 P_HALT  = 4'd5;
+                 P_HALT  = 4'd5,
+                 P_MOVEM = 4'd6;  // MOVEM: one micro-op per register
 
 reg  [3:0] ph;
 reg        rd_pend;        // a read is outstanding
@@ -154,7 +155,7 @@ wire [31:0] op_a = fwd(ra_a, rd_a, ex_w0_v, ex_w0_r, ex_w0_val, ex_u0_v, ex_u0_r
                        ex_u1_v, ex_u1_r, ex_u1_val);
 // the destination register sees this instruction's own source update
 // the third register operand (CAS Du, DIV.L Dr): no A7, no own update
-assign ra_c = eac_i.i.reg_c;
+assign ra_c = (eac_i.i.cls == CL_MOVEM) ? mm_sreg : eac_i.i.reg_c;   // MOVEM: the register being stored
 wire [31:0] op_c = fwd(ra_c, rd_c, ex_w0_v, ex_w0_r, ex_w0_val, ex_u0_v, ex_u0_r, ex_u0_val,
                        ex_u1_v, ex_u1_r, ex_u1_val);
 // the fourth (bitfield width in Dn)
@@ -190,9 +191,9 @@ wire        bf_two  = bf_mem && bf_modify && (bf_n == 3'd3 || bf_n == 3'd5);
 
 //--------------------------------------------------------------- ordinary instructions
 wire addr_only    = (i.cls == CL_JMP || i.cls == CL_JSR || i.cls == CL_LEA || i.cls == CL_PEA);
-wire needs_ld_src = ((i.src.kind == EK_MEM) && !addr_only) || (bf_mem && bf_n == 3'd5);
+wire needs_ld_src = ((i.src.kind == EK_MEM) && !addr_only && i.cls != CL_MOVEM) || (bf_mem && bf_n == 3'd5);
 // CHK2/CMP2 read the upper bound from <ea>+size into the "destination" load
-wire needs_ld_dst = ((i.dst.kind == EK_MEM) && i.rmw) || (i.cls == CL_CHK2) || bf_mem;
+wire needs_ld_dst = ((i.dst.kind == EK_MEM) && i.rmw && i.cls != CL_MOVEM) || (i.cls == CL_CHK2) || bf_mem;
 wire need_smi = (i.src.kind == EK_MEM) && (i.src.mi != MI_NONE);
 wire need_dmi = (i.dst.kind == EK_MEM) && (i.dst.mi != MI_NONE);
 
@@ -616,6 +617,7 @@ typedef struct packed {
 	logic        fin;    // the current instruction leaves EA-fetch this cycle
 	logic [2:0]  dsel;   // which micro-op: 0 ordinary, 1 frame store, 2 exc final, 3 rte final, 4 reset
 	logic        exc_go; logic [7:0] ev; logic [3:0] ef; logic [31:0] epc; logic [31:0] eaddr;
+	logic        mm_go;  // MOVEM: the EA is known (memory-indirect pointer fetched), start the transfers
 } stp_t;
 
 function automatic stp_t stepf(
@@ -675,6 +677,8 @@ function automatic stp_t stepf(
 							s.exc_go = 1'b1; s.ev = 8'd3; s.ef = 4'd2;
 							s.epc = i.pc; s.eaddr = {d_val_c[31:1], 1'b0};
 						end
+					end else if (i.cls == CL_MOVEM) begin
+						s.mm_go = 1'b1;
 					end else if (!stall) begin
 						// a two-micro-op instruction (bitfield trailing byte) finishes on the second
 						s.disp = 1'b1; s.dsel = 3'd0; s.fin = !two || tstep;
@@ -726,10 +730,120 @@ endfunction
 // reads never wait for older stores (store-to-load forwarding, above)
 // a bitfield's read address uses the register file: no read while EX writes one of its registers
 wire bf_rdblk = is_bf && ex_haz;
-wire stp_t st = stepf(ph, eac_valid, rst_pending, i, older_busy, !bf_rdblk, rd_pend, rd_ack, cap,
+wire stp_t st0 = stepf(ph, eac_valid, rst_pending, i, older_busy, !bf_rdblk, rd_pend, rd_ack, cap,
                       s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, trap_n, trap_vec,
                       indexed_mode, two_uop, bf_step, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes);
+
+//--------------------------------------------------------------- MOVEM
+// PRM 4-128..4-131.  Mask bit k names D0..D7, A0..A7 (k = 0..15), reversed
+// for -(An).  One micro-op per register: a store (the register read through
+// port c, EX-forwarded), or a load's register write (word loads sign-extend
+// into Dn as well).  Memory to
+// registers with (An)+: the base register is not loaded, it gets the
+// incremented address.  (-(An): the base register's stored value is its
+// initial value minus the size, PRM 4-128.)  The An update rides on the
+// last micro-op.  Loads
+// go one per clock: the next read issues in the clock a read answers; a
+// load answering while EX stalls waits in mm_have.  mm_mask and mm_addr
+// are the saved state M6's restart will use (plan M4 Files).
+reg  [15:0] mm_mask;       // registers still to transfer (loads: still to read)
+reg  [31:0] mm_addr;       // next address
+reg         mm_empty;      // the mask was zero: one empty micro-op retires it
+reg   [4:0] mm_rreg;       // the outstanding read's register
+reg         mm_rlast;      // ... and it is the last one
+reg         mm_have;       // a loaded value waiting for EX
+reg  [31:0] mm_hdata;
+reg   [4:0] mm_hreg;
+reg         mm_hlast;
+
+wire        mm_ld   = i.imm[0];
+wire        mm_pre  = (i.dst.kind == EK_MEM) && (i.dst.mode == 3'd4);
+wire        mm_post = (i.src.kind == EK_MEM) && (i.src.mode == 3'd3);
+wire  [4:0] mm_base = mm_ld ? eac_i.src_r : eac_i.dst_r;
+wire [31:0] mm_sz   = (i.size == SZ_W) ? 32'd2 : 32'd4;
+
+function automatic logic [3:0] lsb16(input logic [15:0] m);
+	logic [3:0] k;
+	int j;
+	k = 4'd0;
+	for (j = 15; j >= 0; j = j - 1)
+		if (m[j]) k = j[3:0];
+	return k;
+endfunction
+function automatic logic [4:0] mm_reg(input logic [3:0] k, input logic pre, input logic s, input logic m);
+	logic [3:0] j;
+	j = pre ? 4'd15 - k : k;
+	return (j == 4'd15) ? resolve_sp(R_A7L, s, m) : {1'b0, j};   // 0-7 D0-D7, 8-14 A0-A6
+endfunction
+wire  [3:0] mm_k     = lsb16(mm_mask);
+wire  [4:0] mm_sreg  = mm_reg(mm_k, mm_pre, s_bit, sr_in[12]);
+wire        mm_one   = (mm_mask & (mm_mask - 16'd1)) == 16'd0;   // at most one register left
+
+// the step: loads issue from mm_mask and dispatch from the answer (or
+// mm_have); stores dispatch from mm_mask
+typedef struct packed {
+	logic issue; logic disp; logic fin; logic from_buf; logic to_buf; logic empty;
+} mms_t;
+function automatic mms_t mm_step(input logic ld, input logic [15:0] mask, input logic empty,
+                                 input logic pend, input logic cap, input logic have, input logic stall,
+                                 input logic rlast, input logic hlast, input logic one);
+	mms_t r;
+	r = '0;
+	if (empty) begin
+		if (!stall) begin r.disp = 1'b1; r.fin = 1'b1; r.empty = 1'b1; end
+	end else if (ld) begin
+		if (have) begin
+			if (!stall) begin r.disp = 1'b1; r.from_buf = 1'b1; r.fin = hlast; end
+		end else if (cap) begin
+			if (!stall) begin r.disp = 1'b1; r.fin = rlast; end
+			else r.to_buf = 1'b1;
+		end
+		r.issue = (mask != 16'd0) && (!pend || cap) && !have && !stall;
+	end else begin
+		if (!stall && mask != 16'd0) begin r.disp = 1'b1; r.fin = one; end
+	end
+	return r;
+endfunction
+wire mms_t mms = mm_step(mm_ld, mm_mask, mm_empty, rd_pend, cap, mm_have, stall_in, mm_rlast, mm_hlast, mm_one);
+
+function automatic ex_t mm_uop(input id_t i, input mms_t m, input logic ld, input logic [4:0] r,
+                               input logic [31:0] v, input logic [31:0] addr, input logic last,
+                               input logic upd, input logic [4:0] br, input logic [31:0] bval,
+                               input logic skipw);
+	ex_t x;
+	x = base_uop(i);
+	x.cls = CL_MOVEM;
+	x.last = last;
+	if (m.empty) ;
+	else if (ld) begin
+		if (!skipw) begin
+			x.dk = DK_REG; x.dr = r;
+			x.c = (i.size == SZ_W) ? sext16(v[15:0]) : v;
+		end
+	end else begin
+		x.st_v = 1'b1; x.st_addr = addr; x.st_size = i.size;
+		x.st_data = (i.size == SZ_W) ? {16'd0, v[15:0]} : v;
+	end
+	if (last && upd && !m.empty) begin x.u1_v = 1'b1; x.u1_r = br; x.u1_val = bval; end
+	return x;
+endfunction
+wire  [4:0] mm_dreg = mm_ld ? (mms.from_buf ? mm_hreg : mm_rreg) : mm_sreg;
+// -(An) with the base in the list: the MC68020/30/40 store the initial
+// value decremented by the operand size (PRM 4-128; plan D8)
+wire [31:0] mm_dval = mm_ld ? (mms.from_buf ? mm_hdata : rd_data) :
+                      (mm_pre && mm_sreg == mm_base) ? op_c - mm_sz : op_c;
+wire ex_t   mm_x    = mm_uop(i, mms, mm_ld, mm_dreg, mm_dval, mm_addr, mms.fin, mm_pre || mm_post,
+                             mm_base, mm_addr, mm_post && mm_dreg == mm_base);
+
+function automatic stp_t mm_st(input mms_t m, input logic [31:0] a, input logic [1:0] sz);
+	stp_t t;
+	t = '0;
+	t.issue = m.issue; t.it = T_SLD; t.ia = a; t.isz = sz;
+	t.disp = m.disp; t.dsel = 3'd7; t.fin = m.fin;
+	return t;
+endfunction
+wire stp_t st = (ph == P_MOVEM) ? mm_st(mms, mm_addr, i.size) : st0;
 
 // RTR to an odd PC: the CCR alone commits
 function automatic ex_t ccr_only_uop(input ex_t x);
@@ -746,8 +860,9 @@ function automatic ex_t no_last(input ex_t x);
 endfunction
 
 function automatic ex_t dmux(input logic [2:0] sel, input ex_t o, input ex_t f, input ex_t e,
-                             input ex_t r, input ex_t z, input ex_t c, input ex_t n);
+                             input ex_t r, input ex_t z, input ex_t c, input ex_t n, input ex_t m);
 	case (sel)
+		3'd7: return m;
 		3'd0: return o;
 		3'd1: return f;
 		3'd2: return e;
@@ -764,7 +879,8 @@ wire ex_t disp_x = dmux(st.dsel, x_ord,
                         rte_final(i, bank_now, rd_a, r_fv, r_sr, r_pc),
                         reset_final(i, x_sp, r_pc),
                         ccr_only_uop(x_ord),
-                        no_last(x_ord));
+                        no_last(x_ord),
+                        mm_x);
 
 // the early read goes out when this stage leaves the port free and is
 // taking the next instruction (its current one finishes, or it is empty)
@@ -775,7 +891,8 @@ assign rd_addr   = st.issue ? st.ia  : early.a;
 assign rd_size   = st.issue ? st.isz : early.sz;
 wire [2:0] rd_t  = st.issue ? st.it  : early.t;
 assign eaf_stall = eac_valid && !st.fin;
-assign eaf_blk   = eac_valid && (i.serialize || (ph != P_START && ph != P_OPS));
+// (MOVEM blocks EA-calc for its whole stay: its register writes are not in eac_t)
+assign eaf_blk   = eac_valid && (i.serialize || (ph != P_START && ph != P_OPS) || i.cls == CL_MOVEM);
 assign halted    = (ph == P_HALT);
 
 // Bcc/DBcc were guessed taken by ID; a not-taken one is corrected here,
@@ -802,6 +919,8 @@ always @(posedge clk) begin
 		x_vec <= 8'd0; x_fmt <= 4'd0; x_pc <= 32'd0; x_addr <= 32'd0; x_step <= 3'd0;
 		x_sr <= 16'd0; x_sp <= 32'd0; x_bank <= R_ISP; x_target <= 32'd0;
 		bf_step <= 1'b0;
+		mm_mask <= 16'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0;
+		mm_have <= 1'b0; mm_hdata <= 32'd0; mm_hreg <= 5'd0; mm_hlast <= 1'b0;
 		r_step <= 3'd0; r_sr <= 16'd0; r_pc <= 32'd0; r_fv <= 16'd0;
 		rst_pending <= reset_seq;
 		eaf_valid <= 1'b0; eaf_o <= '0;
@@ -817,7 +936,7 @@ always @(posedge clk) begin
 		if (rd_req) begin rd_pend <= 1'b1; rd_tag <= rd_t; rd_a_q <= rd_addr; rd_sz_q <= rd_size; end
 		else if (rd_ack) begin rd_pend <= 1'b0; rd_drop <= 1'b0; end
 		if (flush) begin
-			ph <= P_START; bf_step <= 1'b0;
+			ph <= P_START; bf_step <= 1'b0; mm_have <= 1'b0; mm_empty <= 1'b0;
 			done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
 			if (rd_pend && !rd_ack) rd_drop <= 1'b1;
 		end else begin
@@ -894,6 +1013,28 @@ always @(posedge clk) begin
 				x_step <= 3'd5;
 			end
 			if (st.disp && st.dsel == 3'd0 && two_uop && !st.fin) bf_step <= 1'b1;
+			// MOVEM
+			if (st0.mm_go && ph != P_MOVEM) begin
+				ph       <= P_MOVEM;
+				mm_mask  <= i.ext;
+				mm_empty <= (i.ext == 16'd0);
+				mm_addr  <= mm_ld ? s_addr_c : d_addr_c;
+				mm_have  <= 1'b0;
+			end
+			if (ph == P_MOVEM) begin
+				if (mms.issue) begin
+					mm_rreg  <= mm_sreg; mm_rlast <= mm_one;
+					mm_mask  <= mm_mask & ~(16'd1 << mm_k);
+					mm_addr  <= mm_addr + mm_sz;
+				end
+				if (!mm_ld && mms.disp) begin
+					mm_mask  <= mm_mask & ~(16'd1 << mm_k);
+					mm_addr  <= mm_pre ? mm_addr - mm_sz : mm_addr + mm_sz;
+				end
+				if (mms.to_buf) begin mm_have <= 1'b1; mm_hdata <= rd_data; mm_hreg <= mm_rreg; mm_hlast <= mm_rlast; end
+				if (mms.from_buf) mm_have <= 1'b0;
+				if (mms.fin) mm_empty <= 1'b0;
+			end
 			if (st.fin) begin
 				ph <= P_START; bf_step <= 1'b0;
 				done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;

@@ -104,7 +104,8 @@ typedef enum logic [5:0] {
 	CL_UNPK    = 6'd33,
 	CL_CAS     = 6'd34,
 	CL_CAS2    = 6'd35,
-	CL_BF      = 6'd36   // bitfields
+	CL_BF      = 6'd36,  // bitfields
+	CL_MOVEM   = 6'd37   // MOVEM (EA-fetch sequences one micro-op per register)
 } cls_t;
 
 typedef struct packed {

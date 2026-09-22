@@ -247,6 +247,9 @@ always @* begin
 				w.st_v = 1'b1; w.st_addr = x.daddr; w.st_data = alu_result; w.st_size = x.size;
 			end
 		end
+		CL_MOVEM: begin                   // EA-fetch built it: a load's register, or a store (x.st_*)
+			if (x.dk == DK_REG) begin w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = x.c; end
+		end
 		CL_CAS2: begin                    // EA-fetch decided it; flags from x.b - x.a
 			if (x.wr_ccr) begin w.ccr_v = 1'b1; w.ccr_val = alu_flags; end
 			if (x.dk == DK_REG) begin w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = x.c; end

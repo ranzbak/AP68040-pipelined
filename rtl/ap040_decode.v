@@ -209,7 +209,7 @@ localparam [5:0]
 	F_BITD = 6'd38, F_BITS = 6'd39, F_CAS = 6'd40, F_CAS2 = 6'd41, F_CHK2 = 6'd42,
 	F_CHK = 6'd43, F_TAS = 6'd44, F_NBCD = 6'd45, F_MDW = 6'd46, F_MDL = 6'd47,
 	F_TRAPCC = 6'd48, F_BCD = 6'd49, F_PACK = 6'd50, F_UNPK = 6'd51, F_SHR = 6'd52,
-	F_SHM = 6'd53, F_BF = 6'd54;
+	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55;
 
 // What an opcode word implies about the words that follow it.
 typedef struct packed {
@@ -360,6 +360,15 @@ function automatic shape_t shape(input logic [15:0] op);
 		end
 		16'b0100_1000_1000_0???: begin s.ok = 1'b1; s.form = F_EXT; s.sz = SZ_W; s.alu = `AP040_ALU_EXT; end
 		16'b0100_1000_1100_0???: begin s.ok = 1'b1; s.form = F_EXT; s.sz = SZ_L; s.alu = `AP040_ALU_EXT; end
+		// MOVEM (after EXT, which is its Dn mode): mask word first, then the EA
+		16'b0100_1000_1???_????: begin           // MOVEM regs,<ctl alterable> / -(An)
+			s.form = F_MOVEM; s.npre = 2'd1; s.has_dst = 1'b1; s.sz = op[6] ? SZ_L : SZ_W;
+			s.ok = (s.dm == 3'd4) || (s.dm != 3'd3 && ea_ok(s.dm, s.dr, 1'b0, 1'b0, 1'b1, 1'b1));
+		end
+		16'b0100_1100_1???_????: begin           // MOVEM <ctl> / (An)+,regs
+			s.form = F_MOVEM; s.npre = 2'd1; s.has_src = 1'b1; s.sz = op[6] ? SZ_L : SZ_W;
+			s.ok = (s.sm == 3'd3) || (s.sm != 3'd4 && ea_ok(s.sm, s.sr, 1'b0, 1'b0, 1'b1, 1'b0));
+		end
 		16'b0100_1001_1100_0???: begin s.ok = 1'b1; s.form = F_EXT; s.sz = SZ_L; s.alu = `AP040_ALU_EXTB; end
 		16'h4AFC: s.ok = 1'b0;                   // ILLEGAL (vector 4)
 		16'b0100_1010_11??_????: begin           // TAS <data alterable>
@@ -781,6 +790,9 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				d.cls = CL_SHIFT; d.wr_ccr = 1'b1; d.rmw = 1'b1;
 				d.src = op[5] ? ea_reg(EK_DREG, {2'b00, op[11:9]}) : ea_imm({28'd0, (op[11:9] == 3'd0), op[11:9]});
 				d.dst = ea_reg(EK_DREG, {2'b00, op[2:0]});
+			end
+			F_MOVEM: begin                      // imm[0]: memory to registers; ext = the mask
+				d.cls = CL_MOVEM; d.imm = {31'd0, op[10]};
 			end
 			F_CAS2: begin                       // CAS2 Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
 				d.cls = CL_CAS2; d.wr_ccr = 1'b1; d.rmw = 1'b1;
