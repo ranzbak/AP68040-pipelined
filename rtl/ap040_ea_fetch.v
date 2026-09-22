@@ -758,10 +758,15 @@ reg   [4:0] mm_hreg;
 reg         mm_hlast;
 
 wire        mm_ld   = i.imm[0];
+// MOVEP (PRM 4-133): the same sequencer on bytes at every other address;
+// stores send the register's bytes high first, loads collect the bytes and
+// write Dx once (the low word for .W) with the last one
+wire        mm_p    = i.imm[1];
+wire  [4:0] mp_reg  = mm_ld ? eac_i.dst_r : eac_i.src_r;
 wire        mm_pre  = (i.dst.kind == EK_MEM) && (i.dst.mode == 3'd4);
 wire        mm_post = (i.src.kind == EK_MEM) && (i.src.mode == 3'd3);
 wire  [4:0] mm_base = mm_ld ? eac_i.src_r : eac_i.dst_r;
-wire [31:0] mm_sz   = (i.size == SZ_W) ? 32'd2 : 32'd4;
+wire [31:0] mm_sz   = (mm_p || i.size == SZ_W) ? 32'd2 : 32'd4;
 
 function automatic logic [3:0] lsb16(input logic [15:0] m);
 	logic [3:0] k;
@@ -777,7 +782,8 @@ function automatic logic [4:0] mm_reg(input logic [3:0] k, input logic pre, inpu
 	return (j == 4'd15) ? resolve_sp(R_A7L, s, m) : {1'b0, j};   // 0-7 D0-D7, 8-14 A0-A6
 endfunction
 wire  [3:0] mm_k     = lsb16(mm_mask);
-wire  [4:0] mm_sreg  = mm_reg(mm_k, mm_pre, s_bit, sr_in[12]);
+wire  [4:0] mm_sreg  = mm_p ? mp_reg : mm_reg(mm_k, mm_pre, s_bit, sr_in[12]);
+reg  [23:0] mp_acc;        // MOVEP load: the bytes so far
 wire        mm_one   = (mm_mask & (mm_mask - 16'd1)) == 16'd0;   // at most one register left
 
 // the step: loads issue from mm_mask and dispatch from the answer (or
@@ -787,7 +793,7 @@ typedef struct packed {
 } mms_t;
 function automatic mms_t mm_step(input logic ld, input logic [15:0] mask, input logic empty,
                                  input logic pend, input logic cap, input logic have, input logic stall,
-                                 input logic rlast, input logic hlast, input logic one);
+                                 input logic rlast, input logic hlast, input logic one, input logic mp);
 	mms_t r;
 	r = '0;
 	if (empty) begin
@@ -795,7 +801,7 @@ function automatic mms_t mm_step(input logic ld, input logic [15:0] mask, input 
 	end else if (ld) begin
 		if (have) begin
 			if (!stall) begin r.disp = 1'b1; r.from_buf = 1'b1; r.fin = hlast; end
-		end else if (cap) begin
+		end else if (cap && (!mp || rlast)) begin     // (MOVEP: only the last byte dispatches)
 			if (!stall) begin r.disp = 1'b1; r.fin = rlast; end
 			else r.to_buf = 1'b1;
 		end
@@ -805,12 +811,13 @@ function automatic mms_t mm_step(input logic ld, input logic [15:0] mask, input 
 	end
 	return r;
 endfunction
-wire mms_t mms = mm_step(mm_ld, mm_mask, mm_empty, rd_pend, cap, mm_have, stall_in, mm_rlast, mm_hlast, mm_one);
+wire mms_t mms = mm_step(mm_ld, mm_mask, mm_empty, rd_pend, cap, mm_have, stall_in, mm_rlast, mm_hlast, mm_one,
+                         mm_p);
 
 function automatic ex_t mm_uop(input id_t i, input mms_t m, input logic ld, input logic [4:0] r,
                                input logic [31:0] v, input logic [31:0] addr, input logic last,
                                input logic upd, input logic [4:0] br, input logic [31:0] bval,
-                               input logic skipw);
+                               input logic skipw, input logic mp, input logic [3:0] k);
 	ex_t x;
 	x = base_uop(i);
 	x.cls = CL_MOVEM;
@@ -819,8 +826,11 @@ function automatic ex_t mm_uop(input id_t i, input mms_t m, input logic ld, inpu
 	else if (ld) begin
 		if (!skipw) begin
 			x.dk = DK_REG; x.dr = r;
-			x.c = (i.size == SZ_W) ? sext16(v[15:0]) : v;
+			x.c = mp ? v : (i.size == SZ_W) ? sext16(v[15:0]) : v;   // (MOVEP: v is the merged Dx)
 		end
+	end else if (mp) begin                        // byte k, high first
+		x.st_v = 1'b1; x.st_addr = addr; x.st_size = SZ_B;
+		x.st_data = {24'd0, (i.size == SZ_W) ? v[8 * (1 - k[0]) +: 8] : v[8 * (3 - k[1:0]) +: 8]};
 	end else begin
 		x.st_v = 1'b1; x.st_addr = addr; x.st_size = i.size;
 		x.st_data = (i.size == SZ_W) ? {16'd0, v[15:0]} : v;
@@ -831,10 +841,12 @@ endfunction
 wire  [4:0] mm_dreg = mm_ld ? (mms.from_buf ? mm_hreg : mm_rreg) : mm_sreg;
 // -(An) with the base in the list: the MC68020/30/40 store the initial
 // value decremented by the operand size (PRM 4-128; plan D8)
-wire [31:0] mm_dval = mm_ld ? (mms.from_buf ? mm_hdata : rd_data) :
+// MOVEP load: the last byte completes Dx (.W: its low word; op_b = Dx)
+wire [31:0] mp_val  = (i.size == SZ_W) ? {op_b[31:16], mp_acc[7:0], rd_data[7:0]} : {mp_acc, rd_data[7:0]};
+wire [31:0] mm_dval = mm_ld ? (mms.from_buf ? mm_hdata : mm_p ? mp_val : rd_data) :
                       (mm_pre && mm_sreg == mm_base) ? op_c - mm_sz : op_c;
 wire ex_t   mm_x    = mm_uop(i, mms, mm_ld, mm_dreg, mm_dval, mm_addr, mms.fin, mm_pre || mm_post,
-                             mm_base, mm_addr, mm_post && mm_dreg == mm_base);
+                             mm_base, mm_addr, mm_post && mm_dreg == mm_base, mm_p, mm_k);
 
 function automatic stp_t mm_st(input mms_t m, input logic [31:0] a, input logic [1:0] sz);
 	stp_t t;
@@ -843,7 +855,7 @@ function automatic stp_t mm_st(input mms_t m, input logic [31:0] a, input logic 
 	t.disp = m.disp; t.dsel = 3'd7; t.fin = m.fin;
 	return t;
 endfunction
-wire stp_t st = (ph == P_MOVEM) ? mm_st(mms, mm_addr, i.size) : st0;
+wire stp_t st = (ph == P_MOVEM) ? mm_st(mms, mm_addr, mm_p ? SZ_B : i.size) : st0;
 
 // RTR to an odd PC: the CCR alone commits
 function automatic ex_t ccr_only_uop(input ex_t x);
@@ -1031,7 +1043,10 @@ always @(posedge clk) begin
 					mm_mask  <= mm_mask & ~(16'd1 << mm_k);
 					mm_addr  <= mm_pre ? mm_addr - mm_sz : mm_addr + mm_sz;
 				end
-				if (mms.to_buf) begin mm_have <= 1'b1; mm_hdata <= rd_data; mm_hreg <= mm_rreg; mm_hlast <= mm_rlast; end
+				if (mms.to_buf) begin
+					mm_have <= 1'b1; mm_hdata <= mm_p ? mp_val : rd_data; mm_hreg <= mm_rreg; mm_hlast <= mm_rlast;
+				end
+				if (mm_p && cap) mp_acc <= {mp_acc[15:0], rd_data[7:0]};
 				if (mms.from_buf) mm_have <= 1'b0;
 				if (mms.fin) mm_empty <= 1'b0;
 			end

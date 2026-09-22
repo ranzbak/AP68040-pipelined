@@ -209,7 +209,7 @@ localparam [5:0]
 	F_BITD = 6'd38, F_BITS = 6'd39, F_CAS = 6'd40, F_CAS2 = 6'd41, F_CHK2 = 6'd42,
 	F_CHK = 6'd43, F_TAS = 6'd44, F_NBCD = 6'd45, F_MDW = 6'd46, F_MDL = 6'd47,
 	F_TRAPCC = 6'd48, F_BCD = 6'd49, F_PACK = 6'd50, F_UNPK = 6'd51, F_SHR = 6'd52,
-	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55, F_MOVEUSP = 6'd56;
+	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55, F_MOVEUSP = 6'd56, F_MOVEP = 6'd57;
 
 // What an opcode word implies about the words that follow it.
 typedef struct packed {
@@ -293,7 +293,9 @@ function automatic shape_t shape(input logic [15:0] op);
 			s.ok = (op[7:6] == 2'd0) ? (ea_ok(s.dm, s.dr, 1'b1, 1'b0, 1'b0, 1'b0) && !(s.dm == 3'd7 && s.dr == 3'd4))
 			                         : ea_ok(s.dm, s.dr, 1'b1, 1'b0, 1'b0, 1'b1);
 		end
-		16'b0000_???1_??00_1???: s.ok = 1'b0;   // MOVEP (M4)
+		16'b0000_???1_??00_1???: begin           // MOVEP: the displacement word is the only extension
+			s.ok = 1'b1; s.form = F_MOVEP; s.npre = 2'd1; s.sz = op[6] ? SZ_L : SZ_W;
+		end
 		16'b0000_???1_????_????: begin           // BTST/BCHG/BCLR/BSET Dn,<ea>
 			s.form = F_BITD; s.has_dst = 1'b1;
 			s.sz = (s.dm == 3'd0) ? SZ_L : SZ_B;
@@ -791,6 +793,17 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				d.cls = CL_SHIFT; d.wr_ccr = 1'b1; d.rmw = 1'b1;
 				d.src = op[5] ? ea_reg(EK_DREG, {2'b00, op[11:9]}) : ea_imm({28'd0, (op[11:9] == 3'd0), op[11:9]});
 				d.dst = ea_reg(EK_DREG, {2'b00, op[2:0]});
+			end
+			F_MOVEP: begin                      // run by the MOVEM sequencer: imm[1] = MOVEP
+				d.cls = CL_MOVEM; d.imm = {30'd0, 1'b1, !op[7]};
+				d.ext = op[6] ? 16'h000F : 16'h0003;   // 4 or 2 bytes
+				if (!op[7]) begin
+					d.src = ea_build(3'd5, op[2:0], SZ_B, vbuf, 1, vpc + 32'd2);
+					d.dst = ea_reg(EK_DREG, {2'b00, op[11:9]});
+				end else begin
+					d.dst = ea_build(3'd5, op[2:0], SZ_B, vbuf, 1, vpc + 32'd2);
+					d.src = ea_reg(EK_DREG, {2'b00, op[11:9]});
+				end
 			end
 			F_MOVEM: begin                      // imm[0]: memory to registers; ext = the mask
 				d.cls = CL_MOVEM; d.imm = {31'd0, op[10]};
