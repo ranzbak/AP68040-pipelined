@@ -205,7 +205,7 @@ always @* begin
 	w.st_v = x.st_v; w.st_addr = x.st_addr; w.st_data = x.st_data; w.st_size = x.st_size;
 	w.st_rb = x.st_rb; w.st_fc = x.st_fc; w.stf = x.stf;
 	w.sr_v = x.sr_v; w.sr_val = x.sr_val;
-	w.exc  = x.exc;  w.exc_sp = x.sp_val;
+	w.exc  = x.exc;  w.exc_sp = x.sp_val; w.irq = x.irq;
 	// a sequenced stack-pointer write goes out on the u0 port
 	if (x.sp_v) begin w.u0_v = 1'b1; w.u0_r = x.sp_r; w.u0_val = x.sp_val; end
 	redir = x.redirect; redir_pc = x.target;

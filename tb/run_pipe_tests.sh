@@ -114,21 +114,26 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 	done
 	# t_mmu.s through mk_tmmu.py (the manual's WB1 for a faulted write, PLAN
 	# D13; no interrupts or STOP before M9)
-	python3 mk_tmmu.py "$AP040_REF/tb/asm/t_mmu.s" m7 > "$WORK/t_mmu_m7.s"
+	python3 mk_tmmu.py "$AP040_REF/tb/asm/t_mmu.s" m9s > "$WORK/t_mmu_m9s.s"
+	# t_exceptions.s through mk_tint.py: every section up to the M9 subset
+	# (interrupts, STOP, the level-sensitive IPL; trace and the M bit are M9)
+	python3 mk_tint.py "$AP040_REF/tb/asm/t_exceptions.s" exc_m9s > "$WORK/texc_m9s.s"
 	# apolkosnik/AP68040 main's t_movem_restart.s (MOVEM CM continuation, PLAN
-	# D15) when that clone is next to this one; case 7 (interrupts) left for M9
+	# D15) when that clone is next to this one (case 7: an interrupt behind the CM restart)
 	TMR=""
 	AP040_MAIN=${AP040_MAIN:-../../AP68040-reference}
 	if [ -f "$AP040_MAIN/tb/asm/t_movem_restart.s" ]; then
-		python3 mk_tmovem.py "$AP040_MAIN/tb/asm/t_movem_restart.s" m7 > "$WORK/t_movem_restart_m7.s" && TMR=t_movem_restart_m7
+		python3 mk_tmovem.py "$AP040_MAIN/tb/asm/t_movem_restart.s" m9s > "$WORK/t_movem_restart_m9s.s" && TMR=t_movem_restart_m9s
 	else
 		echo "  (AP68040-reference not found: t_movem_restart skipped)"
 	fi
-	for t in t_integer t_bitfield_mmu t_mmu_m7 t_mmu_pipe $TMR; do
-		if [ "$t" = t_mmu_m7 ] || [ "$t" = t_movem_restart_m7 ]; then
+	for t in t_integer t_bitfield_mmu t_mmu_m9s t_mmu_pipe texc_m9s t_irq_pipe $TMR; do
+		if [ "$t" = t_mmu_m9s ] || [ "$t" = t_movem_restart_m9s ] || [ "$t" = texc_m9s ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "$WORK/$t.s"
 		elif [ "$t" = t_mmu_pipe ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "mmu_asm/$t.s"
+		elif [ "$t" = t_irq_pipe ]; then
+			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "irq_asm/$t.s"
 		else
 			( cd "$AP040_REF/tb/asm" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OLDPWD/$WORK/$t.bin" "$t.s" )
 		fi

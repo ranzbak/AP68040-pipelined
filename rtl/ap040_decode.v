@@ -216,7 +216,7 @@ localparam [5:0]
 	F_BITD = 6'd38, F_BITS = 6'd39, F_CAS = 6'd40, F_CAS2 = 6'd41, F_CHK2 = 6'd42,
 	F_CHK = 6'd43, F_TAS = 6'd44, F_NBCD = 6'd45, F_MDW = 6'd46, F_MDL = 6'd47,
 	F_TRAPCC = 6'd48, F_BCD = 6'd49, F_PACK = 6'd50, F_UNPK = 6'd51, F_SHR = 6'd52,
-	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55, F_MOVEUSP = 6'd56, F_MOVEP = 6'd57, F_MOVE16 = 6'd58, F_MOVES = 6'd59, F_CINV = 6'd60, F_PMMU = 6'd61;
+	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55, F_MOVEUSP = 6'd56, F_MOVEP = 6'd57, F_MOVE16 = 6'd58, F_MOVES = 6'd59, F_CINV = 6'd60, F_PMMU = 6'd61, F_STOP = 6'd62, F_RESET = 6'd63;
 
 // What an opcode word implies about the words that follow it.
 typedef struct packed {
@@ -433,6 +433,8 @@ function automatic shape_t shape(input logic [15:0] op);
 		16'b1111_0110_0010_0???: begin s.ok = 1'b1; s.form = F_MOVE16; s.npre = 2'd1; s.sz = SZ_L; end  // (Ax)+,(Ay)+
 		16'b1111_0110_000?_????: begin s.ok = 1'b1; s.form = F_MOVE16; s.npre = 2'd2; s.sz = SZ_L; end  // abs.L forms
 		16'h4E71: begin s.ok = 1'b1; s.form = F_NOP; end
+		16'h4E70: begin s.ok = 1'b1; s.form = F_RESET; end
+		16'h4E72: begin s.ok = 1'b1; s.form = F_STOP; s.npre = 2'd1; end
 		16'h4E73: begin s.ok = 1'b1; s.form = F_RTE; end
 		16'h4E75: begin s.ok = 1'b1; s.form = F_RTS; end
 		//------------------------------------------------ group 5
@@ -955,6 +957,11 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				d.imm[3:0] = CR_USP; d.imm[4] = !op[3];
 				d.src = ea_reg(EK_AREG, {2'b01, op[2:0]});
 			end
+			// STOP #<data>: privileged, the SR is loaded and the processor stops
+			// until an interrupt (or reset); RESET: privileged, RSTO for 512
+			// clocks (M68040UM 7.x, PRM 4-? STOP/RESET).  Both serialise.
+			F_STOP:  begin d.cls = CL_STOP;  d.priv = 1'b1; d.serialize = 1'b1; d.imm = {16'd0, x1}; end
+			F_RESET: begin d.cls = CL_RSTO;  d.priv = 1'b1; d.serialize = 1'b1; end
 			F_NOP: d.cls = CL_NOP;   // (waits for posted stores in EA-fetch: sync_busy)
 			F_RTE: begin d.cls = CL_RTE; d.priv = 1'b1; d.serialize = 1'b1; end
 			default: ;

@@ -106,7 +106,9 @@ typedef enum logic [5:0] {
 	CL_CAS2    = 6'd35,
 	CL_BF      = 6'd36,  // bitfields
 	CL_MOVEM   = 6'd37,  // MOVEM (EA-fetch sequences one micro-op per register)
-	CL_PMMU    = 6'd38   // PFLUSH / PTEST (EA-fetch runs them against the MMU, M7)
+	CL_PMMU    = 6'd38,  // PFLUSH / PTEST (EA-fetch runs them against the MMU, M7)
+	CL_STOP    = 6'd39,  // STOP #imm (SR, then the stopped state until an interrupt)
+	CL_RSTO    = 6'd40   // the RESET instruction (RSTO for 512 clocks)
 } cls_t;
 
 typedef struct packed {
@@ -268,6 +270,7 @@ typedef struct packed {
 	logic [3:0]  creg_sel;     // MOVEC
 	logic        creg_to;      // MOVEC Rn,Rc
 	logic        exc;          // exception-entry final micro-op (trace/X stream)
+	logic        irq;          // ... of an interrupt (the core acknowledges it at commit)
 	logic        cc;           // Bcc/DBcc/Scc condition, evaluated in EA-fetch
 	logic        nowrite;      // flags only (CMP family, TST)
 	logic        ccr_only;     // MOVE from CCR
@@ -291,6 +294,7 @@ typedef struct packed {
 	stf_t        stf;          // for an access error on the store (M6)
 	logic        creg_v; logic [3:0] creg_sel; logic [31:0] creg_val;
 	logic        exc;   logic [31:0] exc_sp;
+	logic        irq;
 } wb_t;
 
 // MOVEC compact selector codes (ext word bits 11:0 -> these)

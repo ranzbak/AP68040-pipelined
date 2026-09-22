@@ -14,7 +14,7 @@ def patch(old, new):
     global s
     assert s.count(old) == 1, "anchor %r found %d times" % (old, s.count(old))
     s = s.replace(old, new)
-if ms in ("m7", "m8"):
+if ms in ("m7", "m8"):   # (from m9s on: interrupts and STOP exist)
     patch("""        addq.w  #1,(which).l
         cmpi.w  #9,(which).l""", """        addq.w  #1,(which).l
         cmpi.w  #7,(which).l          ; (pipelined: case 7 needs interrupts, plan M9)

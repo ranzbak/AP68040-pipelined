@@ -36,7 +36,10 @@ module ap040_pipe_core
 	// BUS = 1: 0 synchronous stores (precise access errors, M6), 1 posted (fatal errors)
 	parameter         STORE_POST         = 0,
 	// 1: RTE treats format $4 as a format error (a full 68040; the FPU is M10)
-	parameter         HAS_FPU            = 0
+	parameter         HAS_FPU            = 0,
+	// 1: the interrupt inputs are live (the wrapper); 0: tied off (the L1
+	// benches leave ipl unconnected)
+	parameter         IRQ                = 0
 )
 (
 	input  clk,
@@ -89,7 +92,13 @@ module ap040_pipe_core
 	output  [1:0] pf_mode,
 	output [31:0] pf_addr,
 	output  [2:0] pf_fc,
-	input         pf_done
+	input         pf_done,
+	// interrupts, STOP, RESET (plan M9 subset): active-low IPL pins, the NMI
+	// acknowledge toggle (lib/AP68040 ap040_core.v), reset out, stopped
+	input   [2:0] ipl,
+	output        nmi_ack_toggle,
+	output        nresetout,
+	output        dbg_stopped
 );
 
 //--------------------------------------------------------------- stage wires
@@ -137,6 +146,13 @@ wire [31:0] redirect_pc    = wb_smc ? exe_o.stf.npc :
 // (BUS: a store waits in WB while the posted-store buffer is full)
 wire sb_full, sb_busy;
 wire pmmu_busy;             // a PTEST/PFLUSH owns the MMU (EA-fetch): IF holds off
+wire irq_req;               // a level above the mask (or an NMI edge) is pending
+wire [2:0] irq_lvl;
+// The acknowledge toggles when the interrupt's exception micro-op commits:
+// the same edge writes the new mask, as the reference's S_EXC0 does, so the
+// sampler's held level cannot be re-latched against the old mask
+reg  irq_ack_t, nmi_ack_t;
+wire eaf_stopped, eaf_rsto;
 // A held micro-op keeps writing its registers, CCR/SR and control registers
 // (the same values each clock -- nothing younger can pass it), so the stages
 // in front see them through the register file's write-through as usual;
@@ -192,6 +208,66 @@ always @(posedge clk) begin
 		end
 	end
 end
+
+//--------------------------------------------------------------- interrupts
+// The reference core's IPL sampler, lifted (lib/AP68040 ap040_core.v, the
+// "interrupt input synchronization" block): two coherent samples, level 7
+// edge-armed and acknowledged by toggle, a mask-qualified level 1-6 held
+// against a later mask raise until acknowledged, tracked down when the
+// device withdraws.  Interrupts are autovectored (the wrapper's
+// ipl_autovector is ignored, as the reference).  sr is the committed SR:
+// EA-fetch takes an interrupt only with nothing older in flight.
+generate if (IRQ != 0) begin : g_irq
+reg [2:0] ipl_s1, ipl_s2;
+reg [2:0] irq_lvl_r;
+reg [2:0] irq_hold_lvl;
+reg       irq_ack_d, nmi_ack_d, nmi_arm;
+always @(posedge clk) begin
+	if (!nreset) begin
+		ipl_s1 <= 3'b111; ipl_s2 <= 3'b111;
+		irq_lvl_r <= 3'd0; irq_hold_lvl <= 3'd0;
+		irq_ack_d <= 1'b0; nmi_ack_d <= 1'b0; nmi_arm <= 1'b0;
+	end else begin
+		ipl_s1 <= ipl;
+		ipl_s2 <= ipl_s1;
+		if (ipl_s1 == ipl_s2) begin
+			irq_lvl_r <= ~ipl_s2;
+			if (~ipl_s2 != 3'd7) nmi_arm <= 1'b1;
+		end
+		irq_ack_d <= irq_ack_t;
+		if (irq_ack_t != irq_ack_d)
+			irq_hold_lvl <= 3'd0;
+		else if (irq_hold_lvl > irq_lvl_r)
+			irq_hold_lvl <= (irq_lvl_r > sr[10:8]) ? irq_lvl_r : 3'd0;
+		else if (irq_lvl_r != 3'd0 && irq_lvl_r != 3'd7 &&
+		         irq_lvl_r > sr[10:8] && irq_lvl_r > irq_hold_lvl)
+			irq_hold_lvl <= irq_lvl_r;
+		nmi_ack_d <= nmi_ack_t;
+		if (nmi_ack_t != nmi_ack_d) nmi_arm <= 1'b0;
+	end
+end
+wire [2:0] irq_lvl_live = (ipl_s1 == ipl_s2) ? ~ipl_s2 : irq_lvl_r;
+// (an acknowledge still in flight -- toggled, not yet seen by the sampler --
+// is not a new request)
+wire       ack_busy = (irq_ack_t != irq_ack_d) || (nmi_ack_t != nmi_ack_d);
+wire       nmi_pend = irq_lvl_live == 3'd7 && nmi_arm;
+wire       irq_live = irq_lvl_live != 3'd0 && irq_lvl_live != 3'd7 && irq_lvl_live > sr[10:8];
+assign irq_lvl = nmi_pend ? 3'd7 :
+                 (irq_live && irq_lvl_live > irq_hold_lvl) ? irq_lvl_live : irq_hold_lvl;
+assign irq_req = !ack_busy && (nmi_pend || irq_live || irq_hold_lvl != 3'd0);
+end else begin : g_noirq
+assign irq_req = 1'b0;
+assign irq_lvl = 3'd0;
+end endgenerate
+always @(posedge clk)
+	if (!nreset) begin irq_ack_t <= 1'b0; nmi_ack_t <= 1'b0; end
+	else if (ce && retire && exe_o.irq) begin
+		if (exe_o.sr_val[10:8] == 3'd7) nmi_ack_t <= !nmi_ack_t;
+		else irq_ack_t <= !irq_ack_t;
+	end
+assign nmi_ack_toggle = nmi_ack_t;
+assign nresetout      = !eaf_rsto;
+assign dbg_stopped    = eaf_stopped;
 
 // the SR as the stages in front see it: WB's commit written through
 wire [15:0] sr_now = (commit && exe_o.sr_v)  ? exe_o.sr_val :
@@ -406,6 +482,8 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HA
 	.eaf_stall(eaf_stall), .eaf_blk(eaf_blk),
 	.eaf_valid(eaf_valid), .eaf_o(eaf_o),
 	.halted(eaf_halted),
+	.irq_req(irq_req), .irq_lvl(irq_lvl),
+	.stopped(eaf_stopped), .rsto(eaf_rsto),
 	.eaf_redir_v(eaf_redir_v), .eaf_redir_pc(eaf_redir_pc)
 );
 

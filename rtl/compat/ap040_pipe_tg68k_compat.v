@@ -250,7 +250,8 @@ ap040_pipe_core #(
 	.L1_AW(2),
 	.RESET_FROM_VECTORS(1),
 	.BUS(1),
-	.HAS_FPU(AP040_HAS_FPU)
+	.HAS_FPU(AP040_HAS_FPU),
+	.IRQ(1)
 ) core (
 	.clk(clk),
 	.nreset(nreset),
@@ -284,7 +285,8 @@ ap040_pipe_core #(
 	.itt0_q(w_itt0), .itt1_q(w_itt1), .dtt0_q(w_dtt0), .dtt1_q(w_dtt1),
 	.pt_req(pt_req), .pt_write(pt_write), .pt_addr(pt_addr), .pt_fc(pt_fcw),
 	.pt_done(pt_done), .pt_mmusr(pt_mmusr),
-	.pf_req(pf_req), .pf_mode(pf_mode), .pf_addr(pf_addr), .pf_fc(pf_fcw), .pf_done(pf_done)
+	.pf_req(pf_req), .pf_mode(pf_mode), .pf_addr(pf_addr), .pf_fc(pf_fcw), .pf_done(pf_done),
+	.ipl(ipl), .nmi_ack_toggle(nmi_ack_toggle), .nresetout(nresetout), .dbg_stopped()
 );
 
 // the MMU (M7): lifted from the reference as it is, wired as the reference
@@ -334,8 +336,6 @@ assign pt_done = 1'b1; assign pt_mmusr = 32'd0; assign pf_done = 1'b1;
 end endgenerate
 assign cinv_req = 1'b0; assign cinv_ic = 1'b0; assign cinv_dc = 1'b0;
 
-assign nresetout      = 1'b1;       // RESET (M9)
-assign nmi_ack_toggle = 1'b0;       // interrupts (M9)
 assign debug_busy     = mem_req;
 assign debug_fault    = core_stall_flt | core_st_err | post_err;
 assign debug_halted   = c_dbg_halted;

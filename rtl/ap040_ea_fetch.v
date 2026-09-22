@@ -54,7 +54,10 @@ module ap040_ea_fetch
 	// micro-op of its own, so a fault on the last store (CM, a restart)
 	// leaves An as it was -- a faulted store's micro-op keeps its register
 	// writes (they are applied while WB holds it)
-	parameter MM_TAIL = 0
+	parameter MM_TAIL = 0,
+	// RESET: how long RSTO is asserted, in (enabled) clocks -- M68040UM
+	// 7.x "the processor drives the reset out (RSTO) signal for 512 BCLK"
+	parameter RSTO_CLKS = 512
 )
 (
 	input             clk,
@@ -130,6 +133,14 @@ module ap040_ea_fetch
 	output reg        eaf_valid,
 	output ex_t       eaf_o,
 	output            halted,
+	// interrupts (plan M9 subset, pulled forward for gate 1): the core's
+	// sampler (the reference's, lifted) says a level above the mask is
+	// pending; EA-fetch takes it at an instruction boundary and toggles the
+	// acknowledge.  stopped: the STOP state; rsto: RESET's reset out.
+	input             irq_req,
+	input       [2:0] irq_lvl,
+	output            stopped,
+	output            rsto,
 
 	// redirect from this stage: RTS (its return address is loaded here) and
 	// a JMP/JSR whose target needed a memory-indirect pointer
@@ -147,7 +158,9 @@ localparam [3:0] P_START = 4'd0,  // examine / wait for serialisation
                  P_RESET = 4'd4,
                  P_HALT  = 4'd5,
                  P_MOVEM = 4'd6,  // MOVEM: one micro-op per register
-                 P_PMMU  = 4'd7;  // PFLUSH / PTEST: the MMU request, then a refetch
+                 P_PMMU  = 4'd7,  // PFLUSH / PTEST: the MMU request, then a refetch
+                 P_STOP  = 4'd8,  // STOP: the SR is written; waiting for an interrupt
+                 P_RSTO  = 4'd9;  // RESET: RSTO asserted
 
 reg  [3:0] ph;
 reg        rd_pend;        // a read is outstanding
@@ -274,6 +287,11 @@ wire        cm_mode = i.imm[0] ? ((i.src.mode == 3'd6) || (i.src.mode == 3'd7 &&
                                : (i.dst.mode == 3'd6);
 wire        cm_hit  = cm_v && (i.pc == cm_pc);                 // this is the instruction the RTE returned to
 wire        cm_use  = cm_hit && mm_cmi && cm_mode;
+// A MOVEM resumed by RTE with CM set continues the RTE: no interrupt is taken
+// in front of it (apolkosnik/AP68040 t_movem_restart.s case 7, "CM resumes
+// the interrupted instruction before a pending interrupt"; M68040UM 8.4.6.7
+// restarts the MOVEM as part of the RTE's frame processing)
+wire        irq_now = irq_req && !(cm_hit && mm_cmi);
 wire [31:0] s_addr_now = done_smi ? s_addr : eac_i.src_ea;
 wire [31:0] d_addr_now = done_dmi ? d_addr :
                          (i.cls == CL_CHK2) ? s_addr_now + ((i.size == SZ_B) ? 32'd1 : (i.size == SZ_W) ? 32'd2 : 32'd4) :
@@ -408,6 +426,8 @@ function automatic ex_t xord(input eac_t e, input logic [31:0] opa, input logic 
 		CL_RTS, CL_RTD: begin x.target = sv; x.redirect = 1'b0; end
 		CL_RTR:         begin x.target = dv; x.redirect = 1'b0; x.dk = DK_NONE; end
 		CL_MOVE2SR, CL_SROP: begin x.target = i.next_pc; x.redirect = 1'b1; end
+		CL_STOP:  begin x.cls = CL_MOVE2SR; x.a = i.imm; x.dk = DK_NONE; x.redirect = 1'b0; x.last = 1'b0; end
+		CL_RSTO:  begin x.cls = CL_NOP; x.dk = DK_NONE; end
 		// LINK A7: the value pushed is the decremented SP (PRM LINK: SP-4 -> SP;
 		// An -> (SP)), i.e. the push address
 		CL_LINK:        x.a = (e.src_r == e.dst_r) ? da : opa;
@@ -682,14 +702,17 @@ endfunction
 
 // the exception-entry final micro-op
 function automatic ex_t exc_final(input id_t i, input logic [4:0] bank, input logic [31:0] sp,
-                                  input logic [15:0] sr, input logic [31:0] target);
+                                  input logic [15:0] sr, input logic [31:0] target,
+                                  input logic irq, input logic [2:0] lvl);
 	ex_t x;
 	x = base_uop(i);
 	x.cls = CL_EXC;
 	x.exc = 1'b1;
 	x.sp_v = 1'b1; x.sp_r = bank; x.sp_val = sp;
-	// S set, T1/T0 cleared, M kept (M68040UM 8.1, p. 8-4)
-	x.sr_v = 1'b1; x.sr_val = {2'b00, 1'b1, sr[12:0]} & `AP040_SR_MASK;
+	// S set, T1/T0 cleared, M kept (M68040UM 8.1, p. 8-4); an interrupt
+	// also sets the mask to its level (8.1.4)
+	x.sr_v = 1'b1; x.sr_val = {2'b00, 1'b1, sr[12:11], irq ? lvl : sr[10:8], sr[7:0]} & `AP040_SR_MASK;
+	x.irq = irq;    // (the core acknowledges the interrupt when this commits)
 	x.target = target;
 	x.redirect = !target[0];
 	x.last = !target[0];
@@ -731,6 +754,7 @@ typedef struct packed {
 	logic [2:0]  dsel;   // which micro-op: 0 ordinary, 1 frame store, 2 exc final, 3 rte final, 4 reset
 	logic        exc_go; logic [7:0] ev; logic [3:0] ef; logic [31:0] epc; logic [31:0] eaddr;
 	logic        mm_go;  // MOVEM: the EA is known (memory-indirect pointer fetched), start the transfers
+	logic        irq;    // (with exc_go) the exception is an interrupt
 } stp_t;
 
 function automatic stp_t stepf(
@@ -743,12 +767,22 @@ function automatic stp_t stepf(
 	input logic [31:0] s_addr_c, input logic [31:0] s_val_c, input logic [31:0] d_val_c,
 	input logic [2:0] x_step, input logic [31:0] vbr, input logic [7:0] x_vec, input logic [31:0] x_target,
 	input logic [2:0] r_step, input logic [31:0] sp_now, input logic fmt_ok, input logic rte_goes,
-	input logic rx7);
+	input logic rx7, input logic irq_r, input logic [2:0] irq_l, input logic rs_done);
 	stp_t s;
 	s = '0;
 	case (ph)
 		P_START, P_OPS: if (ev_valid && !rstp) begin
-			if (i.serialize && older_busy && ph == P_START) begin
+			if (irq_r && ph == P_START) begin
+				// An interrupt above the mask is taken at this instruction
+				// boundary (M68040UM 8.1.4): once everything older has
+				// committed -- the mask the decision used is then the
+				// architectural one -- vector 24 + level, format $0, PC =
+				// this instruction, which has not started
+				if (!older_busy) begin
+					s.exc_go = 1'b1; s.irq = 1'b1; s.ev = 8'd24 + {5'd0, irq_l}; s.ef = 4'd0;
+					s.epc = i.pc;
+				end
+			end else if (i.serialize && older_busy && ph == P_START) begin
 				// wait until everything older has committed
 			end else if (i.priv && !s_bit) begin
 				s.exc_go = 1'b1; s.ev = 8'd8; s.ef = 4'd0; s.epc = i.pc;
@@ -759,6 +793,11 @@ function automatic stp_t stepf(
 				// the sequence runs in P_RTE
 			end else if (i.cls == CL_PMMU) begin
 				// the sequence runs in P_PMMU
+			end else if (i.cls == CL_STOP) begin
+				// the SR micro-op, then the stopped state (P_STOP)
+				if (!stall) begin s.disp = 1'b1; s.dsel = 3'd0; end
+			end else if (i.cls == CL_RSTO) begin
+				// RSTO in P_RSTO
 			end else if (i.cls == CL_NOP && sync) begin
 				// NOP synchronises: it waits until every older store is in memory
 				// (M68040UM 7.7 bus synchronisation, p. 7-43)
@@ -838,6 +877,18 @@ function automatic stp_t stepf(
 				end
 			end
 		end
+		P_STOP: if (ev_valid) begin
+			// stopped: an interrupt above the (new) mask ends it, once the SR
+			// micro-op has committed; the stacked PC is the instruction after
+			// the STOP (M68040UM 8.1.4; PRM STOP)
+			if (!older_busy && irq_r) begin
+				s.exc_go = 1'b1; s.irq = 1'b1; s.ev = 8'd24 + {5'd0, irq_l}; s.ef = 4'd0;
+				s.epc = i.next_pc;
+			end
+		end
+		P_RSTO: if (ev_valid) begin
+			if (rs_done && !stall) begin s.disp = 1'b1; s.dsel = 3'd0; s.fin = 1'b1; end
+		end
 		P_RESET: begin
 			if (r_step <= 3'd1) begin
 				if (!rd_pend) begin
@@ -859,7 +910,7 @@ wire stp_t st0 = stepf(ph, eac_valid, rst_pending, i, older_busy, !bf_rdblk, rd_
                       s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, trap_n, trap_vec,
                       indexed_mode, two_uop, bf_step, sync_busy, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes,
-                      r_fv[15:12] == 4'd7);
+                      r_fv[15:12] == 4'd7, irq_now, irq_lvl, rs_cnt == 10'd0);
 
 //--------------------------------------------------------------- access errors
 // A data read that ends in an access error (M68040UM 8.2.1, p. 8-6): the
@@ -1113,6 +1164,11 @@ wire stp_t st = aerr_st(pm_st(st1, ph == P_PMMU, pm_got, stall_in), aerr_go, i, 
 // off; the request is a level until done; PTEST's MMUSR is written by the
 // final micro-op, and both refetch the next instruction so nothing younger
 // was translated under the old map (the reference's epf_flush).
+reg        x_irq;          // the exception in progress is an interrupt ...
+reg  [2:0] x_lvl;          // ... of this level (the new mask)
+reg  [9:0] rs_cnt;         // RESET: RSTO clocks left
+assign stopped = (ph == P_STOP);
+assign rsto    = (ph == P_RSTO);
 reg        pm_sent;        // the request went out
 reg        pm_got;         // ... and was answered
 reg [31:0] pm_mmusr;
@@ -1159,7 +1215,7 @@ endfunction
 
 wire ex_t disp_x0 = dmux(st.dsel, x_ord,
                         exc_uop(i, x_k, x_sp, x_sr, x_pc, x_fmt, x_vec, x_addr, x7[(x_k < 4'd2) ? 4'd2 : x_k]),
-                        exc_final(i, x_bank, x_sp, x_sr, x_target),
+                        exc_final(i, x_bank, x_sp, x_sr, x_target, x_irq, x_lvl),
                         rte_final(i, bank_now, rd_a, r_fv, r_sr, r_pc),
                         (ph == P_PMMU) ? pm_x : reset_final(i, x_sp, r_pc),
                         ccr_only_uop(x_ord),
@@ -1231,6 +1287,7 @@ always @(posedge clk) begin
 		bf_step <= 1'b0;
 		pt_req <= 1'b0; pt_write <= 1'b0; pt_addr <= 32'd0; pf_req <= 1'b0; pf_mode <= 2'd0; pf_addr <= 32'd0;
 		pm_sent <= 1'b0; pm_got <= 1'b0; pm_mmusr <= 32'd0;
+		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
 		cm_v <= 1'b0; cm_ea <= 32'd0; cm_pc <= 32'd0; r_ea <= 32'd0; r_ssw <= 16'd0;
 		mm_mask <= 16'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0; mm_tail <= 1'b0;
@@ -1254,7 +1311,7 @@ always @(posedge clk) begin
 			// the faulted store's instruction is done or restarts; everything
 			// behind it (EX's micro-op, this stage) is abandoned
 			eaf_valid <= 1'b0;
-			ph <= P_EXC; x_step <= 3'd5; x_vec <= 8'd2; x_fmt <= 4'd7;
+			ph <= P_EXC; x_step <= 3'd5; x_vec <= 8'd2; x_fmt <= 4'd7; x_irq <= 1'b0;
 			x_pc <= wf_last ? wb_stf.npc : wb_stf.ipc;
 			x_addr <= wb_st_a;
 			x7[2] <= wb_stf.cm ? mm_ea[wb_stf.cmt] :                              // EA (MOVEM: calculated)
@@ -1297,8 +1354,12 @@ always @(posedge clk) begin
 				P_START: begin
 					if (rst_pending) begin
 						ph <= P_RESET; r_step <= 3'd0;
-					end else if (eac_valid && !(i.serialize && older_busy)) begin
-						if (!st.exc_go && i.cls == CL_PMMU) begin
+					end else if (eac_valid && !(i.serialize && older_busy) && !irq_now) begin
+						if (!st.exc_go && i.cls == CL_STOP) begin
+							if (st.disp) ph <= P_STOP;
+						end else if (!st.exc_go && i.cls == CL_RSTO) begin
+							ph <= P_RSTO; rs_cnt <= RSTO_CLKS[9:0] - 10'd1;
+						end else if (!st.exc_go && i.cls == CL_PMMU) begin
 							ph <= P_PMMU; pm_sent <= 1'b0; pm_got <= 1'b0;
 						end else if (!st.exc_go && i.cls == CL_RTE) begin
 							ph <= P_RTE; r_step <= 3'd0;
@@ -1343,10 +1404,11 @@ always @(posedge clk) begin
 							// odd PC after the RTE committed SR and SP: address error with the
 							// restored SR (reference S_RTE_FIN2), PC = the RTE
 							ph <= P_EXC; x_step <= 3'd5;
-							x_vec <= 8'd3; x_fmt <= 4'd2; x_pc <= i.pc; x_addr <= {r_pc[31:1], 1'b0};
+							x_vec <= 8'd3; x_fmt <= 4'd2; x_pc <= i.pc; x_addr <= {r_pc[31:1], 1'b0}; x_irq <= 1'b0;
 						end
 					end
 				end
+				P_RSTO: if (rs_cnt != 10'd0) rs_cnt <= rs_cnt - 10'd1;
 				P_PMMU: begin
 					if (!pm_sent && bus_idle) begin
 						pm_sent <= 1'b1;
@@ -1391,6 +1453,7 @@ always @(posedge clk) begin
 				ph     <= P_EXC;
 				x_vec  <= st.ev; x_fmt <= st.ef; x_pc <= st.epc; x_addr <= st.eaddr;
 				x_step <= 3'd5;
+				x_irq  <= st.irq; x_lvl <= irq_lvl;
 			end
 			if (st.disp && st.dsel == 3'd0 && two_uop && !st.fin) bf_step <= 1'b1;
 			// MOVEM

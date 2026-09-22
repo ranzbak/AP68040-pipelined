@@ -103,13 +103,13 @@ patch("""	move.l	$14(sp),d0	; EA field: WinUAE stacks the fault address here
 """)
 
 # 2. no interrupts before M9
-if ms in ("m7", "m8"):
+if ms in ("m7", "m8"):   # (from m9s on: interrupts and STOP exist)
     patch("""	btst	#0,d0		; injection; benches without it advertise 0
 	beq	imix_done""", """	btst	#0,d0		; injection; benches without it advertise 0
 	bra	imix_done	; (pipelined: interrupts are plan M9)""")
 
 # 3. no STOP before M9
-if ms in ("m7", "m8"):
+if ms in ("m7", "m8"):   # (from m9s on: interrupts and STOP exist)
     patch("""	move.w	#$600D,(DONEREG).l
 	stop	#$2700
 """, """	move.w	#$600D,(DONEREG).l

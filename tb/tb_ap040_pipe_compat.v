@@ -556,6 +556,21 @@ always @(posedge clk) begin
 	end
 end
 
+// $F170 (read): the length, in clocks, of the last RSTO pulse (the RESET
+// instruction's nresetout low time); $F172: how many pulses so far.
+// Pipelined bench only (plan M9 subset).
+reg [15:0] rsto_len = 0, rsto_cnt = 0, rsto_n = 0;
+always @(posedge clk) begin
+	if (!nreset) begin rsto_len <= 0; rsto_n <= 0; end
+	else if (!nresetout) rsto_len <= rsto_len + 1'd1;
+	else if (rsto_len != 0) begin
+		mem[16'hF170 >> 1] = rsto_len;
+		mem[16'hF172 >> 1] = rsto_n + 1'd1;
+		rsto_n <= rsto_n + 1'd1;
+		rsto_len <= 0;
+	end
+end
+
 // Dedicated 32-bit physical table-walker memory port.  It deliberately has
 // an independent latency profile and never asserts mem_ready on the 16-bit
 // CPU bus, so all MMU tests fail if descriptor traffic leaks onto that bus.
