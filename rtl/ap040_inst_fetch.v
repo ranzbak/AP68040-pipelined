@@ -13,6 +13,14 @@
 // A redirect (EX's flush, or ID's guessed-taken branch) empties the queue, //
 // drops the fetch in flight, and fetches at the target in the same clock. //
 //                                                                          //
+// Fetch port (plan M5): f_req/f_addr/f_long held until f_gnt; the answer   //
+// f_ack/f_data (the two words, or the one in f_data[31:16]) comes one or  //
+// more clocks later.  One fetch outstanding; a new one may issue in the   //
+// clock the previous answers.  A redirect while a fetch is outstanding    //
+// marks its answer for dropping.  LONG_ANY = 1: always two words (the L1  //
+// test substrate reads any word pair); 0: one word at a word address that //
+// is not longword aligned (the bus).                                      //
+//                                                                          //
 // FETCH_AT_RESET = 0: idle after reset until the first redirect (the reset //
 // vector fetch in EA-fetch supplies it).  PROG_WORDS bounds how many words //
 // are fetched (the milestone benches' drain checks rely on it).           //
@@ -25,7 +33,8 @@ module ap040_inst_fetch
 	parameter [31:0] PC_RESET       = 32'h0000_0400,
 	parameter         PROG_WORDS     = 10,
 	parameter         L1_AW          = 12,
-	parameter         FETCH_AT_RESET = 1
+	parameter         FETCH_AT_RESET = 1,
+	parameter         LONG_ANY       = 1
 )
 (
 	input             clk,
@@ -39,9 +48,12 @@ module ap040_inst_fetch
 
 	input       [1:0] consume,      // words ID takes from the head this clock
 
-	output [L1_AW-1:0] l1_addr_a,
-	output             l1_en_a,
-	input       [31:0] l1_rdata_a,  // {word at addr, word at addr+2}
+	output            f_req,
+	output     [31:0] f_addr,
+	output            f_long,       // two words (else one)
+	input             f_gnt,        // the request is taken this clock
+	input             f_ack,        // the answer
+	input      [31:0] f_data,       // {word at addr, word at addr+2}
 
 	output            q_v0,         // head word valid
 	output            q_v1,         // second word valid
@@ -59,7 +71,8 @@ reg [15:0] q [0:QN-1];
 reg  [2:0] qcnt;
 reg [31:0] qpc;           // address of q[0]
 reg [31:0] fpc;           // next fetch address
-reg        infl;          // a fetch is in flight (data next clock)
+reg        infl;          // a fetch is outstanding
+reg        fdrop;         // ... and its answer is to be dropped (a redirect came after it)
 reg  [1:0] infl_n;        // how many words it carries
 reg [31:0] issued;        // words handed to ID so far
 reg        running;
@@ -73,18 +86,22 @@ assign q_pc0 = qpc;
 assign q_w0  = q[0];
 assign q_w1  = q[1];
 
-wire  [1:0] want      = 2'd2;
+wire [31:0] fa        = redirect_valid ? redirect_pc : fpc;
+wire  [1:0] want      = (LONG_ANY != 0 || !fa[1]) ? 2'd2 : 2'd1;
+wire        got       = infl && f_ack;                      // an answer this clock
+wire        use_ans   = got && !fdrop && !redirect_valid;  // ... that goes into the queue
 wire  [2:0] after_c   = redirect_valid ? 3'd0 : (qcnt - {1'b0, consume});
-wire  [2:0] pend      = (!redirect_valid && infl) ? {1'b0, infl_n} : 3'd0;
+wire  [2:0] pend      = (!redirect_valid && infl && !fdrop) ? {1'b0, infl_n} : 3'd0;
 assign q_lo = qpc;
 assign q_hi = fpc;
-wire        can_issue = ce && (running || redirect_valid) && (want != 2'd0) && !hold &&
-                        !(redirect_valid && redirect_hold) &&
-                        (after_c + pend + 3'd2 <= QN);
-wire [31:0] f_addr    = redirect_valid ? redirect_pc : fpc;
-
-assign l1_addr_a = (f_addr - PC_RESET) >> 1;
-assign l1_en_a   = can_issue;
+// a request goes out when there is room for the answer and no other fetch
+// is outstanding (or it answers now)
+wire        want_req  = (running || redirect_valid) && !hold && !(redirect_valid && redirect_hold) &&
+                        (!infl || f_ack) && (after_c + pend + 3'd2 <= QN);
+assign f_req  = ce && want_req;
+assign f_addr = fa;
+assign f_long = (want == 2'd2);
+wire        can_issue = f_req && f_gnt;
 
 integer k;
 reg [15:0] nq [0:QN-1];
@@ -96,6 +113,7 @@ always @(posedge clk) begin
 		qpc     <= PC_RESET;
 		fpc     <= PC_RESET;
 		infl    <= 1'b0;
+		fdrop   <= 1'b0;
 		infl_n  <= 2'd0;
 		issued  <= 32'd0;
 		running <= (FETCH_AT_RESET != 0);
@@ -106,9 +124,9 @@ always @(posedge clk) begin
 		for (k = 0; k < QN; k = k + 1)
 			nq[k] = (k + consume < QN) ? q[k + consume] : 16'h4E71;
 		ncnt = after_c;
-		if (!redirect_valid && infl) begin
-			nq[ncnt] = l1_rdata_a[31:16];
-			if (infl_n == 2'd2) nq[ncnt + 1] = l1_rdata_a[15:0];
+		if (use_ans) begin
+			nq[ncnt] = f_data[31:16];
+			if (infl_n == 2'd2) nq[ncnt + 1] = f_data[15:0];
 			ncnt = ncnt + {1'b0, infl_n};
 		end
 		for (k = 0; k < QN; k = k + 1) q[k] <= nq[k];
@@ -120,11 +138,16 @@ always @(posedge clk) begin
 			qpc <= qpc + {29'd0, consume, 1'b0};
 		end
 		hold   <= redirect_valid && redirect_hold;
-		infl   <= can_issue;
-		infl_n <= want;
+		if (can_issue) begin
+			infl <= 1'b1; infl_n <= want; fdrop <= 1'b0;
+		end else if (got) begin
+			infl <= 1'b0; fdrop <= 1'b0;
+		end
+		// a redirect while a fetch is outstanding (and not answering now): drop its answer
+		if (redirect_valid && infl && !f_ack && !can_issue) fdrop <= 1'b1;
 		issued <= issued + {30'd0, consume};
 		if (can_issue) begin
-			fpc    <= f_addr + {29'd0, want, 1'b0};
+			fpc    <= fa + {29'd0, want, 1'b0};
 		end else if (redirect_valid) begin
 			fpc    <= redirect_pc;
 		end

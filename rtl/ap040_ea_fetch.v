@@ -37,6 +37,12 @@
 
 module ap040_ea_fetch
 	import ap040_pipe_pkg::*;
+#(
+	// 1: merge the stores still in EX/WB into a read's answer (the L1 test
+	// substrate answers the next clock, before they reach memory); 0: the
+	// bus controller holds every read until older stores are in memory
+	parameter STFWD = 1
+)
 (
 	input             clk,
 	input             nreset,
@@ -52,6 +58,7 @@ module ap040_ea_fetch
 	input       [2:0] sfc_in, dfc_in,   // MOVES
 	input             older_busy, // EX or WB holds an instruction
 	input             older_store,// EX holds a store that has not reached memory
+	input             sync_busy,  // a store (EX, WB or posted) is not in memory yet: NOP waits
 	input             reset_seq,  // run the reset vector fetch first
 	// EA-calc's early read for the instruction moving in at the end of this
 	// clock (issued when this stage does not use the port itself)
@@ -235,7 +242,7 @@ wire rdreq_t nx = next_rd(need_smi, done_smi, need_dmi, done_dmi, needs_ld_src, 
 // clock back to back).
 reg  [31:0] rd_a_q;        // address and size of the outstanding read
 reg   [1:0] rd_sz_q;
-wire [31:0] rd_data = st_merge(st_merge(rd_data_raw, rd_a_q, rd_sz_q, wb_st_v, wb_st_addr, wb_st_size, wb_st_data),
+wire [31:0] rd_data = (STFWD == 0) ? rd_data_raw : st_merge(st_merge(rd_data_raw, rd_a_q, rd_sz_q, wb_st_v, wb_st_addr, wb_st_size, wb_st_data),
                                rd_a_q, rd_sz_q, ex_st_v, ex_st_addr, ex_st_size, ex_st_data);
 
 // the capture in this cycle, as the dispatch sees it
@@ -632,7 +639,7 @@ function automatic stp_t stepf(
 	input logic s_bit, input logic stall,
 	input rdreq_t nx, input logic ops_done, input logic jmp_odd, input logic rts_odd, input logic rtr_odd,
 	input logic trap_u, input logic trap_n, input logic [7:0] trap_vec,
-	input logic indexed, input logic two, input logic tstep,
+	input logic indexed, input logic two, input logic tstep, input logic sync,
 	input logic [31:0] s_addr_c, input logic [31:0] s_val_c, input logic [31:0] d_val_c,
 	input logic [2:0] x_step, input logic [31:0] vbr, input logic [7:0] x_vec, input logic [31:0] x_target,
 	input logic [2:0] r_step, input logic [31:0] sp_now, input logic fmt_ok, input logic rte_goes);
@@ -649,6 +656,9 @@ function automatic stp_t stepf(
 				s.epc = i.exc_next ? i.next_pc : i.pc; s.eaddr = i.exc_addr;
 			end else if (i.cls == CL_RTE) begin
 				// the sequence runs in P_RTE
+			end else if (i.cls == CL_NOP && sync) begin
+				// NOP synchronises: it waits until every older store is in memory
+				// (M68040UM 7.7 bus synchronisation, p. 7-43)
 			end else begin
 				if (nx.v && !cap && can_rd && !rd_pend) begin
 					s.issue = 1'b1; s.it = nx.t; s.ia = nx.a; s.isz = nx.sz;
@@ -738,7 +748,7 @@ endfunction
 wire bf_rdblk = is_bf && ex_haz;
 wire stp_t st0 = stepf(ph, eac_valid, rst_pending, i, older_busy, !bf_rdblk, rd_pend, rd_ack, cap,
                       s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, trap_n, trap_vec,
-                      indexed_mode, two_uop, bf_step, s_addr_c, s_val_c,
+                      indexed_mode, two_uop, bf_step, sync_busy, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes);
 
 //--------------------------------------------------------------- MOVEM

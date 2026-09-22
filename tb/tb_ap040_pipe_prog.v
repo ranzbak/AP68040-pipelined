@@ -19,6 +19,11 @@
 //   noread <addr>        no data read may touch this byte (pure writes)     //
 //   # ...                comment (the # a word of its own)                 //
 // Prints "ALL TESTS PASSED" or one FAIL line per mismatch.                  //
+//                                                                          //
+// -DBUS_MODE (plan M5): the core with BUS=1 and a memory model on its mem_* //
+// port instead of the L1 array; +prof=0 back-to-back acks, 1 varied waits,  //
+// 2 varied waits under a clock enable high one clock in three with the ack //
+// held until the next enable (the Minimig kernel's clkena).               //
 //--------------------------------------------------------------------------//
 `timescale 1ns/1ps
 
@@ -31,6 +36,8 @@ localparam        L1_WORDS = (1 << L1_AW);
 reg clk = 0;
 always #5 clk = ~clk;
 reg nreset = 0;
+reg ce = 1'b1;
+integer prof = 0;
 
 wire        dbg_wb_valid;
 wire [31:0] dbg_wb_pc;
@@ -38,10 +45,23 @@ wire [31:0] dbg_d0, dbg_d1, dbg_d2, dbg_d3, dbg_d4, dbg_d5, dbg_d6, dbg_d7;
 wire  [4:0] dbg_ccr;
 wire [15:0] dbg_sr;
 
+wire        mem_req, mem_write, mem_instr;
+wire  [1:0] mem_size;
+wire [31:0] mem_addr, mem_wdata;
+wire  [2:0] mem_fc;
+reg         m_ack = 1'b0;
+reg  [31:0] m_rdata = 32'd0;
+
 ap040_pipe_core #(
 	.PC_RESET(PC_RESET), .PROG_WORDS(32'h7FFF_FFFF), .L1_AW(L1_AW), .RESET_FROM_VECTORS(1)
+`ifdef BUS_MODE
+	, .BUS(1)
+`endif
 ) dut (
-	.clk(clk), .nreset(nreset), .ce(1'b1),
+	.clk(clk), .nreset(nreset), .ce(ce),
+	.mem_req(mem_req), .mem_write(mem_write), .mem_instr(mem_instr), .mem_size(mem_size),
+	.mem_addr(mem_addr), .mem_wdata(mem_wdata), .mem_fc(mem_fc),
+	.mem_ack(m_ack), .mem_rdata(m_rdata), .mem_flt(1'b0), .bus_st_err(),
 	.dbg_if_valid(), .dbg_if_pc(), .dbg_id_valid(), .dbg_id_pc(),
 	.dbg_eac_valid(), .dbg_eac_pc(), .dbg_eaf_valid(), .dbg_eaf_pc(),
 	.dbg_ex_valid(), .dbg_ex_pc(), .dbg_wb_valid(dbg_wb_valid), .dbg_wb_pc(dbg_wb_pc),
@@ -50,6 +70,16 @@ ap040_pipe_core #(
 	.dbg_ccr(dbg_ccr), .dbg_sr(dbg_sr)
 );
 
+`ifdef BUS_MODE
+reg [15:0] bmem [0:32767];            // 64K at address 0 (high bits alias, as the L1)
+function [7:0] mb(input [31:0] a);
+	reg [15:0] w;
+	begin
+		w  = bmem[(a >> 1) & 32'h7FFF];
+		mb = a[0] ? w[7:0] : w[15:8];
+	end
+endfunction
+`else
 function [7:0] mb(input [31:0] a);
 	reg [15:0] w;
 	begin
@@ -57,6 +87,88 @@ function [7:0] mb(input [31:0] a);
 		mb = a[0] ? w[7:0] : w[15:8];
 	end
 endfunction
+`endif
+
+// data accesses as the checks below see them: the L1's ports, or (bus mode)
+// a completing mem_* transfer that is not a fetch
+wire        ev_rd, ev_wr, ev_wr_rb;
+wire [31:0] ev_rd_addr, ev_wr_addr, ev_wr_data;
+wire  [1:0] ev_rd_size, ev_wr_size;
+wire  [2:0] ev_rd_fc, ev_wr_fc;
+`ifdef BUS_MODE
+reg         m_busy = 1'b0, m_first = 1'b0;
+integer     m_lat = 0, m_n = 0, cyc = 0;
+// an access event is the clock after the memory answered (m_first): the
+// request is still held then, and the write lands at the falling edge
+assign ev_rd = m_first && !mem_write && !mem_instr;
+assign ev_wr = m_first && mem_write;
+assign ev_rd_addr = mem_addr; assign ev_wr_addr = mem_addr;
+assign ev_rd_size = mem_size; assign ev_wr_size = mem_size;
+assign ev_rd_fc   = mem_fc;   assign ev_wr_fc   = mem_fc;
+assign ev_wr_data = mem_wdata;
+assign ev_wr_rb   = dut.g_bus.u_bcu.mem_rb;
+function integer mlat(input integer p, input integer n);
+	mlat = (p == 0) ? 0 : (n * 7 + 3) % 6;
+endfunction
+function [31:0] mrd(input [31:0] a, input [1:0] sz);
+	case (sz)
+		2'd0:    mrd = {24'd0, mb(a)};
+		2'd1:    mrd = {16'd0, mb(a), mb(a + 1)};
+		default: mrd = {mb(a), mb(a + 1), mb(a + 2), mb(a + 3)};
+	endcase
+endfunction
+task mwb(input [31:0] a, input [7:0] b);
+	if (a[0]) bmem[(a >> 1) & 32'h7FFF][7:0] = b; else bmem[(a >> 1) & 32'h7FFF][15:8] = b;
+endtask
+// the memory: a request is taken when it appears, answered m_lat clocks
+// later; the ack stays up until a clock-enabled edge has seen it
+always @(posedge clk) begin
+	cyc <= cyc + 1;
+	if (!nreset) begin m_busy <= 1'b0; m_ack <= 1'b0; m_first <= 1'b0; end
+	else begin
+		m_first <= 1'b0;
+		if (m_ack && ce) m_ack <= 1'b0;
+		if (!m_busy && mem_req && !m_ack) begin
+			m_busy <= 1'b1; m_lat <= mlat(prof, m_n); m_n <= m_n + 1;
+		end else if (m_busy) begin
+			if (m_lat == 0) begin
+				m_busy <= 1'b0; m_ack <= 1'b1; m_first <= 1'b1;
+				m_rdata <= mrd(mem_addr, mem_size);
+			end else m_lat <= m_lat - 1;
+		end
+	end
+end
+// the request must be low for one enabled clock after an ack (the reference
+// core's S_EPF_GAP rule: the cache and the RAM controllers take a held
+// request after an ack as a new transfer)
+reg     ack_seen = 1'b0;
+integer gap_bad = 0;
+always @(posedge clk)
+	if (nreset && ce) begin
+		if (ack_seen && mem_req) begin
+			gap_bad = gap_bad + 1;
+			if (gap_bad < 4) $display("FAIL: mem_req high in the enabled clock after an ack (addr %h)", mem_addr);
+		end
+		ack_seen <= m_ack;
+	end
+always @(negedge clk)
+	if (m_first && mem_write)
+		case (mem_size)
+			2'd0: mwb(mem_addr, mem_wdata[7:0]);
+			2'd1: begin mwb(mem_addr, mem_wdata[15:8]); mwb(mem_addr + 1, mem_wdata[7:0]); end
+			default: begin
+				mwb(mem_addr, mem_wdata[31:24]); mwb(mem_addr + 1, mem_wdata[23:16]);
+				mwb(mem_addr + 2, mem_wdata[15:8]); mwb(mem_addr + 3, mem_wdata[7:0]);
+			end
+		endcase
+always @(posedge clk) ce <= (prof == 2) ? ((cyc % 3) == 0) : 1'b1;
+`else
+assign ev_rd = dut.u_l1.rd_req;   assign ev_rd_addr = dut.u_l1.rd_addr; assign ev_rd_size = dut.u_l1.rd_size;
+assign ev_wr = dut.u_l1.wr_req;   assign ev_wr_addr = dut.u_l1.wr_addr; assign ev_wr_size = dut.u_l1.wr_size;
+assign ev_wr_data = dut.u_l1.wr_data;
+assign ev_rd_fc = dut.d_rd_fc;    assign ev_wr_fc = dut.exe_o.st_fc;
+assign ev_wr_rb = dut.exe_o.st_rb;
+`endif
 
 function [31:0] reg_by_name(input [63:0] n);   // key as a right-justified ASCII vector
 	case (n)
@@ -94,12 +206,12 @@ reg [31:0] noread [0:15];
 integer    n_noread = 0, reads_bad = 0, nr;
 reg [31:0] rlen;
 always @(posedge clk)
-	if (nreset && dut.u_l1.rd_req) begin
-		rlen = (dut.u_l1.rd_size == 2'd0) ? 1 : (dut.u_l1.rd_size == 2'd1) ? 2 : 4;
+	if (nreset && ev_rd) begin
+		rlen = (ev_rd_size == 2'd0) ? 1 : (ev_rd_size == 2'd1) ? 2 : 4;
 		for (nr = 0; nr < n_noread; nr = nr + 1)
-			if (noread[nr] >= dut.u_l1.rd_addr && noread[nr] < dut.u_l1.rd_addr + rlen) begin
+			if (noread[nr] >= ev_rd_addr && noread[nr] < ev_rd_addr + rlen) begin
 				reads_bad = reads_bad + 1;
-				$display("FAIL: data read of %h (size %0d) touches noread byte %h", dut.u_l1.rd_addr, rlen, noread[nr]);
+				$display("FAIL: data read of %h (size %0d) touches noread byte %h", ev_rd_addr, rlen, noread[nr]);
 			end
 	end
 
@@ -110,17 +222,17 @@ integer n_rb = 0, want_rb = -1, rb_bad = 0, kb, n_rbl = 0;
 reg [31:0] rb_at [0:31];
 reg [2:0] rbn;
 always @(posedge clk)
-	if (nreset && dut.u_l1.wr_req && dut.exe_o.st_rb) begin
-		if (n_rb < n_rbl && rb_at[n_rb] != dut.u_l1.wr_addr) begin
+	if (nreset && ev_wr && ev_wr_rb) begin
+		if (n_rb < n_rbl && rb_at[n_rb] != ev_wr_addr) begin
 			rb_bad = rb_bad + 1;
-			$display("FAIL: locked write-back #%0d at %h, expected %h", n_rb, dut.u_l1.wr_addr, rb_at[n_rb]);
+			$display("FAIL: locked write-back #%0d at %h, expected %h", n_rb, ev_wr_addr, rb_at[n_rb]);
 		end
 		n_rb = n_rb + 1;
-		rbn = (dut.u_l1.wr_size == 2'd0) ? 1 : (dut.u_l1.wr_size == 2'd1) ? 2 : 4;
+		rbn = (ev_wr_size == 2'd0) ? 1 : (ev_wr_size == 2'd1) ? 2 : 4;
 		for (kb = 0; kb < rbn; kb = kb + 1)
-			if (mb(dut.u_l1.wr_addr + kb) !== dut.u_l1.wr_data[8 * (rbn - 1 - kb) +: 8]) begin
+			if (mb(ev_wr_addr + kb) !== ev_wr_data[8 * (rbn - 1 - kb) +: 8]) begin
 				rb_bad = rb_bad + 1;
-				$display("FAIL: locked write-back at %h changes byte %0d", dut.u_l1.wr_addr, kb);
+				$display("FAIL: locked write-back at %h changes byte %0d", ev_wr_addr, kb);
 			end
 	end
 
@@ -130,10 +242,10 @@ reg [31:0] ro_at [0:15];
 integer    ro_n [0:15];
 integer    n_ro = 0, kr;
 always @(posedge clk)
-	if (nreset && dut.u_l1.rd_req)
+	if (nreset && ev_rd)
 		for (kr = 0; kr < n_ro; kr = kr + 1)
-			if (ro_at[kr] >= dut.u_l1.rd_addr &&
-			    ro_at[kr] < dut.u_l1.rd_addr + ((dut.u_l1.rd_size == 2'd0) ? 1 : (dut.u_l1.rd_size == 2'd1) ? 2 : 4))
+			if (ro_at[kr] >= ev_rd_addr &&
+			    ro_at[kr] < ev_rd_addr + ((ev_rd_size == 2'd0) ? 1 : (ev_rd_size == 2'd1) ? 2 : 4))
 				ro_n[kr] = ro_n[kr] + 1;
 
 // "fc <addr> <fc>": every data read and write touching that byte uses that
@@ -143,20 +255,20 @@ reg  [2:0] fc_want [0:15];
 integer    n_fc = 0, fc_bad = 0, fc_hits = 0, kf;
 always @(posedge clk)
 	if (nreset) for (kf = 0; kf < n_fc; kf = kf + 1) begin
-		if (dut.u_l1.rd_req && fc_at[kf] >= dut.u_l1.rd_addr &&
-		    fc_at[kf] < dut.u_l1.rd_addr + ((dut.u_l1.rd_size == 2'd0) ? 1 : (dut.u_l1.rd_size == 2'd1) ? 2 : 4)) begin
+		if (ev_rd && fc_at[kf] >= ev_rd_addr &&
+		    fc_at[kf] < ev_rd_addr + ((ev_rd_size == 2'd0) ? 1 : (ev_rd_size == 2'd1) ? 2 : 4)) begin
 			fc_hits = fc_hits + 1;
-			if (dut.d_rd_fc !== fc_want[kf]) begin
+			if (ev_rd_fc !== fc_want[kf]) begin
 				fc_bad = fc_bad + 1;
-				$display("FAIL: read of %h with FC %0d, expected %0d", dut.u_l1.rd_addr, dut.d_rd_fc, fc_want[kf]);
+				$display("FAIL: read of %h with FC %0d, expected %0d", ev_rd_addr, ev_rd_fc, fc_want[kf]);
 			end
 		end
-		if (dut.u_l1.wr_req && fc_at[kf] >= dut.u_l1.wr_addr &&
-		    fc_at[kf] < dut.u_l1.wr_addr + ((dut.u_l1.wr_size == 2'd0) ? 1 : (dut.u_l1.wr_size == 2'd1) ? 2 : 4)) begin
+		if (ev_wr && fc_at[kf] >= ev_wr_addr &&
+		    fc_at[kf] < ev_wr_addr + ((ev_wr_size == 2'd0) ? 1 : (ev_wr_size == 2'd1) ? 2 : 4)) begin
 			fc_hits = fc_hits + 1;
-			if (dut.exe_o.st_fc !== fc_want[kf]) begin
+			if (ev_wr_fc !== fc_want[kf]) begin
 				fc_bad = fc_bad + 1;
-				$display("FAIL: write of %h with FC %0d, expected %0d", dut.u_l1.wr_addr, dut.exe_o.st_fc, fc_want[kf]);
+				$display("FAIL: write of %h with FC %0d, expected %0d", ev_wr_addr, ev_wr_fc, fc_want[kf]);
 			end
 		end
 	end
@@ -167,13 +279,13 @@ always @(posedge clk)
 // go unseen.
 reg inimage = 0;
 always @(posedge clk)
-	if (nreset && inimage && ((dut.u_l1.rd_req && (dut.u_l1.rd_addr >> (L1_AW + 1)) != 0) ||
-	               (dut.u_l1.wr_req && (dut.u_l1.wr_addr >> (L1_AW + 1)) != 0))) begin
+	if (nreset && inimage && ((ev_rd && (ev_rd_addr >> (L1_AW + 1)) != 0) ||
+	               (ev_wr && (ev_wr_addr >> (L1_AW + 1)) != 0))) begin
 		reads_bad = reads_bad + 1;
-		if (dut.u_l1.rd_req && (dut.u_l1.rd_addr >> (L1_AW + 1)) != 0)
-			$display("FAIL: data read outside the image at %h", dut.u_l1.rd_addr);
+		if (ev_rd && (ev_rd_addr >> (L1_AW + 1)) != 0)
+			$display("FAIL: data read outside the image at %h", ev_rd_addr);
 		else
-			$display("FAIL: data write outside the image at %h", dut.u_l1.wr_addr);
+			$display("FAIL: data write outside the image at %h", ev_wr_addr);
 	end
 
 initial begin
@@ -184,8 +296,13 @@ initial begin
 	if (!$value$plusargs("cycles=%d", max_cycles)) max_cycles = 20000;
 	for (i = 0; i < 32768; i = i + 1) img[i] = 16'h4E71;
 	$readmemh(progf, img);
+`ifdef BUS_MODE
+	if (!$value$plusargs("prof=%d", prof)) prof = 0;
+	for (i = 0; i < 32768; i = i + 1) bmem[i] = img[i];
+`else
 	for (i = 0; i < L1_WORDS; i = i + 1)
 		dut.u_l1.mem[(i - (PC_RESET >> 1)) & (L1_WORDS - 1)] = img[i];
+`endif
 	// the halt line first
 	halt_pc = 32'hFFFF_FFFE;
 	fd = $fopen(expf, "r");
@@ -217,6 +334,11 @@ initial begin
 	nreset = 1;
 	for (cycles = 0; cycles < max_cycles && !done; cycles = cycles + 1) @(posedge clk);
 	repeat (2) @(posedge clk);
+`ifdef BUS_MODE
+	// the posted stores the program left behind reach memory
+	for (i = 0; i < 2000 && (dut.sb_busy || mem_req || m_busy || m_ack); i = i + 1) @(posedge clk);
+	repeat (2) @(posedge clk);
+`endif
 	errors = 0; nchk = 0;
 	if (!done) begin
 		errors = errors + 1;
@@ -260,6 +382,9 @@ initial begin
 	end
 	$fclose(fd);
 	errors = errors + reads_bad + rb_bad + fc_bad;
+`ifdef BUS_MODE
+	errors = errors + gap_bad;
+`endif
 	if (n_fc > 0 && fc_hits == 0) begin
 		errors = errors + 1;
 		$display("FAIL: no access touched any 'fc' byte");

@@ -27,7 +27,10 @@ module ap040_pipe_core
 	parameter [31:0] PC_RESET           = 32'h0000_0400,
 	parameter         PROG_WORDS         = 10,
 	parameter         L1_AW              = 12,
-	parameter         RESET_FROM_VECTORS = 0
+	parameter         RESET_FROM_VECTORS = 0,
+	// 0: the L1 test substrate (the milestone benches); 1: the memory port
+	// mem_* through the bus controller (plan M5, the Minimig wrapper)
+	parameter         BUS                = 0
 )
 (
 	input  clk,
@@ -43,10 +46,27 @@ module ap040_pipe_core
 	output [31:0] dbg_d0, output [31:0] dbg_d1, output [31:0] dbg_d2, output [31:0] dbg_d3,
 	output [31:0] dbg_d4, output [31:0] dbg_d5, output [31:0] dbg_d6, output [31:0] dbg_d7,
 	output  [4:0] dbg_ccr,
-	output [15:0] dbg_sr
+	output [15:0] dbg_sr,
+
+	// memory port (BUS = 1): the reference core's mem_* contract
+	output        mem_req,
+	output        mem_write,
+	output        mem_instr,
+	output  [1:0] mem_size,
+	output [31:0] mem_addr,
+	output [31:0] mem_wdata,
+	output  [2:0] mem_fc,
+	input         mem_ack,
+	input  [31:0] mem_rdata,
+	input         mem_flt,
+	output        bus_st_err     // a posted store bus-errored (fatal)
 );
 
 //--------------------------------------------------------------- stage wires
+// (declared before the bus controller's generate block uses them)
+wire        fw_st_v;
+wire [31:0] fw_st_addr, fw_st_data;
+wire  [1:0] fw_st_size;
 wire        q_v0, q_v1;  wire [31:0] q_pc0;  wire [15:0] q_w0, q_w1;  wire [1:0] id_consume;
 // self-modifying code: the code the stages younger than EX hold
 wire [31:0] if_q_lo, if_q_hi, id_g_lo, id_g_hi;
@@ -78,7 +98,10 @@ wire [31:0] redirect_pc    = ex_redirect ? ex_redirect_pc :
                              eac_redir_v ? eac_redir_pc : id_redirect_pc;
 
 //--------------------------------------------------------------- commit (WB)
-wire commit = exe_valid;
+// (BUS: a store waits in WB while the posted-store buffer is full)
+wire sb_full, sb_busy;
+wire wb_hold = exe_valid && exe_o.st_v && sb_full;
+wire commit  = exe_valid && !wb_hold;
 
 reg [15:0] sr;
 reg [31:0] vbr;
@@ -155,6 +178,12 @@ wire      [31:0] d_rd_addr, d_rd_data;
 wire       [1:0] d_rd_size;
 wire             d_wr_ready;
 
+// The L1 test substrate stays instantiated (the benches poke dut.u_l1.mem);
+// with BUS = 1 nothing reads it and synthesis removes it.
+wire        f_req, f_long, f_gnt, f_ack;
+wire [31:0] f_addr, f_data;
+wire        l1_rd_ack;
+wire [31:0] l1_rd_data;
 ap040_pipe_l1 #(
 	.AW(L1_AW), .DW(16), .PC_RESET(PC_RESET)
 ) u_l1
@@ -164,29 +193,65 @@ ap040_pipe_l1 #(
 	.address_a (l1_addr_a),
 	.en_a      (l1_en_a),
 	.q_a       (l1_rdata_a),
-	.rd_req    (d_rd_req),
+	.rd_req    ((BUS == 0) && d_rd_req),
 	.rd_addr   (d_rd_addr),
 	.rd_size   (d_rd_size),
-	.rd_ack    (d_rd_ack),
-	.rd_data   (d_rd_data),
-	.wr_req    (ce && commit && exe_o.st_v),
+	.rd_ack    (l1_rd_ack),
+	.rd_data   (l1_rd_data),
+	.wr_req    ((BUS == 0) && ce && commit && exe_o.st_v),
 	.wr_addr   (exe_o.st_addr),
 	.wr_size   (exe_o.st_size),
 	.wr_data   (exe_o.st_data),
 	.wr_ready  (d_wr_ready)
 );
 
+generate if (BUS == 0) begin : g_l1
+	// fetches always granted, answered the next clock
+	reg f_ack_r;
+	always @(posedge clk) if (!nreset) f_ack_r <= 1'b0; else f_ack_r <= f_req;
+	assign f_gnt = 1'b1;
+	assign f_ack = f_ack_r;
+	assign f_data = l1_rdata_a;
+	assign l1_addr_a = (f_addr - PC_RESET) >> 1;
+	assign l1_en_a   = f_req;
+	assign d_rd_ack  = l1_rd_ack;
+	assign d_rd_data = l1_rd_data;
+	assign sb_full = 1'b0; assign sb_busy = 1'b0;
+	assign mem_req = 1'b0; assign mem_write = 1'b0; assign mem_instr = 1'b0; assign mem_size = 2'd0;
+	assign mem_addr = 32'd0; assign mem_wdata = 32'd0; assign mem_fc = 3'd0; assign bus_st_err = 1'b0;
+end else begin : g_bus
+	wire rd_err_w, f_err_w;
+	assign l1_addr_a = '0;
+	assign l1_en_a   = 1'b0;
+	ap040_pipe_bcu u_bcu
+	(
+		.clk(clk), .nreset(nreset), .ce(ce),
+		.st_v(ce && commit && exe_o.st_v), .st_addr(exe_o.st_addr), .st_size(exe_o.st_size),
+		.st_data(exe_o.st_data), .st_fc(exe_o.st_fc), .st_rb(exe_o.st_rb), .mem_rb(),
+		.sb_full(sb_full), .sb_busy(sb_busy),
+		.older_st(fw_st_v || (exe_valid && exe_o.st_v)),
+		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
+		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(rd_err_w),
+		.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_fc(sr_now[13] ? 3'd6 : 3'd2),
+		.f_gnt(f_gnt), .f_ack(f_ack), .f_data(f_data), .f_err(f_err_w),
+		.st_err(bus_st_err),
+		.mem_req(mem_req), .mem_write(mem_write), .mem_instr(mem_instr), .mem_size(mem_size),
+		.mem_addr(mem_addr), .mem_wdata(mem_wdata), .mem_fc(mem_fc),
+		.mem_ack(mem_ack), .mem_rdata(mem_rdata), .mem_flt(mem_flt)
+	);
+end endgenerate
+
 //--------------------------------------------------------------- stages
 ap040_inst_fetch #(
 	.PC_RESET(PC_RESET), .PROG_WORDS(PROG_WORDS), .L1_AW(L1_AW),
-	.FETCH_AT_RESET(RESET_FROM_VECTORS ? 0 : 1)
+	.FETCH_AT_RESET(RESET_FROM_VECTORS ? 0 : 1), .LONG_ANY(BUS ? 0 : 1)
 ) u_if
 (
 	.clk(clk), .nreset(nreset), .ce(ce),
 	.redirect_valid(redirect_valid), .redirect_pc(redirect_pc), .redirect_hold(ex_smc),
 	.q_lo(if_q_lo), .q_hi(if_q_hi),
 	.consume(id_consume),
-	.l1_addr_a(l1_addr_a), .l1_en_a(l1_en_a), .l1_rdata_a(l1_rdata_a),
+	.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_gnt(f_gnt), .f_ack(f_ack), .f_data(f_data),
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1)
 );
 
@@ -199,7 +264,7 @@ ap040_decode u_id
 	.id_valid(id_valid), .id_o(id_o), .g_lo(id_g_lo), .g_hi(id_g_hi), .g_v(id_g_v)
 );
 
-wire older_busy  = eaf_valid || exe_valid;
+wire older_busy  = eaf_valid || exe_valid || sb_busy;   // (serialising waits for posted stores too)
 wire older_store = eaf_valid && (eaf_o.st_v || eaf_o.dk == DK_MEM ||
                                  eaf_o.cls == CL_BSR || eaf_o.cls == CL_JSR);
 wire    early_v;
@@ -211,9 +276,6 @@ wire  [4:0] fw_w0_r;
 wire [31:0] fw_w0_val;
 wire        fw_ccr_v;
 wire  [4:0] fw_ccr;
-wire        fw_st_v;
-wire [31:0] fw_st_addr, fw_st_data;
-wire  [1:0] fw_st_size;
 wire ex_w0_pend = eaf_valid && (eaf_o.dk == DK_REG || eaf_o.cls == CL_DBCC || eaf_o.cls == CL_SCC);
 
 ap040_ea_calc u_eac
@@ -238,12 +300,13 @@ ap040_ea_calc u_eac
 
 
 
-ap040_ea_fetch u_eaf
+ap040_ea_fetch #(.STFWD(BUS ? 0 : 1)) u_eaf
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ex_stall), .flush(flush),
 	.eac_valid(eac_valid), .eac_i(eac_o),
 	.sr_in(sr_now), .vbr_in(vbr), .sfc_in(sfc), .dfc_in(dfc),
 	.older_busy(older_busy), .older_store(older_store),
+	.sync_busy((BUS != 0) && (sb_busy || fw_st_v || (exe_valid && exe_o.st_v))),
 	.reset_seq(RESET_FROM_VECTORS != 0),
 	.early_v(early_v), .early(early_rd),
 	.ra_a(ra_a), .ra_b(ra_b), .ra_c(ra_c), .ra_d(ra_d), .rd_a(rd_a), .rd_b(rd_b), .rd_c(rd_c), .rd_d(rd_d),
@@ -277,7 +340,7 @@ assign smc_hit = ovl(fw_st_addr, fw_st_size, eac_valid, eac_o.i.pc, eac_o.i.next
 
 ap040_execute u_ex
 (
-	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(1'b0),
+	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(wb_hold),
 	.eaf_valid(eaf_valid), .x(eaf_o),
 	.ccr_in(sr_now[4:0]), .sr_in(sr_now),
 	.sfc_in({29'd0, sfc}), .dfc_in({29'd0, dfc}), .cacr_in(cacr), .vbr_in(vbr),
@@ -295,7 +358,7 @@ ap040_execute u_ex
 ap040_writeback u_wb
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(1'b0),
-	.exe_valid(exe_valid && exe_o.last), .exe_pc(exe_o.pc),
+	.exe_valid(commit && exe_o.last), .exe_pc(exe_o.pc),
 	.wb_stall(), .wb_valid(wb_valid), .wb_pc(wb_pc)
 );
 

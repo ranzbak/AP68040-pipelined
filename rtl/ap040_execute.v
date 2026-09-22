@@ -403,11 +403,12 @@ reg  smc_pend;
 wire smc_now  = smc_in && eaf_valid && w.st_v && x.cls != CL_EXC;
 wire smc_fire = eaf_valid && x.last && (smc_now || smc_pend);
 assign ex_smc         = smc_fire;
-assign ex_redirect    = eaf_valid && (redir || smc_fire);
+// (WB holding a store stalls EX: the redirect goes out once, when the micro-op moves on)
+assign ex_redirect    = eaf_valid && (redir || smc_fire) && !stall_in;
 assign ex_redirect_pc = redir ? redir_pc : x.next_pc;
 always @(posedge clk)
 	if (!nreset) smc_pend <= 1'b0;
-	else if (ce && eaf_valid && !md_wait) smc_pend <= !x.last && (smc_pend || smc_now);
+	else if (ce && eaf_valid && !md_wait && !stall_in) smc_pend <= !x.last && (smc_pend || smc_now);
 
 always @(posedge clk) begin
 	if (!nreset) begin

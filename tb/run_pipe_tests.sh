@@ -63,6 +63,28 @@ if command -v vasmm68k_mot > /dev/null; then
 			fail=1
 		fi
 	done
+	# the same programs through the memory port (BUS=1, plan M5) at the three
+	# wait profiles of tb_ap040_pipe_prog.v's memory model
+	if [ -z "${PIPE_NO_BUS:-}" ]; then
+	iverilog -g2012 -DBUS_MODE -I "$RTL" -o "$WORK/tb_pipe_bus.vvp" tb_ap040_pipe_prog.v $SRC > "$WORK/tb_pipe_bus.clog" 2>&1 || {
+		echo "  COMPILE-ERROR bus bench"; grep -v "constant selects" "$WORK/tb_pipe_bus.clog" | head -5; exit 1; }
+	for s in pipe_asm/*.s; do
+		n=$(basename "$s" .s)
+		[ -f "pipe_asm/$n.exp" ] || continue
+		[ -f "$WORK/$n.hex" ] || continue
+		cyc=$(sed -n 's/^; diff:.*--cycles \([0-9]*\).*/\1/p' "$s" | head -1)
+		cyc=$(( ${cyc:-20000} * 8 ))
+		for p in 0 1 2; do
+			if timeout 900 vvp "$WORK/tb_pipe_bus.vvp" +prog="$WORK/$n.hex" +expect="pipe_asm/$n.exp" +prof=$p +cycles=$cyc > "$WORK/bus_${n}_$p.log" 2>&1 &&
+			   grep -q "ALL TESTS PASSED" "$WORK/bus_${n}_$p.log"; then
+				echo "  pass  bus$p:$n"
+			else
+				echo "  FAIL  bus$p:$n  (see $WORK/bus_${n}_$p.log)"
+				fail=1
+			fi
+		done
+	done
+	fi
 else
 	echo "  (vasmm68k_mot not found: program benches skipped)"
 fi

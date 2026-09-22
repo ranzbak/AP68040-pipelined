@@ -1,3 +1,4 @@
+; diff: --cycles 40000
 ; sysmoves.s - plan M4 tb_ap040_pipe_sysmoves: MOVEC every 68040 selector
 ; written with all ones and read back through its write mask (TC $0000C000,
 ; ITT/DTT $FFFFE364 -- written without E, the reference bench cannot run translated, URP/SRP $FFFFFE00, CACR's non-enable bits, SFC/DFC 3 bits),

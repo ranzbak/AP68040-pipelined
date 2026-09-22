@@ -930,7 +930,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				d.imm[3:0] = CR_USP; d.imm[4] = !op[3];
 				d.src = ea_reg(EK_AREG, {2'b01, op[2:0]});
 			end
-			F_NOP: d.cls = CL_NOP;
+			F_NOP: d.cls = CL_NOP;   // (waits for posted stores in EA-fetch: sync_busy)
 			F_RTE: begin d.cls = CL_RTE; d.priv = 1'b1; d.serialize = 1'b1; end
 			default: ;
 		endcase
