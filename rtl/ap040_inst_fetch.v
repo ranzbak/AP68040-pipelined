@@ -80,7 +80,20 @@ localparam QN = 6;
 reg [15:0] q [0:QN-1];
 reg  [2:0] qcnt;
 reg [31:0] qpc;           // address of q[0]
-reg [31:0] fpc;           // next fetch address
+// The next fetch address, kept as "the address last issued" plus "how many
+// bytes were fetched from it" instead of as one incremented register.
+// Timing (whole-design build): a redirect arrives late -- EA-fetch decides it
+// from the memory acknowledge, which the wrapper registers on the clk_114
+// edge immediately before the core's clk_38 edge (cpu.xdc: that crossing is
+// one clk_114 period, 8.815 ns, and is deliberately NOT relaxed).  With
+// `fpc <= fa + want*2` the redirect target had to cross a 32-bit carry chain
+// before the flip-flop; that was the worst clk_114 -> clk_38 path in
+// build/stage_ap040_pipe_m9sc (-0.075 ns, about 1.6 ns of adder and its
+// routing).  The target is now only muxed into fpc_b, and the increment
+// happens on the way OUT, from registers, well inside the clk_38 period.
+reg [31:0] fpc_b;         // the address the last fetch was issued at (or a redirect target)
+reg  [2:0] fpc_i;         // bytes already fetched from it: 0, 2 or 4
+wire [31:0] fpc = fpc_b + {29'd0, fpc_i};   // next fetch address
 reg        infl;          // a fetch is outstanding
 reg        fdrop;         // ... and its answer is to be dropped (a redirect came after it)
 reg [31:0] f_fa;          // ... and its address
@@ -135,7 +148,8 @@ always @(posedge clk) begin
 	if (!nreset) begin
 		qcnt    <= 3'd0;
 		qpc     <= PC_RESET;
-		fpc     <= PC_RESET;
+		fpc_b   <= PC_RESET;
+		fpc_i   <= 3'd0;
 		infl    <= 1'b0;
 		fdrop   <= 1'b0;
 		infl_n  <= 2'd0;
@@ -184,10 +198,14 @@ always @(posedge clk) begin
 		// a redirect while a fetch is outstanding (and not answering now): drop its answer
 		if (redirect_valid && infl && !f_ack && !can_issue) fdrop <= 1'b1;
 		issued <= issued + {30'd0, consume};
+		// (equivalent to the old `fpc <= fa + want*2` / `fpc <= redirect_pc`:
+		// fpc is fpc_b + fpc_i, and fa is redirect_pc on a redirect)
 		if (can_issue) begin
-			fpc    <= fa + {29'd0, want, 1'b0};
+			fpc_b  <= fa;
+			fpc_i  <= {want, 1'b0};
 		end else if (redirect_valid) begin
-			fpc    <= redirect_pc;
+			fpc_b  <= redirect_pc;
+			fpc_i  <= 3'd0;
 		end
 	end
 end
