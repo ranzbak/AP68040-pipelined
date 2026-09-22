@@ -1167,23 +1167,42 @@ endfunction
 // the dispatch chain decided for that instruction rather than sitting at the
 // top of it -- the chain is the core's longest combinational path (EA-fetch's
 // output to IF's fetch PC), and a term there costs ~0.9 ns of WNS.
+// It is ARMED one clock ahead (irq_take, a register) and then overrides only
+// the DISPATCH fields.  Two rules learned from the whole-design builds:
+//   - a term at the head of stepf's chain costs ~0.9 ns (build m9s: 180 new
+//     failing endpoints, worst -0.483);
+//   - an override of the chain's RESULT is worse still, because the memory
+//     request is computed from it and the acknowledge path (clk_114 -> clk_38,
+//     8.815 ns) then carries the extra mux (build m9sb: -1.307).
+// With the arm registered, the combinational chain never sees the interrupt:
+// the dispatch mux selects on a flip-flop, and the read request is simply
+// ANDed with it.
 function automatic stp_t irq_st(input stp_t s, input logic go, input logic [2:0] lvl,
                                 input logic [31:0] pc);
 	stp_t t;
 	begin
 		t = s;
 		if (go) begin
-			t = '0;
+			t.disp = 1'b0; t.fin = 1'b0; t.mm_go = 1'b0;
 			t.exc_go = 1'b1; t.irq = 1'b1;
-			t.ev = 8'd24 + {5'd0, lvl}; t.ef = 4'd0; t.epc = pc;
+			t.ev = 8'd24 + {5'd0, lvl}; t.ef = 4'd0; t.epc = pc; t.eaddr = 32'd0;
 		end
 		return t;
 	end
 endfunction
-wire irq_go = eac_valid && !rst_pending && irq_now && !older_busy &&
+// irq_hold is the REGISTERED "a request is pending and may be taken in front
+// of whatever is at the boundary": while it is set no instruction is
+// dispatched at P_START and no read is issued, so the entry cannot race the
+// instruction it is taken in front of.  Everything it is made of is a
+// register or a cheap term, and it reaches the dispatch as a mux select, not
+// as a term inside stepf.
+reg        irq_take;
+reg  [2:0] irq_take_lvl;
+wire [31:0] irq_take_pc = (ph == P_STOP) ? i.next_pc : i.pc;
+wire irq_go = irq_take && eac_valid && !rst_pending && !older_busy &&
               ((ph == P_START) || (ph == P_STOP));
 wire stp_t st = aerr_st(irq_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in),
-                               irq_go, irq_lvl, (ph == P_STOP) ? i.next_pc : i.pc), aerr_go, i, rd_a_q);
+                               irq_go, irq_take_lvl, irq_take_pc), aerr_go, i, rd_a_q);
 
 //--------------------------------------------------------------- PFLUSH / PTEST
 // M68040UM 3.7 (MMU instructions): privileged; they wait for everything
@@ -1282,7 +1301,7 @@ assign rd_fc     = (st.issue && (ph == P_START || ph == P_OPS) && i.fcsel == 2'd
                    (ph == P_EXC || ph == P_RTE || ph == P_RESET) ? 3'd5 : fc_data;
 wire   use_early = early_v && early.v && !st.issue && (!rd_pend || rd_ack) &&
                    (st.fin || !eac_valid) && !rst_pending;
-assign rd_req    = (st.issue || use_early) && !flush;
+assign rd_req    = (st.issue || use_early) && !flush && !irq_take;   // (registered: out of stepf)
 assign rd_addr   = st.issue ? st.ia  : early.a;
 assign rd_size   = st.issue ? st.isz : early.sz;
 wire [2:0] rd_t  = st.issue ? st.it  : early.t;
@@ -1321,6 +1340,7 @@ always @(posedge clk) begin
 		pm_sent <= 1'b0; pm_got <= 1'b0; pm_mmusr <= 32'd0;
 		cinv_req <= 1'b0; cinv_ic <= 1'b0; cinv_dc <= 1'b0;
 		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
+		irq_take <= 1'b0; irq_take_lvl <= 3'd0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
 		cm_v <= 1'b0; cm_ea <= 32'd0; cm_pc <= 32'd0; r_ea <= 32'd0; r_ssw <= 16'd0;
 		mm_mask <= 16'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0; mm_tail <= 1'b0;
@@ -1387,7 +1407,7 @@ always @(posedge clk) begin
 				P_START: begin
 					if (rst_pending) begin
 						ph <= P_RESET; r_step <= 3'd0;
-					end else if (eac_valid && !(i.serialize && older_busy) && !irq_now) begin
+					end else if (eac_valid && !(i.serialize && older_busy) && !irq_take) begin
 						if (!st.exc_go && i.cls == CL_STOP) begin
 							if (st.disp) ph <= P_STOP;
 						end else if (!st.exc_go && i.cls == CL_RSTO) begin
@@ -1474,6 +1494,10 @@ always @(posedge clk) begin
 			endcase
 			// an exception starts: step 5 waits for everything older to
 			// commit, then latches SR and the supervisor SP
+			// the pending-interrupt hold, one clock behind the sampler
+			irq_take     <= irq_now && !rd_req && ph != P_EXC && ph != P_RTE &&
+			                ph != P_RESET && ph != P_HALT;
+			irq_take_lvl <= irq_lvl;
 			if (st.exc_go && ph != P_EXC && i.cls == CL_EXC && i.exc_vec == 8'd2) begin
 				// an instruction fetch fault (ID marked the instruction): FA =
 				// the faulted fetch, SSW RW = 1, SIZE of the fetch, TM = 6/2
