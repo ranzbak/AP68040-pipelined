@@ -34,7 +34,12 @@
 module ap040_pipe_bcu
 	import ap040_pipe_pkg::*;
 #(
-	parameter SB_N = 4
+	parameter SB_N = 4,
+	// 0: synchronous stores -- WB holds a store until memory has taken it, so
+	//    an access error on it is precise (M6; the reference core's stores are
+	//    synchronous at the core too).  1: posted through the SB_N FIFO; an
+	//    error on a posted store is fatal (st_err, the reference's post_err).
+	parameter POST = 0
 )
 (
 	input             clk,
@@ -48,7 +53,10 @@ module ap040_pipe_bcu
 	input      [31:0] st_data,
 	input       [2:0] st_fc,
 	input             st_rb,      // (a CAS/CAS2 locked write-back: carried to mem_rb for the benches)
-	output            sb_full,    // WB must hold a store
+	output            sb_full,    // WB must hold a store (POST = 1)
+	output            st_done,    // (POST = 0) WB's store completes this clock ...
+	output            st_ferr,    // ... with an access error
+	output            st_fatc,    // ... from the MMU
 	output            sb_busy,    // a posted store is not in memory yet
 	input             older_st,   // EX or WB holds a store not yet committed
 
@@ -100,7 +108,7 @@ reg        sb_b [0:SB_N-1];
 reg [PW-1:0] sb_rp, sb_wp;
 reg [PW:0]   sb_cnt;
 
-assign sb_full = (sb_cnt == SB_N[PW:0]);
+assign sb_full = POST ? (sb_cnt == SB_N[PW:0]) : 1'b0;
 assign sb_busy = (sb_cnt != 0) || (mem_req && mem_write);
 
 //--------------------------------------------------------------- data read slot
@@ -114,7 +122,7 @@ localparam [1:0] K_ST = 2'd0, K_RD = 2'd1, K_IF = 2'd2;
 reg  [1:0] kind;           // what the transfer in progress is
 
 wire idle    = !mem_req;         // (a new request never starts in the ack clock: one low enabled edge)
-wire go_st   = idle && (sb_cnt != 0);
+wire go_st   = POST ? (idle && (sb_cnt != 0)) : (idle && st_v);
 // A read goes from the slot, never in the clock it is requested: EA-fetch
 // may be sending the older instruction's store to EX in that same clock
 // (an early read), and older_st sees it only once it is there.
@@ -123,6 +131,9 @@ wire go_if   = idle && !go_st && !go_rd && f_req;
 assign f_gnt = go_if;
 
 wire done    = mem_req && (mem_ack || mem_flt);
+assign st_done = !POST && done && (kind == K_ST);
+assign st_ferr = st_done && mem_flt;
+assign st_fatc = st_ferr && mem_atc;
 
 integer k;
 always @(posedge clk) begin
@@ -139,13 +150,13 @@ always @(posedge clk) begin
 		mem_rb <= 1'b0;
 	end else if (ce) begin
 		rd_ack <= 1'b0; f_ack <= 1'b0;
-		// a store committed by WB
-		if (st_v) begin
+		// a store committed by WB (posted)
+		if (POST && st_v) begin
 			sb_a[sb_wp] <= st_addr; sb_d[sb_wp] <= st_data; sb_s[sb_wp] <= st_size; sb_f[sb_wp] <= st_fc;
 			sb_b[sb_wp] <= st_rb;
 			sb_wp <= sb_wp + 1'b1;
 		end
-		sb_cnt <= sb_cnt + (st_v ? 1'b1 : 1'b0) - ((done && kind == K_ST) ? 1'b1 : 1'b0);
+		if (POST) sb_cnt <= sb_cnt + (st_v ? 1'b1 : 1'b0) - ((done && kind == K_ST) ? 1'b1 : 1'b0);
 		// a data read request waits in the slot
 		if (rd_req) begin dq_v <= 1'b1; dq_a <= rd_addr; dq_s <= rd_size; dq_f <= rd_fc; end
 		// completion
@@ -153,8 +164,10 @@ always @(posedge clk) begin
 			mem_req <= 1'b0;
 			case (kind)
 				K_ST: begin
-					sb_rp <= sb_rp + 1'b1;
-					if (mem_flt) st_err <= 1'b1;
+					if (POST) begin
+						sb_rp <= sb_rp + 1'b1;
+						if (mem_flt) st_err <= 1'b1;
+					end
 				end
 				K_RD: begin rd_ack <= 1'b1; rd_data <= mem_rdata; rd_err <= mem_flt; rd_atc <= mem_flt && mem_atc; end
 				default: begin                // a word fetch answers right-aligned: IF wants it on top
@@ -164,7 +177,11 @@ always @(posedge clk) begin
 			endcase
 		end
 		// a new transfer
-		if (go_st) begin
+		if (go_st && !POST) begin
+			// the store WB holds (stable until st_done)
+			mem_req <= 1'b1; kind <= K_ST; mem_write <= 1'b1; mem_instr <= 1'b0;
+			mem_addr <= st_addr; mem_size <= st_size; mem_wdata <= st_data; mem_fc <= st_fc; mem_rb <= st_rb;
+		end else if (go_st) begin
 			mem_req <= 1'b1; kind <= K_ST; mem_write <= 1'b1; mem_instr <= 1'b0;
 			mem_addr <= sb_a[sb_rp]; mem_size <= sb_s[sb_rp]; mem_wdata <= sb_d[sb_rp]; mem_fc <= sb_f[sb_rp];
 			mem_rb <= sb_b[sb_rp];

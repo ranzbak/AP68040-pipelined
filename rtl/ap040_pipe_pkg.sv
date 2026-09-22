@@ -216,6 +216,19 @@ endfunction
 // what EX does with its result
 localparam [2:0] DK_NONE = 3'd0, DK_REG = 3'd1, DK_MEM = 3'd2;
 
+// A store's access error (M6) needs: the instruction's architectural next PC
+// (a fault on its LAST micro-op is reported with the write pending in WB1
+// and the stacked PC past the instruction, M68040UM 8.4.6.3 case 3), its
+// first word (earlier micro-ops restart it), and what the SSW reports.
+typedef struct packed {
+	logic [31:0] npc;
+	logic [31:0] ipc;
+	logic        exc;          // an exception frame store: a fault is a double fault
+	logic        m16;          // MOVE16 (SSW TT = 01, SIZE = line)
+	logic        lk;           // CAS/CAS2/TAS (SSW LK)
+	logic        moves;        // MOVES (TT/TM from the DFC)
+} stf_t;
+
 typedef struct packed {
 	logic [31:0] pc;
 	logic [31:0] next_pc;
@@ -242,6 +255,7 @@ typedef struct packed {
 	logic [1:0]  st_size;
 	logic        st_rb;        // the store is a locked write-back (CAS/CAS2 mismatch, M68040UM 7.4.5 p. 7-26)
 	logic [2:0]  st_fc;        // the store's function code
+	stf_t        stf;          // what an access error on the store needs (M6)
 	logic        sp_v;         // write sp_val to physical stack pointer sp_r
 	logic [4:0]  sp_r;
 	logic [31:0] sp_val;
@@ -271,6 +285,7 @@ typedef struct packed {
 	logic        st_v;  logic [31:0] st_addr; logic [31:0] st_data; logic [1:0] st_size;
 	logic        st_rb;        // locked write-back (trace benches: not a data write the reference makes)
 	logic [2:0]  st_fc;        // function code (MOVES: DFC; else supervisor/user data)
+	stf_t        stf;          // for an access error on the store (M6)
 	logic        creg_v; logic [3:0] creg_sel; logic [31:0] creg_val;
 	logic        exc;   logic [31:0] exc_sp;
 } wb_t;

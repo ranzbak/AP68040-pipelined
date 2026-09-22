@@ -23,6 +23,7 @@ module ap040_execute
 	input             nreset,
 	input             ce,
 	input             stall_in,   // WB cannot accept
+	input             wb_drop,    // WB's store faulted (M6): its micro-op is gone
 
 	input             eaf_valid,
 	input  ex_t       x,
@@ -202,7 +203,7 @@ always @* begin
 	w.u0_v = x.u0_v; w.u0_r = x.u0_r; w.u0_val = x.u0_val;
 	w.u1_v = x.u1_v; w.u1_r = x.u1_r; w.u1_val = x.u1_val;
 	w.st_v = x.st_v; w.st_addr = x.st_addr; w.st_data = x.st_data; w.st_size = x.st_size;
-	w.st_rb = x.st_rb; w.st_fc = x.st_fc;
+	w.st_rb = x.st_rb; w.st_fc = x.st_fc; w.stf = x.stf;
 	w.sr_v = x.sr_v; w.sr_val = x.sr_val;
 	w.exc  = x.exc;  w.exc_sp = x.sp_val;
 	// a sequenced stack-pointer write goes out on the u0 port
@@ -414,6 +415,8 @@ always @(posedge clk) begin
 	if (!nreset) begin
 		exe_valid <= 1'b0;
 		exe_o     <= '0;
+	end else if (ce && wb_drop) begin
+		exe_valid <= 1'b0;
 	end else if (ce && !stall_in) begin
 		// a MUL/DIV still running sends a bubble to WB
 		exe_valid <= eaf_valid && !md_wait;

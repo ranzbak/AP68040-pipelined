@@ -32,7 +32,9 @@ module ap040_pipe_core
 	// mem_* through the bus controller (plan M5, the Minimig wrapper)
 	parameter         BUS                = 0,
 	// CAS2 Dc1 = Dc2 on a failed compare: 0 the 68040's order (operand 2), 1 the 020/030's
-	parameter         CAS2_DC_ORDER_020  = 0
+	parameter         CAS2_DC_ORDER_020  = 0,
+	// BUS = 1: 0 synchronous stores (precise access errors, M6), 1 posted (fatal errors)
+	parameter         STORE_POST         = 0
 )
 (
 	input  clk,
@@ -116,9 +118,15 @@ wire sb_full, sb_busy;
 // (the same values each clock -- nothing younger can pass it), so the stages
 // in front see them through the register file's write-through as usual;
 // only its store and its retirement wait (retire).
-wire wb_hold = exe_valid && exe_o.st_v && sb_full;
-wire commit  = exe_valid;
-wire retire  = exe_valid && !wb_hold;
+// synchronous stores (BUS, STORE_POST = 0): WB holds until memory has
+// the store; an access error on it drops the micro-op (its register writes
+// stand) and EA-fetch takes vector 2 (M6)
+wire st_done, st_ferr, st_fatc;
+wire wb_fault = exe_valid && exe_o.st_v && st_ferr;
+wire wb_hold  = exe_valid && exe_o.st_v && ((BUS != 0 && STORE_POST == 0) ? !st_done : sb_full);
+wire commit   = exe_valid;
+// (a fault on the last micro-op: the instruction is complete, its write pending in WB1)
+wire retire   = exe_valid && !wb_hold && !(wb_fault && !exe_o.last);
 
 reg [15:0] sr;
 reg [31:0] vbr;
@@ -244,6 +252,7 @@ generate if (BUS == 0) begin : g_l1
 	assign d_rd_ack  = l1_rd_ack;
 	assign d_rd_data = l1_rd_data;
 	assign sb_full = 1'b0; assign sb_busy = 1'b0;
+	assign st_done = 1'b0; assign st_ferr = 1'b0; assign st_fatc = 1'b0;
 	assign mem_req = 1'b0; assign mem_write = 1'b0; assign mem_instr = 1'b0; assign mem_size = 2'd0;
 	assign mem_addr = 32'd0; assign mem_wdata = 32'd0; assign mem_fc = 3'd0; assign bus_st_err = 1'b0;
 	assign d_rd_err = 1'b0; assign d_rd_atc = 1'b0;
@@ -252,12 +261,13 @@ end else begin : g_bus
 
 	assign l1_addr_a = '0;
 	assign l1_en_a   = 1'b0;
-	ap040_pipe_bcu u_bcu
+	ap040_pipe_bcu #(.POST(STORE_POST)) u_bcu
 	(
 		.clk(clk), .nreset(nreset), .ce(ce),
-		.st_v(ce && retire && exe_o.st_v), .st_addr(exe_o.st_addr), .st_size(exe_o.st_size),
+		.st_v(STORE_POST ? (ce && retire && exe_o.st_v) : (exe_valid && exe_o.st_v)),
+		.st_addr(exe_o.st_addr), .st_size(exe_o.st_size),
 		.st_data(exe_o.st_data), .st_fc(exe_o.st_fc), .st_rb(exe_o.st_rb), .mem_rb(),
-		.sb_full(sb_full), .sb_busy(sb_busy),
+		.sb_full(sb_full), .sb_busy(sb_busy), .st_done(st_done), .st_ferr(st_ferr), .st_fatc(st_fatc),
 		.older_st(fw_st_v || (exe_valid && exe_o.st_v)),
 		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
 		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(d_rd_err),
@@ -351,6 +361,9 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020)) u_e
 	.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
 	.rd_ack(d_rd_ack), .rd_data_raw(d_rd_data),
 	.rd_err(d_rd_err), .rd_atc(d_rd_atc), .bus_wdata(mem_wdata),
+	.wb_fault(ce && wb_fault), .wb_fatm(st_fatc),
+	.wb_st_a(exe_o.st_addr), .wb_st_s(exe_o.st_size), .wb_st_d(exe_o.st_data), .wb_st_f(exe_o.st_fc),
+	.wb_last(exe_o.last), .wb_stf(exe_o.stf),
 	.wb_st_v(retire && exe_o.st_v), .wb_st_addr(exe_o.st_addr), .wb_st_size(exe_o.st_size), .wb_st_data(exe_o.st_data),
 	.ex_st_v(fw_st_v), .ex_st_addr(fw_st_addr), .ex_st_size(fw_st_size), .ex_st_data(fw_st_data),
 	.eaf_stall(eaf_stall), .eaf_blk(eaf_blk),
@@ -374,7 +387,7 @@ assign smc_hit = ovl(fw_st_addr, fw_st_size, eac_valid, eac_o.i.pc, eac_o.i.next
 
 ap040_execute u_ex
 (
-	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(wb_hold),
+	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(wb_hold), .wb_drop(wb_fault),
 	.eaf_valid(eaf_valid), .x(eaf_o),
 	.ccr_in(sr_now[4:0]), .sr_in(sr_now),
 	.sfc_in({29'd0, sfc}), .dfc_in({29'd0, dfc}), .cacr_in(cacr), .vbr_in(vbr),

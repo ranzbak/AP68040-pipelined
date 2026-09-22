@@ -87,6 +87,13 @@ module ap040_ea_fetch
 	input             rd_ack,
 	input      [31:0] rd_data_raw,
 	input             rd_err,     // the read ended in an access error (M6)
+	// WB's store ended in an access error (M6, synchronous stores): EX's
+	// micro-op and this stage are flushed and vector 2 is taken
+	input             wb_fault,
+	input             wb_fatm,     // ... from the MMU (ATC)
+	input      [31:0] wb_st_a, input [1:0] wb_st_s, input [31:0] wb_st_d, input [2:0] wb_st_f,
+	input             wb_last,     // ... on the instruction's last micro-op (WB1 pending write)
+	input  stf_t      wb_stf,
 	input             rd_atc,     // ... from the MMU (else a physical bus error)
 	input      [31:0] bus_wdata,  // the memory port's last write data (the reference's stale WB3D)
 	// the older stores not yet in memory when a read sampled it: the one in
@@ -802,6 +809,20 @@ wire        aer_lk   = (i.cls == CL_CAS) || (i.cls == CL_CAS2) ||
                        (i.cls == CL_ALU && i.alu == `AP040_ALU_TAS && i.dst.kind == EK_MEM);
 wire        aer_m16  = (i.cls == CL_MOVEM) && i.imm[2];
 wire [15:0] aer_ssw  = ssw_f(rd_atc, aer_lk, 1'b0, rd_sz_q, aer_m16, i.fcsel != 2'd0, rd_fc_q);
+// A store's access error (synchronous stores: the micro-op is still in
+// WB).  On the instruction's last micro-op everything else it did has
+// committed: the write is reported pending in WB1 and the stacked PC is past
+// the instruction (M68040UM 8.4.6.3 case 3; the handler completes WB1, as
+// NetBSD's trap.c does; a MOVE16 carries its line in PD0-PD3, case 4).  On
+// an earlier micro-op (MOVEM, MOVE16, a bitfield's or CAS2's first store)
+// the instruction restarts, as the reference core does, WB1S = 0.  A fault
+// on an exception-frame store is a double fault.
+wire [15:0] wf_ssw  = ssw_f(wb_fatm, wb_stf.lk, 1'b1, wb_st_s, wb_stf.m16, wb_stf.moves, wb_st_f);
+function automatic logic [7:0] wbs_f(input logic [15:0] ssw);
+	return {1'b1, ssw[6:0]};               // V, SIZE, TT, TM (Figure 8-8)
+endfunction
+wire        wf_dbl  = wb_fault && (wb_stf.exc || ph == P_EXC || ph == P_RTE || ph == P_RESET);
+wire        wf_go   = wb_fault && !wf_dbl;
 wire        aerr_go  = cap_err && eac_valid && (ph == P_START || ph == P_OPS || ph == P_MOVEM);
 wire        aerr_dbl = cap_err && (ph == P_EXC || ph == P_RTE || ph == P_RESET);
 
@@ -1025,12 +1046,20 @@ wire ex_t disp_x0 = dmux(st.dsel, x_ord,
                         mm_x);
 // every store's function code: the frame stores and ordinary stores are
 // data in the current mode (the frame: supervisor), MOVES: DFC
-function automatic ex_t with_fc(input ex_t x, input logic [2:0] fc);
+function automatic ex_t with_fc(input ex_t x, input logic [2:0] fc, input id_t i, input logic exc,
+                                input logic m16, input logic lk);
 	ex_t y;
 	y = x; y.st_fc = fc;
+	y.stf.npc = (i.cls == CL_JSR) ? x.target : (i.cls == CL_BSR) ? i.btarget : i.next_pc;
+	y.stf.ipc = i.pc;
+	y.stf.exc = exc;
+	y.stf.m16 = m16;
+	y.stf.lk  = lk;
+	y.stf.moves = (i.fcsel == 2'd2);
 	return y;
 endfunction
-wire ex_t disp_x = with_fc(disp_x0, (st.dsel == 3'd1) ? 3'd5 : (st.dsel == 3'd0 && i.fcsel == 2'd2) ? dfc_in : fc_data);
+wire ex_t disp_x = with_fc(disp_x0, (st.dsel == 3'd1) ? 3'd5 : (st.dsel == 3'd0 && i.fcsel == 2'd2) ? dfc_in : fc_data,
+                           i, ph == P_EXC, aer_m16, aer_lk);
 
 // the early read goes out when this stage leaves the port free and is
 // taking the next instruction (its current one finishes, or it is empty)
@@ -1083,7 +1112,7 @@ always @(posedge clk) begin
 		eaf_valid <= 1'b0; eaf_o <= '0;
 	end else if (ce) begin
 		// the EX-side output register
-		if (flush) eaf_valid <= 1'b0;
+		if (flush || wf_go) eaf_valid <= 1'b0;
 		else if (!stall_in) begin
 			eaf_valid <= st.disp;
 			if (st.disp) eaf_o <= disp_x;
@@ -1092,7 +1121,29 @@ always @(posedge clk) begin
 		// is answered later; rd_drop throws that answer away.
 		if (rd_req) begin rd_pend <= 1'b1; rd_tag <= rd_t; rd_a_q <= rd_addr; rd_sz_q <= rd_size; rd_fc_q <= rd_fc; end
 		else if (rd_ack) begin rd_pend <= 1'b0; rd_drop <= 1'b0; end
-		if (flush) begin
+		if (wf_go) begin
+			// the faulted store's instruction is done or restarts; everything
+			// behind it (EX's micro-op, this stage) is abandoned
+			eaf_valid <= 1'b0;
+			ph <= P_EXC; x_step <= 3'd5; x_vec <= 8'd2; x_fmt <= 4'd7;
+			x_pc <= wb_last ? wb_stf.npc : wb_stf.ipc;
+			x_addr <= wb_st_a;
+			x7[2] <= wb_stf.m16 ? {wb_st_a[31:4], 4'd0} : wb_st_a;               // EA
+			x7[3] <= {wf_ssw, 16'h0000};                                          // SSW, WB3S
+			x7[4] <= {16'h0000, 8'h00, wb_last ? wbs_f(wf_ssw) : 8'h00};          // WB2S, WB1S
+			x7[5] <= wb_st_a;                                                     // FA
+			x7[6] <= wb_last ? 32'd0 : wb_st_a;                                   // WB3A
+			x7[7] <= wb_last ? 32'd0 : wb_st_d;                                   // WB3D
+			x7[8] <= 32'd0; x7[9] <= 32'd0;                                       // WB2A, WB2D
+			x7[10] <= wb_last ? wb_st_a : 32'd0;                                  // WB1A
+			x7[11] <= !wb_last ? 32'd0 : wb_stf.m16 ? m16_buf[0] : wb_st_d;       // WB1D / PD0
+			x7[12] <= (wb_last && wb_stf.m16) ? m16_buf[1] : 32'd0;               // PD1
+			x7[13] <= (wb_last && wb_stf.m16) ? m16_buf[2] : 32'd0;               // PD2
+			x7[14] <= (wb_last && wb_stf.m16) ? m16_buf[3] : 32'd0;               // PD3
+			bf_step <= 1'b0; mm_have <= 1'b0; mm_empty <= 1'b0;
+			done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
+			if (rd_pend && !rd_ack) rd_drop <= 1'b1;
+		end else if (flush) begin
 			ph <= P_START; bf_step <= 1'b0; mm_have <= 1'b0; mm_empty <= 1'b0;
 			done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
 			if (rd_pend && !rd_ack) rd_drop <= 1'b1;
@@ -1227,7 +1278,7 @@ always @(posedge clk) begin
 				if (mm_bnow && !mms.fin) begin mm_bv <= 1'b1; mm_bval <= mm_lval; end
 				if (mms.fin) mm_empty <= 1'b0;
 			end
-			if (aerr_dbl) ph <= P_HALT;
+			if (aerr_dbl || wf_dbl) ph <= P_HALT;
 			if (st.fin) begin
 				ph <= P_START; bf_step <= 1'b0;
 				done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
