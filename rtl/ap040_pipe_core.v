@@ -513,21 +513,12 @@ function automatic logic ovl(input logic [31:0] a, input logic [1:0] sz, input l
 	e = a + ((sz == SZ_B) ? 32'd1 : (sz == SZ_W) ? 32'd2 : 32'd4);
 	return v && (a < hi) && (lo < e);
 endfunction
-// The same test with `hib` an address whose whole 8-byte block counts as
-// inside the range: what IF reports (ap040_inst_fetch.v, q_hi).
-function automatic logic ovl_blk(input logic [31:0] a, input logic [1:0] sz,
-                                 input logic [31:0] lo, input logic [31:0] hib);
-	logic [31:0] e;
-	e = a + ((sz == SZ_B) ? 32'd1 : (sz == SZ_W) ? 32'd2 : 32'd4);
-	return (a[31:3] <= hib[31:3]) && (lo < e);
-endfunction
 assign smc_hit = exe_valid && exe_o.st_v && !exe_o.stf.exc &&
                  (ovl(exe_o.st_addr, exe_o.st_size, eaf_valid && eaf_o.pc != exe_o.pc, eaf_o.pc, eaf_o.next_pc) ||
                   ovl(exe_o.st_addr, exe_o.st_size, eac_valid, eac_o.i.pc, eac_o.i.next_pc) ||
                   ovl(exe_o.st_addr, exe_o.st_size, id_valid, id_o.pc, id_o.next_pc) ||
                   ovl(exe_o.st_addr, exe_o.st_size, id_g_v, id_g_lo, id_g_hi) ||
-                  (BUS ? ovl_blk(exe_o.st_addr, exe_o.st_size, if_q_lo, if_q_hi)
-                       : ovl(exe_o.st_addr, exe_o.st_size, 1'b1, if_q_lo, if_q_hi)));
+                  ovl(exe_o.st_addr, exe_o.st_size, 1'b1, if_q_lo, if_q_hi));
 // The refetch goes out in the store's first clock in WB, not when memory
 // acknowledges it (timing: the acknowledge must not reach IF's fetch address,
 // the gate build's clk_114 -> clk_38 path), once (smc_fired while WB holds

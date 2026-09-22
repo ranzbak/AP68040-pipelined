@@ -70,8 +70,7 @@ module ap040_inst_fetch
 	output reg [31:0] pf_addr,      // the faulted fetch: address, two words, ATC
 	output reg        pf_long,
 	output reg        pf_atc,
-	// the code held here: see the note on q_hi below -- with the bus it is the
-	// last fetch's address and the range runs to the end of that 8-byte block
+	// the code held here: every word queued or in flight lies in [q_lo, q_hi)
 	output     [31:0] q_lo,
 	output     [31:0] q_hi
 );
@@ -81,20 +80,7 @@ localparam QN = 6;
 reg [15:0] q [0:QN-1];
 reg  [2:0] qcnt;
 reg [31:0] qpc;           // address of q[0]
-// The next fetch address, kept as "the address last issued" plus "how many
-// bytes were fetched from it" instead of as one incremented register.
-// Timing (whole-design build): a redirect arrives late -- EA-fetch decides it
-// from the memory acknowledge, which the wrapper registers on the clk_114
-// edge immediately before the core's clk_38 edge (cpu.xdc: that crossing is
-// one clk_114 period, 8.815 ns, and is deliberately NOT relaxed).  With
-// `fpc <= fa + want*2` the redirect target had to cross a 32-bit carry chain
-// before the flip-flop; that was the worst clk_114 -> clk_38 path in
-// build/stage_ap040_pipe_m9sc (-0.075 ns, about 1.6 ns of adder and its
-// routing).  The target is now only muxed into fpc_b, and the increment
-// happens on the way OUT, from registers, well inside the clk_38 period.
-reg [31:0] fpc_b;         // the address the last fetch was issued at (or a redirect target)
-reg  [2:0] fpc_i;         // bytes already fetched from it: 0, 2 or 4
-wire [31:0] fpc = fpc_b + {29'd0, fpc_i};   // next fetch address
+reg [31:0] fpc;           // next fetch address
 reg        infl;          // a fetch is outstanding
 reg        fdrop;         // ... and its answer is to be dropped (a redirect came after it)
 reg [31:0] f_fa;          // ... and its address
@@ -129,23 +115,7 @@ wire        use_ans   = got && !fdrop && !redirect_valid;  // ... that goes into
 wire  [2:0] after_c   = redirect_valid ? 3'd0 : (qcnt - {1'b0, consume});
 wire  [2:0] pend      = (!redirect_valid && infl && !fdrop) ? {1'b0, infl_n} : 3'd0;
 assign q_lo = qpc;
-// What q_hi means depends on LONG_ANY, i.e. on which memory this core has:
-//
-//   LONG_ANY = 0 (the bus, the Minimig build): a two-word fetch is longword
-//     ALIGNED, so no fetch ever crosses an 8-byte block.  q_hi is then the
-//     address the LAST fetch was issued at and the store-into-code check in
-//     ap040_pipe_core.v compares 8-byte BLOCKS: every word IF holds or has in
-//     flight lies in [q_lo, end of q_hi's block).  That is a conservative
-//     superset of [q_lo, fpc) and it keeps the 32-bit adder that makes the
-//     next fetch address out of the comparison -- with `fpc` here, the store
-//     address had to be compared against a SUM, which landed in the clk_38
-//     critical path of build/stage_ap040_pipe_m9sd.
-//
-//   LONG_ANY = 1 (the L1 test substrate): a four-byte fetch may start at any
-//     word address and so may cross a block, which the block test would
-//     under-cover.  There q_hi is the end of the range as before; the
-//     substrate exists only in the benches, where the adder costs nothing.
-assign q_hi = (LONG_ANY != 0) ? fpc : fpc_b;
+assign q_hi = fpc;
 // a request goes out when there is room for the answer and no other fetch
 // is outstanding (or it answers now)
 wire        want_req  = (running || redirect_valid) && !hold && !(redirect_valid && redirect_hold) &&
@@ -165,8 +135,7 @@ always @(posedge clk) begin
 	if (!nreset) begin
 		qcnt    <= 3'd0;
 		qpc     <= PC_RESET;
-		fpc_b   <= PC_RESET;
-		fpc_i   <= 3'd0;
+		fpc     <= PC_RESET;
 		infl    <= 1'b0;
 		fdrop   <= 1'b0;
 		infl_n  <= 2'd0;
@@ -215,14 +184,10 @@ always @(posedge clk) begin
 		// a redirect while a fetch is outstanding (and not answering now): drop its answer
 		if (redirect_valid && infl && !f_ack && !can_issue) fdrop <= 1'b1;
 		issued <= issued + {30'd0, consume};
-		// (equivalent to the old `fpc <= fa + want*2` / `fpc <= redirect_pc`:
-		// fpc is fpc_b + fpc_i, and fa is redirect_pc on a redirect)
 		if (can_issue) begin
-			fpc_b  <= fa;
-			fpc_i  <= {want, 1'b0};
+			fpc    <= fa + {29'd0, want, 1'b0};
 		end else if (redirect_valid) begin
-			fpc_b  <= redirect_pc;
-			fpc_i  <= 3'd0;
+			fpc    <= redirect_pc;
 		end
 	end
 end
