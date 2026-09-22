@@ -9,7 +9,7 @@
 ; frame to the log.  (The L1 run has no bus errors: the handler is never
 ; entered and the log stays empty there -- the .exp is the bus-mode one,
 ; written by hand from M68040UM 8.4.6 and lib/AP68040 aerr_word.)
-; expect-berr: 7000 r 7011 r 7026 r 7104 r
+; expect-berr: 7000 r 7011 r 7026 r 7104 r 7304 r
 v_adr	equ	unexp
 v_ill	equ	unexp
 v_prv	equ	unexp
@@ -38,7 +38,13 @@ start:
 	move.l	d4,($7214).l
 	move.l	d5,($7218).l
 	move.l	a3,($721c).l
-	move.l	a6,($7220).l	; log end: 4 frames of 60 bytes
+	; the base register loaded before the fault: the restart must use the
+	; original base (it is written only with the last register)
+	movea.l	#$7300,a4
+	movem.l	(a4),a4/a5	; $7304 faults after a4 is loaded
+	move.l	a4,($7224).l	; ($7300) = $00007400
+	move.l	a5,($7228).l	; ($7304) = $55667788
+	move.l	a6,($7220).l	; log end: 5 frames of 60 bytes
 halt:
 	bra.s	halt
 
@@ -61,3 +67,7 @@ unexp:
 	dc.b	0,0,0,0,0,0,$77,0
 	org	$7100
 	dc.l	$AAAA0001,$AAAA0002,$AAAA0003,$AAAA0004
+	org	$7300
+	dc.l	$00007400,$55667788
+	org	$7400
+	dc.l	$DEADDEAD,$BAD0BAD0

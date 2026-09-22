@@ -944,8 +944,18 @@ function automatic ex_t m16_upd(input ex_t x0, input logic m16, input logic last
 	end
 	return x;
 endfunction
-wire ex_t   mm_x0   = mm_uop(i, mms, mm_lde, mm_dreg, mm_dval, mm_addr, mms.fin, mm_pre || mm_post,
-                             mm_base, mm_addr, mm_post && mm_dreg == mm_base, mm_p, mm_k);
+// A control-mode load that names its base register writes it only with the
+// last register (the reference's mm_base_pend), so a restart after an
+// access error part way recomputes the EA from the original base; (An)+
+// never loads the base (it gets the incremented address).
+wire        mm_bnow = mm_ld && !mm_p && (mm_dreg == mm_base) && mms.disp && !mms.empty;
+wire [31:0] mm_lval = (i.size == SZ_W) ? sext16(mm_dval[15:0]) : mm_dval;
+reg         mm_bv;         // the base register's loaded value is waiting
+reg  [31:0] mm_bval;
+wire        mm_upd  = (mm_pre || mm_post) || mm_bv || mm_bnow;
+wire [31:0] mm_uval = (mm_pre || mm_post) ? mm_addr : mm_bnow ? mm_lval : mm_bval;
+wire ex_t   mm_x0   = mm_uop(i, mms, mm_lde, mm_dreg, mm_dval, mm_addr, mms.fin, mm_upd,
+                             mm_base, mm_uval, mm_ld && !mm_p && mm_dreg == mm_base, mm_p, mm_k);
 wire ex_t   m16_x   = m16_upd(mm_uop(i, '0, 1'b0, 5'd0, m16_buf[m16_ks], m16_saddr, m16_sf, 1'b0,
                                      5'd0, 32'd0, 1'b0, 1'b0, 4'd0),
                               1'b1, m16_sf, eac_i);
@@ -1067,6 +1077,7 @@ always @(posedge clk) begin
 		bf_step <= 1'b0;
 		mm_mask <= 16'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0;
 		mm_have <= 1'b0; mm_hdata <= 32'd0; mm_hreg <= 5'd0; mm_hlast <= 1'b0;
+		mm_bv <= 1'b0; mm_bval <= 32'd0;
 		r_step <= 3'd0; r_sr <= 16'd0; r_pc <= 32'd0; r_fv <= 16'd0;
 		rst_pending <= reset_seq;
 		eaf_valid <= 1'b0; eaf_o <= '0;
@@ -1179,6 +1190,7 @@ always @(posedge clk) begin
 				mm_addr  <= mm_16 ? (s_addr_c & ~32'd15) : mm_ld ? s_addr_c : d_addr_c;
 				mm_have  <= 1'b0;
 				m16_smask <= 4'hF; m16_have <= 4'h0;
+				mm_bv <= 1'b0;
 				m16_saddr <= d_addr_c & ~32'd15;
 			end
 			if (ph == P_MOVEM) begin
@@ -1201,6 +1213,7 @@ always @(posedge clk) begin
 				end
 				if (mm_p && cap) mp_acc <= {mp_acc[15:0], rd_data[7:0]};
 				if (mms.from_buf) mm_have <= 1'b0;
+				if (mm_bnow && !mms.fin) begin mm_bv <= 1'b1; mm_bval <= mm_lval; end
 				if (mms.fin) mm_empty <= 1'b0;
 			end
 			if (aerr_dbl) ph <= P_HALT;
