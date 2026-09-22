@@ -4,8 +4,9 @@
 ; (restart), SSW ATC clear / RW set / SIZE / TM = 5 (supervisor data) or 1
 ; (user), FA = EA = the first byte of the transfer, WB1S-WB3S clear, WB3A =
 ; FA; the RTE restarts the instruction, which then succeeds; its (An)+
-; update happens once; a MOVEM that faults part way loads every register
-; on the restart, its base register included.  The handler copies each
+; update happens once; a MOVEM that faults part way sets SSW CM with EA =
+; its calculated EA (PLAN D15) and loads every register on the restart, its
+; base register included.  The handler copies each
 ; frame to the log.  (The L1 run has no bus errors: the handler is never
 ; entered and the log stays empty there -- the .exp is the bus-mode one,
 ; written by hand from M68040UM 8.4.6 and lib/AP68040 aerr_word.)

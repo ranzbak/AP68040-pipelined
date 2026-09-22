@@ -23,6 +23,8 @@ it changes and fails loudly if a patch no longer applies.
 2. The interleave sweeps (161-167) need interrupts (M9): skipped with a
    branch, as the program itself does on a bench without IPL injection.
 3. The ending: STOP (M9) is replaced by a branch to self after $600D.
+4. h_aerr, MOVEM faults (PLAN D15): the EA = FA check is skipped when SSW CM
+   is set (the manual stacks the MOVEM's calculated EA there).
 """
 import sys
 
@@ -86,6 +88,18 @@ hm_wb1l:
 	move.l	$44(sp),(a0)+
 hm_wb1done:
 	; NetBSD order: repair the mapping FIRST, then complete writebacks
+""")
+
+# 1b. h_aerr, MOVEM faults (PLAN D15): M68040UM 8.4.6.2 (p. 8-25) -- and
+# WinUAE's 68040 MMU mode, cpummu.cpp mmu040_movem -- set SSW CM and stack
+# the MOVEM's calculated EA, not the fault address; lib/AP68040 never sets
+# CM, and h_aerr checks EA = FA.  The patched handler skips that one check
+# when CM is set (FA is still checked).
+patch("""	move.l	$14(sp),d0	; EA field: WinUAE stacks the fault address here
+""", """	move.w	$18(sp),d0	; (pipelined, D15) CM: the EA field is the MOVEM's
+	btst	#12,d0		; calculated EA, not the fault address
+	bne	haerr_eaok
+	move.l	$14(sp),d0	; EA field: WinUAE stacks the fault address here
 """)
 
 # 2. no interrupts before M9

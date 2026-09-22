@@ -228,6 +228,8 @@ typedef struct packed {
 	logic        m16;          // MOVE16 (SSW TT = 01, SIZE = line)
 	logic        lk;           // CAS/CAS2/TAS (SSW LK)
 	logic        moves;        // MOVES (TT/TM from the DFC)
+	logic        cm;           // MOVEM: a fault sets SSW CM and restarts (M68040UM 8.4.6.2)
+	logic        cmt;          // ... which MOVEM (EA-fetch's saved-EA slot)
 } stf_t;
 
 typedef struct packed {

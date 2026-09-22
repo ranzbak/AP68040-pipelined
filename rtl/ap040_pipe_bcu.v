@@ -132,6 +132,13 @@ reg  [2:0] dq_f;
 localparam [1:0] K_ST = 2'd0, K_RD = 2'd1, K_IF = 2'd2;
 reg  [1:0] kind;           // what the transfer in progress is
 
+// page-crossing split state (see below)
+reg        sp_on;          // the transfer in progress is split into bytes
+reg  [1:0] sp_i;           // the byte on the bus
+reg  [1:0] sp_s;           // the whole transfer's size
+reg [31:0] sp_a;           // ... its address
+reg [31:0] sp_d;           // ... its store data
+reg [23:0] sp_acc;         // the bytes read so far
 wire idle    = !mem_req;         // (a new request never starts in the ack clock: one low enabled edge)
 wire go_st   = POST ? (idle && !sp_on && (sb_cnt != 0)) : (idle && !sp_on && st_v);
 // A read goes from the slot, never in the clock it is requested: EA-fetch
@@ -144,12 +151,7 @@ assign f_gnt = go_if;
 wire done    = mem_req && (mem_ack || mem_flt);
 
 //--------------------------------------------------------------- page-crossing split
-reg        sp_on;          // the transfer in progress is split into bytes
-reg  [1:0] sp_i;           // the byte on the bus
-reg  [1:0] sp_s;           // the whole transfer's size
-reg [31:0] sp_a;           // ... its address
-reg [31:0] sp_d;           // ... its store data
-reg [23:0] sp_acc;         // the bytes read so far
+// (sp_on .. sp_acc: declared with the port logic above)
 function automatic logic crosses(input logic e, input logic p, input logic [31:0] a, input logic [1:0] sz);
 	logic [13:0] off;
 	off = {1'b0, p & a[12], a[11:0]} + ((sz == SZ_L) ? 14'd4 : (sz == SZ_W) ? 14'd2 : 14'd1);

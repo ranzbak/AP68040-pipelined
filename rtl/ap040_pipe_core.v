@@ -149,7 +149,9 @@ wire wb_fault = exe_valid && exe_o.st_v && st_ferr;
 wire wb_hold  = exe_valid && exe_o.st_v && ((BUS != 0 && STORE_POST == 0) ? !st_done : sb_full);
 wire commit   = exe_valid;
 // (a fault on the last micro-op: the instruction is complete, its write pending in WB1)
-wire retire   = exe_valid && !wb_hold && !(wb_fault && !exe_o.last);
+// (a faulted store retires only on an instruction's last micro-op, and never
+// for MOVEM: its fault restarts the instruction with CM set, M68040UM 8.4.6.7)
+wire retire   = exe_valid && !wb_hold && !(wb_fault && (!exe_o.last || exe_o.stf.cm));
 
 reg [15:0] sr;
 reg [31:0] vbr;
@@ -373,7 +375,8 @@ ap040_ea_calc u_eac
 
 
 
-ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HAS_FPU(HAS_FPU)) u_eaf
+ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HAS_FPU(HAS_FPU),
+                 .MM_TAIL(BUS ? 1 : 0)) u_eaf
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ex_stall), .flush(flush),
 	.eac_valid(eac_valid), .eac_i(eac_o),

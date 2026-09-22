@@ -49,7 +49,12 @@ module ap040_ea_fetch
 	parameter CAS2_DC_ORDER_020 = 0,
 	// 1: a full MC68040 (FPU): RTE rejects the LC/EC format $4 frame
 	// (format error), as the reference with AP040_HAS_FPU; 0: the LC040 pops it
-	parameter HAS_FPU = 0
+	parameter HAS_FPU = 0,
+	// 1 (bus builds): a MOVEM -(An) store sends its An update on a trailing
+	// micro-op of its own, so a fault on the last store (CM, a restart)
+	// leaves An as it was -- a faulted store's micro-op keeps its register
+	// writes (they are applied while WB holds it)
+	parameter MM_TAIL = 0
 )
 (
 	input             clk,
@@ -241,9 +246,33 @@ wire addr_only    = (i.cls == CL_JMP || i.cls == CL_JSR || i.cls == CL_LEA || i.
 wire needs_ld_src = ((i.src.kind == EK_MEM) && !addr_only && i.cls != CL_MOVEM) || (bf_mem && (bf_n == 3'd3 || bf_n == 3'd5));
 // CHK2/CMP2 read the upper bound from <ea>+size into the "destination" load
 wire needs_ld_dst = ((i.dst.kind == EK_MEM) && i.rmw && i.cls != CL_MOVEM) || (i.cls == CL_CHK2) || bf_mem;
-wire need_smi = (i.src.kind == EK_MEM) && (i.src.mi != MI_NONE);
-wire need_dmi = (i.dst.kind == EK_MEM) && (i.dst.mi != MI_NONE);
+wire need_smi = (i.src.kind == EK_MEM) && (i.src.mi != MI_NONE) && !cm_use;   // (CM: the EA is the stacked one)
+wire need_dmi = (i.dst.kind == EK_MEM) && (i.dst.mi != MI_NONE) && !cm_use;
 
+//--------------------------------------------------------------- MOVEM continuation (CM)
+// M68040UM 8.4.6.2 (p. 8-25) and 8.4.6.7 (p. 8-27): an access fault on a
+// MOVEM's data access stacks a format $7 frame with SSW CM set and the
+// calculated effective address in the EA field; the stacked PC is the
+// MOVEM (every transfer is repeated).  RTE of that frame restores the EA and
+// restarts the MOVEM after its EA calculation when the mode is indexed or
+// memory indirect (mode 6) or PC relative (mode 7, register 2/3) -- the
+// MOVEM may have overwritten a register or the pointer the EA came from.
+// A handler that clears CM gets the EA calculated again.  The pending
+// continuation (cm_v) belongs to the instruction at the RTE's return PC
+// only; a fault fetching that instruction stacks CM and the EA again.
+// (lib/AP68040 never sets CM, D13; apolkosnik/AP68040 main does:
+// t_movem_restart.s.)
+reg  [31:0] mm_ea [0:1];   // each MOVEM's calculated EA, two slots: a store's fault
+reg         mm_tag;        // reaches WB after the next MOVEM may have started
+reg         cm_v;          // an RTE restored CM: the MOVEM at cm_pc uses cm_ea
+reg  [31:0] cm_ea, cm_pc;
+reg  [31:0] r_ea;          // RTE of a format $7 frame: its EA and SSW
+reg  [15:0] r_ssw;
+wire        mm_cmi  = (i.cls == CL_MOVEM) && !i.imm[1] && !i.imm[2];   // MOVEM proper (not MOVEP/MOVE16)
+wire        cm_mode = i.imm[0] ? ((i.src.mode == 3'd6) || (i.src.mode == 3'd7 && (i.src.mreg == 3'd2 || i.src.mreg == 3'd3)))
+                               : (i.dst.mode == 3'd6);
+wire        cm_hit  = cm_v && (i.pc == cm_pc);                 // this is the instruction the RTE returned to
+wire        cm_use  = cm_hit && mm_cmi && cm_mode;
 wire [31:0] s_addr_now = done_smi ? s_addr : eac_i.src_ea;
 wire [31:0] d_addr_now = done_dmi ? d_addr :
                          (i.cls == CL_CHK2) ? s_addr_now + ((i.size == SZ_B) ? 32'd1 : (i.size == SZ_W) ? 32'd2 : 32'd4) :
@@ -254,11 +283,12 @@ function automatic rdreq_t next_rd(input logic nsmi, input logic dsmi, input log
                                    input logic nsld, input logic dsld, input logic ndld, input logic ddld,
                                    input logic [31:0] sea, input logic [31:0] dea,
                                    input logic [31:0] sa, input logic [31:0] da, input logic [1:0] sz,
-                                   input logic [1:0] dsz);
+                                   input logic [1:0] dsz, input logic dfirst);
 	rdreq_t r;
 	r = '0; r.sz = SZ_L;
 	if (nsmi && !dsmi)      begin r.v = 1'b1; r.t = T_SMI; r.a = sea; end
 	else if (ndmi && !ddmi) begin r.v = 1'b1; r.t = T_DMI; r.a = dea; end
+	else if (dfirst && ndld && !ddld) begin r.v = 1'b1; r.t = T_DLD; r.a = da; r.sz = dsz; end
 	else if (nsld && !dsld) begin r.v = 1'b1; r.t = T_SLD; r.a = sa; r.sz = sz; end
 	else if (ndld && !ddld) begin r.v = 1'b1; r.t = T_DLD; r.a = da; r.sz = dsz; end
 	return r;
@@ -271,7 +301,8 @@ wire rdreq_t nx = next_rd(need_smi, done_smi, need_dmi, done_dmi, needs_ld_src, 
                           is_bf ? bf_addr + ((bf_n == 3'd3) ? 32'd2 : 32'd4) : s_addr_now, is_bf ? bf_addr : d_addr_now,
                           is_bf ? SZ_B : i.size,
                           (i.cls == CL_CHK2) ? i.size : !is_bf ? i.size2 :
-                          (bf_n == 3'd1) ? SZ_B : (bf_n <= 3'd3) ? SZ_W : SZ_L);
+                          (bf_n == 3'd1) ? SZ_B : (bf_n <= 3'd3) ? SZ_W : SZ_L,
+                          is_bf);   // (a bitfield: the word/long first, then the byte -- WinUAE x_get_bitfield)
 
 // Store-to-load forwarding.  The memory answers with what it held at the
 // clock edge ending the read's issue clock (a store committing on that edge
@@ -710,7 +741,8 @@ function automatic stp_t stepf(
 	input logic indexed, input logic two, input logic tstep, input logic sync,
 	input logic [31:0] s_addr_c, input logic [31:0] s_val_c, input logic [31:0] d_val_c,
 	input logic [2:0] x_step, input logic [31:0] vbr, input logic [7:0] x_vec, input logic [31:0] x_target,
-	input logic [2:0] r_step, input logic [31:0] sp_now, input logic fmt_ok, input logic rte_goes);
+	input logic [2:0] r_step, input logic [31:0] sp_now, input logic fmt_ok, input logic rte_goes,
+	input logic rx7);
 	stp_t s;
 	s = '0;
 	case (ph)
@@ -790,7 +822,13 @@ function automatic stp_t stepf(
 					s.ia = sp_now + ((r_step == 3'd0) ? 32'd0 : (r_step == 3'd1) ? 32'd2 : 32'd6);
 					s.isz = (r_step == 3'd1) ? SZ_L : SZ_W;
 				end
-			end else if (r_step == 3'd3) begin
+			end else if (r_step == 3'd3 && rx7) begin
+				// format $7: the EA (restored for a MOVEM continuation) ...
+				if (!rd_pend && can_rd) begin s.issue = 1'b1; s.it = T_DMI; s.ia = sp_now + 32'd8; s.isz = SZ_L; end
+			end else if (r_step == 3'd4 && rx7) begin
+				// ... and the SSW (its CM bit)
+				if (!rd_pend && can_rd) begin s.issue = 1'b1; s.it = T_SMI; s.ia = sp_now + 32'd12; s.isz = SZ_W; end
+			end else if (r_step == (rx7 ? 3'd5 : 3'd3)) begin
 				if (fmt_ok) begin
 					if (!stall) begin s.disp = 1'b1; s.dsel = 3'd3; s.fin = rte_goes; end
 				end else begin
@@ -819,7 +857,8 @@ wire bf_rdblk = is_bf && ex_haz;
 wire stp_t st0 = stepf(ph, eac_valid, rst_pending, i, older_busy, !bf_rdblk, rd_pend, rd_ack, cap,
                       s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, trap_n, trap_vec,
                       indexed_mode, two_uop, bf_step, sync_busy, s_addr_c, s_val_c,
-                      d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes);
+                      d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes,
+                      r_fv[15:12] == 4'd7);
 
 //--------------------------------------------------------------- access errors
 // A data read that ends in an access error (M68040UM 8.2.1, p. 8-6): the
@@ -831,7 +870,7 @@ wire stp_t st0 = stepf(ph, eac_valid, rst_pending, i, older_busy, !bf_rdblk, rd_
 // aligned), SSW {CP CU CT CM = 0, MA = 0, ATC, LK, RW = !LK, X = 0, SIZE,
 // TT, TM}, WB1S-WB3S = 0, WB3A = FA, WB3D = the port's last write data,
 // the rest 0.
-function automatic logic [15:0] ssw_f(input logic ma, input logic atc, input logic lk, input logic wr, input logic [1:0] sz,
+function automatic logic [15:0] ssw_f(input logic cm, input logic ma, input logic atc, input logic lk, input logic wr, input logic [1:0] sz,
                                       input logic m16, input logic moves, input logic [2:0] fc);
 	logic [1:0] tt, szf;
 	logic [2:0] tm;
@@ -840,12 +879,12 @@ function automatic logic [15:0] ssw_f(input logic ma, input logic atc, input log
 	else if (moves && fc[1]) tm = {fc[2], 2'b01};         // FC 2/6: data space (p. 8-28)
 	if (m16) tt = 2'b01;
 	szf = m16 ? 2'b11 : (sz == SZ_B) ? 2'b01 : (sz == SZ_W) ? 2'b10 : 2'b00;
-	return {4'b0000, ma, atc, lk, !wr && !lk, 1'b0, szf, tt, tm};
+	return {3'b000, cm, ma, atc, lk, !wr && !lk, 1'b0, szf, tt, tm};
 endfunction
 wire        aer_lk   = (i.cls == CL_CAS) || (i.cls == CL_CAS2) ||
                        (i.cls == CL_ALU && i.alu == `AP040_ALU_TAS && i.dst.kind == EK_MEM);
 wire        aer_m16  = (i.cls == CL_MOVEM) && i.imm[2];
-wire [15:0] aer_ssw  = ssw_f(rd_ma, rd_atc, aer_lk, 1'b0, rd_sz_q, aer_m16, i.fcsel != 2'd0, rd_fc_q);
+wire [15:0] aer_ssw  = ssw_f(ph == P_MOVEM && mm_cmi, rd_ma, rd_atc, aer_lk, 1'b0, rd_sz_q, aer_m16, i.fcsel != 2'd0, rd_fc_q);
 // A store's access error (synchronous stores: the micro-op is still in
 // WB).  On the instruction's last micro-op everything else it did has
 // committed: the write is reported pending in WB1 and the stacked PC is past
@@ -854,11 +893,12 @@ wire [15:0] aer_ssw  = ssw_f(rd_ma, rd_atc, aer_lk, 1'b0, rd_sz_q, aer_m16, i.fc
 // an earlier micro-op (MOVEM, MOVE16, a bitfield's or CAS2's first store)
 // the instruction restarts, as the reference core does, WB1S = 0.  A fault
 // on an exception-frame store is a double fault.
-wire [15:0] wf_ssw  = ssw_f(wb_fma, wb_fatm, wb_stf.lk, 1'b1, wb_st_s, wb_stf.m16, wb_stf.moves, wb_st_f);
+wire [15:0] wf_ssw  = ssw_f(wb_stf.cm, wb_fma, wb_fatm, wb_stf.lk, 1'b1, wb_st_s, wb_stf.m16, wb_stf.moves, wb_st_f);
 function automatic logic [7:0] wbs_f(input logic [15:0] ssw);
 	return {1'b1, ssw[6:0]};               // V, SIZE, TT, TM (Figure 8-8)
 endfunction
 wire        wf_dbl  = wb_fault && (wb_stf.exc || ph == P_EXC || ph == P_RTE || ph == P_RESET);
+wire        wf_last = wb_last && !wb_stf.cm;      // MOVEM: CM and a restart, never WB1
 wire        wf_go   = wb_fault && !wf_dbl;
 wire        aerr_go  = cap_err && eac_valid && (ph == P_START || ph == P_OPS || ph == P_MOVEM);
 wire        aerr_dbl = cap_err && (ph == P_EXC || ph == P_RTE || ph == P_RESET);
@@ -936,15 +976,19 @@ wire        mm_one   = (mm_mask & (mm_mask - 16'd1)) == 16'd0;   // at most one 
 // mm_have); stores dispatch from mm_mask
 typedef struct packed {
 	logic issue; logic disp; logic fin; logic from_buf; logic to_buf; logic empty;
+	logic tail;   // the last -(An) store went: the An update follows on its own
+	logic tailu;  // ... this is that micro-op
 } mms_t;
 function automatic mms_t mm_step(input logic ld, input logic [15:0] mask, input logic empty,
                                  input logic pend, input logic cap, input logic have, input logic stall,
                                  input logic rlast, input logic hlast, input logic one, input logic mp,
                                  input logic sblk,
-                                 input logic nodisp);
+                                 input logic nodisp, input logic tailreq, input logic tail);
 	mms_t r;
 	r = '0;
-	if (empty) begin
+	if (tail) begin
+		if (!stall) begin r.disp = 1'b1; r.fin = 1'b1; r.empty = 1'b1; r.tailu = 1'b1; end
+	end else if (empty) begin
 		if (!stall) begin r.disp = 1'b1; r.fin = 1'b1; r.empty = 1'b1; end
 	end else if (ld) begin
 		if (have) begin
@@ -957,14 +1001,15 @@ function automatic mms_t mm_step(input logic ld, input logic [15:0] mask, input 
 	end else begin
 		// (a store waits while EX writes the register it stores: its value
 		// comes from the register file, never from EX -- timing)
-		if (!stall && mask != 16'd0 && !sblk) begin r.disp = 1'b1; r.fin = one; end
+		if (!stall && mask != 16'd0 && !sblk) begin r.disp = 1'b1; r.fin = one && !tailreq; r.tail = one && tailreq; end
 	end
 	return r;
 endfunction
 wire mm_sblk = hz(ex_w0_v, ex_w0_r, ra_c, ra_c, ra_c, ra_c) || hz(ex_u0_v, ex_u0_r, ra_c, ra_c, ra_c, ra_c) ||
                hz(ex_u1_v, ex_u1_r, ra_c, ra_c, ra_c, ra_c);
+reg  mm_tail;              // the trailing An-update micro-op is next
 wire mms_t mms = mm_step(mm_lde, mm_mask, mm_empty, rd_pend, cap, mm_have, stall_in, mm_rlast, mm_hlast, mm_one,
-                         mm_p, mm_sblk, mm_16);
+                         mm_p, mm_sblk, mm_16, (MM_TAIL != 0) && mm_pre && !mm_ld && !mm_p && !mm_16, mm_tail);
 
 function automatic ex_t mm_uop(input id_t i, input mms_t m, input logic ld, input logic [4:0] r,
                                input logic [31:0] v, input logic [31:0] addr, input logic last,
@@ -987,7 +1032,7 @@ function automatic ex_t mm_uop(input id_t i, input mms_t m, input logic ld, inpu
 		x.st_v = 1'b1; x.st_addr = addr; x.st_size = i.size;
 		x.st_data = (i.size == SZ_W) ? {16'd0, v[15:0]} : v;
 	end
-	if (last && upd && !m.empty) begin x.u1_v = 1'b1; x.u1_r = br; x.u1_val = bval; end
+	if (last && upd && (!m.empty || m.tailu)) begin x.u1_v = 1'b1; x.u1_r = br; x.u1_val = bval; end
 	return x;
 endfunction
 wire  [4:0] mm_dreg = mm_lde ? (mms.from_buf ? mm_hreg : mm_rreg) : mm_sreg;
@@ -1016,7 +1061,8 @@ wire [31:0] mm_lval = (i.size == SZ_W) ? sext16(mm_dval[15:0]) : mm_dval;
 reg         mm_bv;         // the base register's loaded value is waiting
 reg  [31:0] mm_bval;
 wire        mm_upd  = (mm_pre || mm_post) || mm_bv || mm_bnow;
-wire [31:0] mm_uval = (mm_pre || mm_post) ? mm_addr : mm_bnow ? mm_lval : mm_bval;
+wire [31:0] mm_uval = mm_tail ? mm_addr + mm_sz :              // (the trailing micro-op: after the last decrement)
+                      (mm_pre || mm_post) ? mm_addr : mm_bnow ? mm_lval : mm_bval;
 wire ex_t   mm_x0   = mm_uop(i, mms, mm_lde, mm_dreg, mm_dval, mm_addr, mms.fin, mm_upd,
                              mm_base, mm_uval, mm_ld && !mm_p && mm_dreg == mm_base, mm_p, mm_k);
 wire ex_t   m16_x   = m16_upd(mm_uop(i, '0, 1'b0, 5'd0, m16_buf[m16_ks], m16_saddr, m16_sf, 1'b0,
@@ -1121,7 +1167,7 @@ wire ex_t disp_x0 = dmux(st.dsel, x_ord,
 // every store's function code: the frame stores and ordinary stores are
 // data in the current mode (the frame: supervisor), MOVES: DFC
 function automatic ex_t with_fc(input ex_t x, input logic [2:0] fc, input id_t i, input logic exc,
-                                input logic m16, input logic lk);
+                                input logic m16, input logic lk, input logic cm, input logic cmt);
 	ex_t y;
 	y = x; y.st_fc = fc;
 	y.stf.npc = (i.cls == CL_JSR) ? x.target : (i.cls == CL_BSR) ? i.btarget : i.next_pc;
@@ -1130,10 +1176,12 @@ function automatic ex_t with_fc(input ex_t x, input logic [2:0] fc, input id_t i
 	y.stf.m16 = m16;
 	y.stf.lk  = lk;
 	y.stf.moves = (i.fcsel == 2'd2);
+	y.stf.cm  = cm;
+	y.stf.cmt = cmt;
 	return y;
 endfunction
 wire ex_t disp_x = with_fc(disp_x0, (st.dsel == 3'd1) ? 3'd5 : (st.dsel == 3'd0 && i.fcsel == 2'd2) ? dfc_in : fc_data,
-                           i, ph == P_EXC, aer_m16, aer_lk);
+                           i, ph == P_EXC, aer_m16, aer_lk, ph == P_MOVEM && mm_cmi, mm_tag);
 
 // the early read goes out when this stage leaves the port free and is
 // taking the next instruction (its current one finishes, or it is empty)
@@ -1182,7 +1230,9 @@ always @(posedge clk) begin
 		bf_step <= 1'b0;
 		pt_req <= 1'b0; pt_write <= 1'b0; pt_addr <= 32'd0; pf_req <= 1'b0; pf_mode <= 2'd0; pf_addr <= 32'd0;
 		pm_sent <= 1'b0; pm_got <= 1'b0; pm_mmusr <= 32'd0;
-		mm_mask <= 16'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0;
+		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
+		cm_v <= 1'b0; cm_ea <= 32'd0; cm_pc <= 32'd0; r_ea <= 32'd0; r_ssw <= 16'd0;
+		mm_mask <= 16'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0; mm_tail <= 1'b0;
 		mm_have <= 1'b0; mm_hdata <= 32'd0; mm_hreg <= 5'd0; mm_hlast <= 1'b0;
 		mm_bv <= 1'b0; mm_bval <= 32'd0;
 		r_step <= 3'd0; r_sr <= 16'd0; r_pc <= 32'd0; r_fv <= 16'd0;
@@ -1204,25 +1254,26 @@ always @(posedge clk) begin
 			// behind it (EX's micro-op, this stage) is abandoned
 			eaf_valid <= 1'b0;
 			ph <= P_EXC; x_step <= 3'd5; x_vec <= 8'd2; x_fmt <= 4'd7;
-			x_pc <= wb_last ? wb_stf.npc : wb_stf.ipc;
+			x_pc <= wf_last ? wb_stf.npc : wb_stf.ipc;
 			x_addr <= wb_st_a;
-			x7[2] <= wb_stf.m16 ? {wb_st_a[31:4], 4'd0} : wb_st_a;               // EA
+			x7[2] <= wb_stf.cm ? mm_ea[wb_stf.cmt] :                              // EA (MOVEM: calculated)
+			         wb_stf.m16 ? {wb_st_a[31:4], 4'd0} : wb_st_a;
 			x7[3] <= {wf_ssw, 16'h0000};                                          // SSW, WB3S
-			x7[4] <= {16'h0000, 8'h00, wb_last ? wbs_f(wf_ssw) : 8'h00};          // WB2S, WB1S
+			x7[4] <= {16'h0000, 8'h00, wf_last ? wbs_f(wf_ssw) : 8'h00};          // WB2S, WB1S
 			x7[5] <= wb_st_a;                                                     // FA
-			x7[6] <= wb_last ? 32'd0 : wb_st_a;                                   // WB3A
-			x7[7] <= wb_last ? 32'd0 : wb_st_d;                                   // WB3D
+			x7[6] <= wf_last ? 32'd0 : wb_st_a;                                   // WB3A
+			x7[7] <= wf_last ? 32'd0 : wb_st_d;                                   // WB3D
 			x7[8] <= 32'd0; x7[9] <= 32'd0;                                       // WB2A, WB2D
-			x7[10] <= wb_last ? wb_st_a : 32'd0;                                  // WB1A
-			x7[11] <= !wb_last ? 32'd0 : wb_stf.m16 ? m16_buf[0] : wb_st_d;       // WB1D / PD0
-			x7[12] <= (wb_last && wb_stf.m16) ? m16_buf[1] : 32'd0;               // PD1
-			x7[13] <= (wb_last && wb_stf.m16) ? m16_buf[2] : 32'd0;               // PD2
-			x7[14] <= (wb_last && wb_stf.m16) ? m16_buf[3] : 32'd0;               // PD3
-			bf_step <= 1'b0; mm_have <= 1'b0; mm_empty <= 1'b0;
+			x7[10] <= wf_last ? wb_st_a : 32'd0;                                  // WB1A
+			x7[11] <= !wf_last ? 32'd0 : wb_stf.m16 ? m16_buf[0] : wb_st_d;       // WB1D / PD0
+			x7[12] <= (wf_last && wb_stf.m16) ? m16_buf[1] : 32'd0;               // PD1
+			x7[13] <= (wf_last && wb_stf.m16) ? m16_buf[2] : 32'd0;               // PD2
+			x7[14] <= (wf_last && wb_stf.m16) ? m16_buf[3] : 32'd0;               // PD3
+			bf_step <= 1'b0; mm_have <= 1'b0; mm_empty <= 1'b0; mm_tail <= 1'b0;
 			done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
 			if (rd_pend && !rd_ack) rd_drop <= 1'b1;
 		end else if (flush) begin
-			ph <= P_START; bf_step <= 1'b0; mm_have <= 1'b0; mm_empty <= 1'b0;
+			ph <= P_START; bf_step <= 1'b0; mm_have <= 1'b0; mm_empty <= 1'b0; mm_tail <= 1'b0;
 			done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
 			if (rd_pend && !rd_ack) rd_drop <= 1'b1;
 		end else begin
@@ -1277,7 +1328,14 @@ always @(posedge clk) begin
 					end
 				end
 				P_RTE: begin
-					if (r_step == 3'd3 && st.disp && !rte_goes) begin
+					// (format $7: its EA and SSW, T_DMI / T_SMI in this phase)
+					if (cap && rd_tag == T_DMI) begin r_ea <= rd_data; r_step <= r_step + 3'd1; end
+					if (cap && rd_tag == T_SMI) begin r_ssw <= rd_data[15:0]; r_step <= r_step + 3'd1; end
+					if (st.disp) begin
+						cm_v  <= (r_fv[15:12] == 4'd7) && r_ssw[12];
+						cm_ea <= r_ea; cm_pc <= r_pc;
+					end
+					if (r_step == ((r_fv[15:12] == 4'd7) ? 3'd5 : 3'd3) && st.disp && !rte_goes) begin
 						if (r_fv[15:12] == 4'd1) begin
 							ph <= P_START;              // $1: process the next frame after the commit
 						end else begin
@@ -1309,8 +1367,8 @@ always @(posedge clk) begin
 			if (st.exc_go && ph != P_EXC && i.cls == CL_EXC && i.exc_vec == 8'd2) begin
 				// an instruction fetch fault (ID marked the instruction): FA =
 				// the faulted fetch, SSW RW = 1, SIZE of the fetch, TM = 6/2
-				x7[2]  <= i.exc_addr;
-				x7[3]  <= {ssw_f(1'b0, i.imm[0], 1'b0, 1'b0, i.size, 1'b0, 1'b0, s_bit ? 3'd6 : 3'd2), 16'h0000};
+				x7[2]  <= cm_hit ? cm_ea : i.exc_addr;          // (a pending CM keeps its EA)
+				x7[3]  <= {ssw_f(cm_hit, 1'b0, i.imm[0], 1'b0, 1'b0, i.size, 1'b0, 1'b0, s_bit ? 3'd6 : 3'd2), 16'h0000};
 				x7[4]  <= 32'd0;
 				x7[5]  <= i.exc_addr;
 				x7[6]  <= i.exc_addr;
@@ -1318,7 +1376,8 @@ always @(posedge clk) begin
 				for (xk = 8; xk <= 14; xk = xk + 1) x7[xk] <= 32'd0;
 			end
 			if (aerr_go) begin
-				x7[2]  <= aer_m16 ? {rd_a_q[31:4], 4'd0} : rd_a_q;      // EA
+				x7[2]  <= (ph == P_MOVEM && mm_cmi) ? mm_ea[mm_tag] :    // EA (MOVEM: calculated)
+				          aer_m16 ? {rd_a_q[31:4], 4'd0} : rd_a_q;
 				x7[3]  <= {aer_ssw, 16'h0000};                           // SSW, WB3S
 				x7[4]  <= 32'd0;                                         // WB2S, WB1S
 				x7[5]  <= rd_a_q;                                        // FA
@@ -1338,7 +1397,11 @@ always @(posedge clk) begin
 				ph       <= P_MOVEM;
 				mm_mask  <= mm_16 ? 16'h000F : i.ext;
 				mm_empty <= !mm_16 && (i.ext == 16'd0);
-				mm_addr  <= mm_16 ? (s_addr_c & ~32'd15) : mm_ld ? s_addr_c : d_addr_c;
+				mm_addr  <= mm_16 ? (s_addr_c & ~32'd15) : cm_use ? cm_ea : mm_ld ? s_addr_c : d_addr_c;
+				if (mm_cmi) begin
+					mm_tag <= !mm_tag;
+					mm_ea[!mm_tag] <= cm_use ? cm_ea : mm_ld ? s_addr_c : d_addr_c;
+				end
 				mm_have  <= 1'b0;
 				m16_smask <= 4'hF; m16_have <= 4'h0;
 				mm_bv <= 1'b0;
@@ -1365,9 +1428,11 @@ always @(posedge clk) begin
 				if (mm_p && cap) mp_acc <= {mp_acc[15:0], rd_data[7:0]};
 				if (mms.from_buf) mm_have <= 1'b0;
 				if (mm_bnow && !mms.fin) begin mm_bv <= 1'b1; mm_bval <= mm_lval; end
-				if (mms.fin) mm_empty <= 1'b0;
+				if (mms.fin) begin mm_empty <= 1'b0; mm_tail <= 1'b0; end
+				if (mms.tail) mm_tail <= 1'b1;
 			end
 			if (aerr_dbl || wf_dbl) ph <= P_HALT;
+			if (ph != P_RTE && eac_valid && cm_hit && (st.fin || st.exc_go || st0.mm_go)) cm_v <= 1'b0;
 			if (st.fin) begin
 				ph <= P_START; bf_step <= 1'b0;
 				done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
