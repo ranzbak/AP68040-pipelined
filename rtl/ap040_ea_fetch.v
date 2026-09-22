@@ -291,7 +291,14 @@ wire        cm_use  = cm_hit && mm_cmi && cm_mode;
 // in front of it (apolkosnik/AP68040 t_movem_restart.s case 7, "CM resumes
 // the interrupted instruction before a pending interrupt"; M68040UM 8.4.6.7
 // restarts the MOVEM as part of the RTE's frame processing)
-wire        irq_now = irq_req && !(cm_hit && mm_cmi);
+// Nor in front of an instruction whose first operand read has already gone
+// out (EA-calc's early read, or a read issued since): the interrupt waits
+// for the next boundary.  Taking it would read the operand twice -- once
+// now, again after the RTE -- and a read with a side effect (a CIA's ICR
+// read clears its flags, M68040UM 8.1.4: an interrupt is taken between
+// instructions, the one in front has not accessed memory) would lose it.
+wire        i_rd    = (rd_pend && !rd_drop) || done_smi || done_dmi || done_sld || done_dld;
+wire        irq_now = irq_req && !(cm_hit && mm_cmi) && !i_rd;
 wire [31:0] s_addr_now = done_smi ? s_addr : eac_i.src_ea;
 wire [31:0] d_addr_now = done_dmi ? d_addr :
                          (i.cls == CL_CHK2) ? s_addr_now + ((i.size == SZ_B) ? 32'd1 : (i.size == SZ_W) ? 32'd2 : 32'd4) :
@@ -1249,7 +1256,8 @@ wire [2:0] fc_data = s_bit ? 3'd5 : 3'd1;
 assign rd_fc     = (st.issue && (ph == P_START || ph == P_OPS) && i.fcsel == 2'd1) ? sfc_in :
                    (ph == P_EXC || ph == P_RTE || ph == P_RESET) ? 3'd5 : fc_data;
 wire   use_early = early_v && early.v && !st.issue && (!rd_pend || rd_ack) &&
-                   (st.fin || !eac_valid) && !rst_pending;
+                   (st.fin || !eac_valid) && !rst_pending &&
+                   !irq_req;   // (an interrupt pending: the next instruction starts without a read, so it is taken in front of it)
 assign rd_req    = (st.issue || use_early) && !flush;
 assign rd_addr   = st.issue ? st.ia  : early.a;
 assign rd_size   = st.issue ? st.isz : early.sz;

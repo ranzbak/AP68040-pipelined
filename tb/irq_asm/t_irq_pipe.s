@@ -15,6 +15,17 @@
 ;   25-27 RESET: RSTO asserted once for >= 512 clocks (M68040UM 5.7.3 /
 ;         the RESET instruction: 512 BCLK), execution continues after it
 ;   28-29 RESET in user mode: privilege violation (vector 8), no RSTO
+;   34-38 a swept request against STOP: the stacked SR is always the SR the
+;         STOP loaded and the stacked PC the instruction after it (the SR
+;         micro-op commits before the interrupt is taken)
+;   36-39 a swept request against a run of flag-setting instructions: the
+;         stacked CCR is the one the instruction in front of the boundary
+;         left (nothing older is still in flight when the frame is built)
+;   32-33 an interrupt never lands between an instruction's operand read
+;         and its execution: a run of reads of a counting register ($F180,
+;         every read counts at $F182) under a swept level-2 request ($F148);
+;         the count must equal the reads the program executed (a second
+;         read after the RTE would lose a read-to-clear flag, e.g. a CIA ICR)
 
 FAILREG		equ	$F100
 DONEREG		equ	$F102
@@ -22,8 +33,14 @@ IPLREG		equ	$F110
 IPLSTEP		equ	$F150
 RSTOLEN		equ	$F170
 RSTONUM		equ	$F172
+IPLDLY		equ	$F148
+RDCNT		equ	$F180
+RDCNTN		equ	$F182
 logp		equ	$3600		; log pointer
 cnt_prv		equ	$3604
+cnt_irq		equ	$360C
+cnt_ccr		equ	$3610
+mode		equ	$3614		; handler check mode: 0 none, 1 STOP sweep, 2 CCR
 logbuf		equ	$3700		; per interrupt: level.w, sr.w, pc.l, frame sr.w, vec.w
 
 failt	macro
@@ -169,6 +186,78 @@ priv_back:
 	move.w	(RSTONUM).l,d0
 	chkl	d0,1,29
 
+;------------------------------------------------------ interrupt vs operand read
+	move.w	#$2700,sr
+	clr.w	(RDCNTN).l
+	clr.w	(cnt_irq).l
+	moveq	#1,d5			; request delay, swept 1..63
+rd_loop:
+	move.l	#logbuf,(logp).l
+	move.w	d5,(IPLDLY).l		; level 2 after d5 clocks
+	move.w	#$2000,sr
+	rept	16
+	move.w	(RDCNT).l,d0
+	endr
+	move.w	#100,d1			; let a late request in before masking
+rd_wait:
+	dbra	d1,rd_wait
+	move.w	#$2700,sr
+	addq.w	#1,d5
+	cmp.w	#64,d5
+	bne	rd_loop
+	moveq	#0,d0
+	move.w	(RDCNTN).l,d0
+	chkl	d0,63*16,32		; each read went to the bus once
+	moveq	#0,d0
+	move.w	(cnt_irq).l,d0
+	chkl	d0,63,33		; and every request was taken
+
+;------------------------------------------------------ STOP: the SR commits first
+	move.w	#$2700,sr
+	move.w	#1,(mode).l
+	clr.w	(cnt_irq).l
+	moveq	#1,d5			; request delay, swept 1..63
+st_loop:
+	move.w	#$2700,sr		; (the handler's RTE returned with $2000)
+	move.w	d5,(IPLDLY).l		; level 2 after d5 clocks: before, during or after the STOP
+	stop	#$2000
+stop_ret2:
+	addq.w	#1,d5
+	cmp.w	#64,d5
+	bne.s	st_loop
+	move.w	#$2700,sr
+	moveq	#0,d0
+	move.w	(cnt_irq).l,d0
+	chkl	d0,63,38		; every request woke the STOP exactly once
+
+;------------------------------------------------------ the stacked CCR is the boundary's
+	move.w	#2,(mode).l
+	clr.w	(cnt_ccr).l
+	moveq	#1,d5
+cc_loop:
+	move.w	#$2700,sr
+	move.w	d5,(IPLDLY).l
+	move.w	#$2000,sr
+blk2:
+	rept	16
+	moveq	#0,d2			; Z set: CCR = $04
+	addq.l	#1,d2			; Z clear: CCR = $00
+	endr
+	move.w	#100,d1
+cc_wait:
+	dbra	d1,cc_wait
+	addq.w	#1,d5
+	cmp.w	#64,d5
+	bne	cc_loop
+	move.w	#$2700,sr
+	clr.w	(mode).l
+	moveq	#0,d0
+	move.w	(cnt_ccr).l,d0
+	tst.w	d0
+	bne.s	cc_ok
+	failt	39			; no interrupt landed inside the block: the check would be vacuous
+cc_ok:
+
 	move.w	#$600D,(DONEREG).l
 halt:	bra.s	halt
 
@@ -176,6 +265,12 @@ halt:	bra.s	halt
 h_l1:	move.w	#1,d6
 	bra.s	h_com
 h_l2:	move.w	#2,d6
+	addq.w	#1,(cnt_irq).l
+	move.w	(mode).l,d3
+	cmp.w	#1,d3
+	beq	h_stopchk
+	cmp.w	#2,d3
+	beq	h_ccrchk
 	bra.s	h_com
 h_l3:	move.w	#3,d6
 	bra.s	h_com
@@ -197,9 +292,46 @@ h_com:
 	move.l	a5,(logp).l
 	rte
 
+; mode 1: the STOP sweep -- the frame must carry the SR the STOP loaded and
+; the PC after it, whenever in the STOP's execution the request arrives
+h_stopchk:
+	move.w	(sp),d3
+	cmp.w	#$2000,d3
+	beq.s	h_sc1
+	move.w	#34,d7
+	bra	fail_all
+h_sc1:
+	move.l	2(sp),d4
+	cmp.l	#stop_ret2,d4
+	beq	h_com
+	move.w	#35,d7
+	bra	fail_all
+; mode 2: inside blk2, the stacked CCR is what the instruction before the
+; stacked PC left ($04 after moveq #0, $00 after addq.l #1)
+h_ccrchk:
+	move.l	2(sp),d4
+	sub.l	#blk2,d4
+	cmp.l	#64,d4
+	bcc	h_com			; outside the block
+	addq.w	#1,(cnt_ccr).l
+	move.w	(sp),d3
+	and.w	#$001F,d3
+	btst	#1,d4
+	bne.s	h_cc_addq
+	tst.w	d3
+	beq	h_com
+	move.w	#36,d7
+	bra	fail_all
+h_cc_addq:
+	cmp.w	#4,d3
+	beq	h_com
+	move.w	#37,d7
+	bra	fail_all
+
 uret	equ	$3608
 h_priv:	addq.w	#1,(cnt_prv).l
-	move.l	(uret).l,2(sp)		; back in supervisor mode, past the RESET
+	ori.w	#$2700,(sp)		; return in supervisor mode with interrupts masked ...
+	move.l	(uret).l,2(sp)		; ... past the instruction that trapped
 	rte
 
 fail_lvl:	add.w	#0,d2

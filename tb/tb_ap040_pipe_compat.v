@@ -571,6 +571,18 @@ always @(posedge clk) begin
 	end
 end
 
+// $F180 (read): a counting register -- every data read of it that the
+// memory port completes adds one to the word at $F182 (a read with a side
+// effect, like a CIA's ICR; t_irq_pipe.s checks that an interrupt never
+// makes the core read an operand twice).  Pipelined bench only.
+reg rdcnt_ack_q = 0;
+always @(posedge clk) begin
+	rdcnt_ack_q <= dut.mem_ack;
+	if (nreset && dut.mem_ack && !rdcnt_ack_q && !dut.mem_write && !dut.mem_instr &&
+	    dut.mem_addr[15:0] == 16'hF180)
+		mem[16'hF182 >> 1] = mem[16'hF182 >> 1] + 1'd1;
+end
+
 // Dedicated 32-bit physical table-walker memory port.  It deliberately has
 // an independent latency profile and never asserts mem_ready on the 16-bit
 // CPU bus, so all MMU tests fail if descriptor traffic leaks onto that bus.
