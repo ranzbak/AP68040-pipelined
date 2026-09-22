@@ -260,8 +260,10 @@ function automatic logic hz(input logic v, input logic [4:0] r, input logic [4:0
                             input logic [4:0] c, input logic [4:0] d);
 	return v && (r == a || r == b || r == c || r == d);
 endfunction
-wire ex_haz = hz(ex_w0_v, ex_w0_r, ra_a, ra_b, ra_c, ra_d) || hz(ex_u0_v, ex_u0_r, ra_a, ra_b, ra_c, ra_d) ||
-              hz(ex_u1_v, ex_u1_r, ra_a, ra_b, ra_c, ra_d);
+// (BFEXTU/BFEXTS/BFFFO only write the register port a names: no wait for it)
+wire [4:0] hz_a   = (i.cls == CL_BF && i.alu[2:0] != 3'd7) ? R_NONE : ra_a;
+wire ex_haz = hz(ex_w0_v, ex_w0_r, hz_a, ra_b, ra_c, ra_d) || hz(ex_u0_v, ex_u0_r, hz_a, ra_b, ra_c, ra_d) ||
+              hz(ex_u1_v, ex_u1_r, hz_a, ra_b, ra_c, ra_d);
 wire vhold = vdep && (cap || ex_haz);
 wire ops_done = (!need_smi || dn_smi) && (!need_dmi || dn_dmi) &&
                 (!needs_ld_src || dn_sld) && (!needs_ld_dst || dn_dld) && !vhold;
