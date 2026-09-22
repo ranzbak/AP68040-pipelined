@@ -171,7 +171,10 @@ function automatic rdreq_t first_rd(input id_t i, input logic [31:0] src_ea, inp
 	rdreq_t r;
 	logic ld_src, ld_dst;
 	r = '0; r.sz = SZ_L;
-	ld_src = (i.src.kind == EK_MEM) && !(i.cls == CL_JMP || i.cls == CL_JSR || i.cls == CL_LEA || i.cls == CL_PEA);
+	// (MOVEM sequences its own reads: an early one would read the first
+	// operand twice -- a side effect on I/O)
+	ld_src = (i.src.kind == EK_MEM) && !(i.cls == CL_JMP || i.cls == CL_JSR || i.cls == CL_LEA || i.cls == CL_PEA ||
+	                                     i.cls == CL_MOVEM);
 	ld_dst = (i.dst.kind == EK_MEM) && i.rmw;
 	if (i.serialize || i.cls == CL_BF) return r;   // a bitfield's address needs its offset register
 	if (i.src.kind == EK_MEM && i.src.mi != MI_NONE)      begin r.v = 1'b1; r.t = T_SMI; r.a = src_ea; end
@@ -271,7 +274,9 @@ typedef struct packed {
 
 // MOVEC compact selector codes (ext word bits 11:0 -> these)
 localparam [3:0] CR_SFC = 4'd0, CR_DFC = 4'd1, CR_CACR = 4'd2, CR_VBR = 4'd3,
-                 CR_USP = 4'd4, CR_ISP = 4'd5, CR_MSP = 4'd6, CR_BAD = 4'hF;
+                 CR_USP = 4'd4, CR_ISP = 4'd5, CR_MSP = 4'd6,
+                 CR_TC = 4'd7, CR_ITT0 = 4'd8, CR_ITT1 = 4'd9, CR_DTT0 = 4'd10, CR_DTT1 = 4'd11,
+                 CR_MMUSR = 4'd12, CR_URP = 4'd13, CR_SRP = 4'd14, CR_BAD = 4'hF;
 
 function automatic logic [31:0] sext8(input logic [7:0] v);  return {{24{v[7]}}, v}; endfunction
 function automatic logic [31:0] sext16(input logic [15:0] v); return {{16{v[15]}}, v}; endfunction

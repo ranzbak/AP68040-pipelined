@@ -81,6 +81,9 @@ reg [15:0] sr;
 reg [31:0] vbr;
 reg  [2:0] sfc, dfc;
 reg [31:0] cacr;
+// MMU registers: stored with the reference's write masks (lib/AP68040
+// ap040_core.v S_MOVEC2), no effect until M7
+reg [31:0] tc, itt0, itt1, dtt0, dtt1, mmusr, urp, srp;
 
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -89,6 +92,8 @@ always @(posedge clk) begin
 		sfc  <= 3'h0;
 		dfc  <= 3'h0;
 		cacr <= 32'h0;
+		tc <= 32'h0; itt0 <= 32'h0; itt1 <= 32'h0; dtt0 <= 32'h0; dtt1 <= 32'h0;
+		mmusr <= 32'h0; urp <= 32'h0; srp <= 32'h0;
 	end else if (ce && commit) begin
 		if (exe_o.sr_v)       sr <= exe_o.sr_val;
 		else if (exe_o.ccr_v) sr[4:0] <= exe_o.ccr_val;
@@ -98,6 +103,14 @@ always @(posedge clk) begin
 				CR_DFC:  dfc  <= exe_o.creg_val[2:0];
 				CR_CACR: cacr <= exe_o.creg_val & 32'h8000_8000;
 				CR_VBR:  vbr  <= exe_o.creg_val;
+				CR_TC:   tc   <= exe_o.creg_val & 32'h0000_C000;
+				CR_ITT0: itt0 <= exe_o.creg_val & 32'hFFFF_E364;
+				CR_ITT1: itt1 <= exe_o.creg_val & 32'hFFFF_E364;
+				CR_DTT0: dtt0 <= exe_o.creg_val & 32'hFFFF_E364;
+				CR_DTT1: dtt1 <= exe_o.creg_val & 32'hFFFF_E364;
+				CR_MMUSR: mmusr <= exe_o.creg_val;
+				CR_URP:  urp  <= exe_o.creg_val & 32'hFFFF_FE00;
+				CR_SRP:  srp  <= exe_o.creg_val & 32'hFFFF_FE00;
 				default: ;
 			endcase
 		end
@@ -250,6 +263,8 @@ ap040_execute u_ex
 	.eaf_valid(eaf_valid), .x(eaf_o),
 	.ccr_in(sr_now[4:0]), .sr_in(sr_now),
 	.sfc_in({29'd0, sfc}), .dfc_in({29'd0, dfc}), .cacr_in(cacr), .vbr_in(vbr),
+	.tc_in(tc), .itt0_in(itt0), .itt1_in(itt1), .dtt0_in(dtt0), .dtt1_in(dtt1),
+	.mmusr_in(mmusr), .urp_in(urp), .srp_in(srp),
 	.ex_stall(ex_stall),
 	.fw_w0_v(fw_w0_v), .fw_w0_r(fw_w0_r), .fw_w0_val(fw_w0_val),
 	.fw_ccr_v(fw_ccr_v), .fw_ccr(fw_ccr),

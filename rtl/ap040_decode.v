@@ -846,12 +846,25 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					12'h800: d.imm[3:0] = CR_USP;
 					12'h804: d.imm[3:0] = CR_ISP;
 					12'h803: d.imm[3:0] = CR_MSP;
+					// the MMU registers are accepted and stored before M7 (plan M4:
+					// 68040.library probes them); M68040UM 3.1, PRM MOVEC 4-138
+					12'h003: d.imm[3:0] = CR_TC;
+					12'h004: d.imm[3:0] = CR_ITT0;
+					12'h005: d.imm[3:0] = CR_ITT1;
+					12'h006: d.imm[3:0] = CR_DTT0;
+					12'h007: d.imm[3:0] = CR_DTT1;
+					12'h805: d.imm[3:0] = CR_MMUSR;
+					12'h806: d.imm[3:0] = CR_URP;
+					12'h807: d.imm[3:0] = CR_SRP;
 					default: d.imm[3:0] = CR_BAD;
 				endcase
 				d.imm[4] = op[0];                // 1 = Rn -> Rc
 				d.src = ea_reg(x1[15] ? EK_AREG : EK_DREG, {1'b0, x1[15], x1[14:12]});
+				// an unknown selector is illegal -- in supervisor mode; MOVEC is
+				// privileged first (user mode: vector 8 for every selector,
+				// cputest MOVEC2; EA-fetch checks priv before CL_EXC)
 				if (d.imm[3:0] == CR_BAD) begin
-					d.cls = CL_EXC; d.exc_vec = 8'd4; d.priv = 1'b0;
+					d.cls = CL_EXC; d.exc_vec = 8'd4;
 				end
 			end
 			F_NOP: d.cls = CL_NOP;

@@ -124,6 +124,18 @@ always @(posedge clk)
 			end
 	end
 
+// "readonce <addr>": exactly one data read touches that byte (MOVEM/MOVEP
+// must not read an operand twice: I/O side effects)
+reg [31:0] ro_at [0:15];
+integer    ro_n [0:15];
+integer    n_ro = 0, kr;
+always @(posedge clk)
+	if (nreset && dut.u_l1.rd_req)
+		for (kr = 0; kr < n_ro; kr = kr + 1)
+			if (ro_at[kr] >= dut.u_l1.rd_addr &&
+			    ro_at[kr] < dut.u_l1.rd_addr + ((dut.u_l1.rd_size == 2'd0) ? 1 : (dut.u_l1.rd_size == 2'd1) ? 2 : 4))
+				ro_n[kr] = ro_n[kr] + 1;
+
 // "inimage": no data access may fall outside the image.  The L1 model
 // aliases the high address bits (ea_all relies on it), so a wrong high
 // address (a bitfield offset shifted without its sign, say) would otherwise
@@ -168,6 +180,7 @@ initial begin
 				rc = $fscanf(fd, "%h", a);
 				noread[n_noread] = a; n_noread = n_noread + 1;
 			end else if (key == "inimage") inimage = 1;
+			else if (key == "readonce") begin rc = $fscanf(fd, "%h", a); ro_at[n_ro] = a; ro_n[n_ro] = 0; n_ro = n_ro + 1; end
 			else if (key == "rbcount") rc = $fscanf(fd, "%d", want_rb);
 			else if (key == "rb") begin rc = $fscanf(fd, "%h", a); rb_at[n_rbl] = a; n_rbl = n_rbl + 1; end
 			else rc = $fscanf(fd, "%h", v);
@@ -191,6 +204,7 @@ initial begin
 		else if (key == "halt") rc = $fscanf(fd, "%h", v);
 		else if (key == "noread") rc = $fscanf(fd, "%h", v);
 		else if (key == "inimage") ;
+		else if (key == "readonce") rc = $fscanf(fd, "%h", v);
 		else if (key == "rbcount") rc = $fscanf(fd, "%d", v);
 		else if (key == "rb") rc = $fscanf(fd, "%h", v);
 		else if (key == "#") begin : skipline2
@@ -219,6 +233,11 @@ initial begin
 	end
 	$fclose(fd);
 	errors = errors + reads_bad + rb_bad;
+	for (kr = 0; kr < n_ro; kr = kr + 1)
+		if (ro_n[kr] != 1) begin
+			errors = errors + 1;
+			$display("FAIL: byte %h read %0d times, expected once", ro_at[kr], ro_n[kr]);
+		end
 	if (want_rb >= 0 && n_rb != want_rb) begin
 		errors = errors + 1;
 		$display("FAIL: %0d locked write-backs, expected %0d", n_rb, want_rb);

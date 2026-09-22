@@ -8,6 +8,7 @@
 ; loads arriving while EX is busy with a divide.
 ; expect-inimage
 ; expect-range: 7000 7200
+; expect-readonce: 7060 7062 7064 7084
 v_adr	equ	unexp
 v_ill	equ	unexp
 v_prv	equ	unexp

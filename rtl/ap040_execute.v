@@ -30,6 +30,7 @@ module ap040_execute
 	input       [4:0] ccr_in,     // CCR with the WB write-through
 	input      [15:0] sr_in,      // SR with the WB write-through
 	input      [31:0] sfc_in, dfc_in, cacr_in, vbr_in,
+	input      [31:0] tc_in, itt0_in, itt1_in, dtt0_in, dtt1_in, mmusr_in, urp_in, srp_in,
 
 	output            ex_stall,
 
@@ -175,6 +176,14 @@ always @* begin
 		CR_DFC:  creg_rd = dfc_in;
 		CR_CACR: creg_rd = cacr_in;
 		CR_VBR:  creg_rd = vbr_in;
+		CR_TC:   creg_rd = tc_in;
+		CR_ITT0: creg_rd = itt0_in;
+		CR_ITT1: creg_rd = itt1_in;
+		CR_DTT0: creg_rd = dtt0_in;
+		CR_DTT1: creg_rd = dtt1_in;
+		CR_MMUSR: creg_rd = mmusr_in;
+		CR_URP:  creg_rd = urp_in;
+		CR_SRP:  creg_rd = srp_in;
 		default: creg_rd = x.a;          // USP/ISP/MSP: EA-fetch read the register
 	endcase
 end
