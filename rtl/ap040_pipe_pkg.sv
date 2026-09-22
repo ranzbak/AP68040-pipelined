@@ -108,7 +108,8 @@ typedef enum logic [5:0] {
 	CL_MOVEM   = 6'd37,  // MOVEM (EA-fetch sequences one micro-op per register)
 	CL_PMMU    = 6'd38,  // PFLUSH / PTEST (EA-fetch runs them against the MMU, M7)
 	CL_STOP    = 6'd39,  // STOP #imm (SR, then the stopped state until an interrupt)
-	CL_RSTO    = 6'd40   // the RESET instruction (RSTO for 512 clocks)
+	CL_RSTO    = 6'd40,  // the RESET instruction (RSTO for 512 clocks)
+	CL_CINV    = 6'd41   // CINV / CPUSH (EA-fetch drives the cache's maintenance port, M8)
 } cls_t;
 
 typedef struct packed {

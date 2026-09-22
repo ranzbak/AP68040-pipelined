@@ -39,7 +39,10 @@ module ap040_pipe_core
 	parameter         HAS_FPU            = 0,
 	// 1: the interrupt inputs are live (the wrapper); 0: tied off (the L1
 	// benches leave ipl unconnected)
-	parameter         IRQ                = 0
+	parameter         IRQ                = 0,
+	// 1: the cache maintenance port is live (the wrapper answers cinv_done);
+	// 0: CINV/CPUSH complete at once (the L1 benches have no cache)
+	parameter         CINV               = 0
 )
 (
 	input  clk,
@@ -98,7 +101,13 @@ module ap040_pipe_core
 	input   [2:0] ipl,
 	output        nmi_ack_toggle,
 	output        nresetout,
-	output        dbg_stopped
+	output        dbg_stopped,
+	// cache maintenance (M8): CINV/CPUSH to the wrapper's cache and to the
+	// external banks (TG68K.vhd's cache_maint_*)
+	output        cinv_req,
+	output        cinv_ic,
+	output        cinv_dc,
+	input         cinv_done
 );
 
 //--------------------------------------------------------------- stage wires
@@ -484,6 +493,8 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HA
 	.halted(eaf_halted),
 	.irq_req(irq_req), .irq_lvl(irq_lvl),
 	.stopped(eaf_stopped), .rsto(eaf_rsto),
+	.cinv_req(cinv_req), .cinv_ic(cinv_ic), .cinv_dc(cinv_dc),
+	.cinv_done((CINV != 0) ? cinv_done : 1'b1),
 	.eaf_redir_v(eaf_redir_v), .eaf_redir_pc(eaf_redir_pc)
 );
 

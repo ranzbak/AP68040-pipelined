@@ -221,7 +221,7 @@ wire        b_ack;
 wire [31:0] b_rdata;
 
 // CINV sideband
-wire        cinv_req, cinv_ic, cinv_dc, cinv_done;
+wire        cinv_req, cinv_ic, cinv_dc, cinv_done;   // CINV/CPUSH (M8)
 
 // posted-store sideband from the cache (A2b-1)
 wire        post_busy, post_err;
@@ -251,7 +251,8 @@ ap040_pipe_core #(
 	.RESET_FROM_VECTORS(1),
 	.BUS(1),
 	.HAS_FPU(AP040_HAS_FPU),
-	.IRQ(1)
+	.IRQ(1),
+	.CINV(1)
 ) core (
 	.clk(clk),
 	.nreset(nreset),
@@ -286,7 +287,8 @@ ap040_pipe_core #(
 	.pt_req(pt_req), .pt_write(pt_write), .pt_addr(pt_addr), .pt_fc(pt_fcw),
 	.pt_done(pt_done), .pt_mmusr(pt_mmusr),
 	.pf_req(pf_req), .pf_mode(pf_mode), .pf_addr(pf_addr), .pf_fc(pf_fcw), .pf_done(pf_done),
-	.ipl(ipl), .nmi_ack_toggle(nmi_ack_toggle), .nresetout(nresetout), .dbg_stopped()
+	.ipl(ipl), .nmi_ack_toggle(nmi_ack_toggle), .nresetout(nresetout), .dbg_stopped(),
+	.cinv_req(cinv_req), .cinv_ic(cinv_ic), .cinv_dc(cinv_dc), .cinv_done(cinv_done)
 );
 
 // the MMU (M7): lifted from the reference as it is, wired as the reference
@@ -334,7 +336,6 @@ assign mmu_addr_phys     = mem_addr;
 assign mmu_cache_inhibit = 1'b0;
 assign pt_done = 1'b1; assign pt_mmusr = 32'd0; assign pf_done = 1'b1;
 end endgenerate
-assign cinv_req = 1'b0; assign cinv_ic = 1'b0; assign cinv_dc = 1'b0;
 
 assign debug_busy     = mem_req;
 assign debug_fault    = core_stall_flt | core_st_err | post_err;

@@ -127,7 +127,7 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 	else
 		echo "  (AP68040-reference not found: t_movem_restart skipped)"
 	fi
-	for t in t_integer t_bitfield_mmu t_mmu_m9s t_mmu_pipe texc_m9s t_irq_pipe $TMR; do
+	for t in t_integer t_cache t_bitfield_mmu t_mmu_m9s t_mmu_pipe texc_m9s t_irq_pipe $TMR; do
 		if [ "$t" = t_mmu_m9s ] || [ "$t" = t_movem_restart_m9s ] || [ "$t" = texc_m9s ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "$WORK/$t.s"
 		elif [ "$t" = t_mmu_pipe ]; then

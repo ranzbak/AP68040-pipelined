@@ -935,7 +935,17 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					d.cls = CL_EXC; d.exc_vec = 8'd4;
 				end
 			end
-			F_CINV: begin d.cls = CL_NOP; d.priv = 1'b1; d.serialize = 1'b1; end
+			// CINV / CPUSH (M68040UM 4.5, p. 4-11): privileged, serialising;
+			// the caches here are write-through (nothing dirty), so a push
+			// invalidates exactly as an invalidate does -- the reference does
+			// the same.  imm[1] = instruction cache, imm[0] = data cache
+			// (ir[7]/ir[6]); the scope field (ir[4:3]) is widened to ALL,
+			// which is safe, and 00 is not a CINV encoding at all (shape():
+			// it falls through to the F-line trap, as M68040UM 4.5 requires)
+			F_CINV: begin
+				d.cls = CL_CINV; d.priv = 1'b1; d.serialize = 1'b1;
+				d.imm = {30'd0, op[7], op[6]};
+			end
 			F_PMMU: begin                       // imm: [3] PTEST, [2] PTESTW, [1:0] PFLUSH mode
 				d.cls = CL_PMMU; d.priv = 1'b1; d.serialize = 1'b1;
 				d.imm = {28'd0, op[6], !op[5], op[4:3]};

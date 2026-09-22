@@ -113,6 +113,11 @@ module ap040_ea_fetch
 	input             pf_done,
 	input             bus_idle,    // the memory port has no transfer (the MMU is ours)
 	output            pmmu_busy,   // IF must not fetch
+	// cache maintenance (M8): CINV / CPUSH drive the wrapper's cache port
+	output reg        cinv_req,
+	output reg        cinv_ic,
+	output reg        cinv_dc,
+	input             cinv_done,
 	input             wb_fault,
 	input             wb_fatm,     // ... from the MMU (ATC)
 	input             wb_fma,      // ... on a split store's second page (SSW.MA)
@@ -160,7 +165,8 @@ localparam [3:0] P_START = 4'd0,  // examine / wait for serialisation
                  P_MOVEM = 4'd6,  // MOVEM: one micro-op per register
                  P_PMMU  = 4'd7,  // PFLUSH / PTEST: the MMU request, then a refetch
                  P_STOP  = 4'd8,  // STOP: the SR is written; waiting for an interrupt
-                 P_RSTO  = 4'd9;  // RESET: RSTO asserted
+                 P_RSTO  = 4'd9,  // RESET: RSTO asserted
+                 P_CINV  = 4'd10; // CINV / CPUSH: the cache request, then a refetch
 
 reg  [3:0] ph;
 reg        rd_pend;        // a read is outstanding
@@ -800,6 +806,8 @@ function automatic stp_t stepf(
 				// the sequence runs in P_RTE
 			end else if (i.cls == CL_PMMU) begin
 				// the sequence runs in P_PMMU
+			end else if (i.cls == CL_CINV) begin
+				// the sequence runs in P_CINV
 			end else if (i.cls == CL_STOP) begin
 				// the SR micro-op, then the stopped state (P_STOP)
 				if (!stall) begin s.disp = 1'b1; s.dsel = 3'd0; end
@@ -1162,7 +1170,7 @@ function automatic stp_t pm_st(input stp_t t0, input logic inph, input logic got
 	end
 	return t;
 endfunction
-wire stp_t st = aerr_st(pm_st(st1, ph == P_PMMU, pm_got, stall_in), aerr_go, i, rd_a_q);
+wire stp_t st = aerr_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in), aerr_go, i, rd_a_q);
 
 //--------------------------------------------------------------- PFLUSH / PTEST
 // M68040UM 3.7 (MMU instructions): privileged; they wait for everything
@@ -1179,7 +1187,11 @@ assign rsto    = (ph == P_RSTO);
 reg        pm_sent;        // the request went out
 reg        pm_got;         // ... and was answered
 reg [31:0] pm_mmusr;
-assign pmmu_busy = (ph == P_PMMU);
+// IF holds off while a PTEST/PFLUSH owns the MMU, and while a CINV is in
+// flight: the final micro-op then refetches, so the prefetch buffer cannot
+// serve a word fetched before the invalidate (M68040UM 4.5: CINV I must
+// reach code the pipeline has already read; the reference's epf_flush)
+assign pmmu_busy = (ph == P_PMMU) || (ph == P_CINV);
 function automatic ex_t pmmu_uop(input id_t i, input logic [31:0] mmusr);
 	ex_t x;
 	x = base_uop(i);
@@ -1224,7 +1236,7 @@ wire ex_t disp_x0 = dmux(st.dsel, x_ord,
                         exc_uop(i, x_k, x_sp, x_sr, x_pc, x_fmt, x_vec, x_addr, x7[(x_k < 4'd2) ? 4'd2 : x_k]),
                         exc_final(i, x_bank, x_sp, x_sr, x_target, x_irq, x_lvl),
                         rte_final(i, bank_now, rd_a, r_fv, r_sr, r_pc),
-                        (ph == P_PMMU) ? pm_x : reset_final(i, x_sp, r_pc),
+                        (ph == P_PMMU || ph == P_CINV) ? pm_x : reset_final(i, x_sp, r_pc),
                         ccr_only_uop(x_ord),
                         no_last(x_ord),
                         mm_x);
@@ -1295,6 +1307,7 @@ always @(posedge clk) begin
 		bf_step <= 1'b0;
 		pt_req <= 1'b0; pt_write <= 1'b0; pt_addr <= 32'd0; pf_req <= 1'b0; pf_mode <= 2'd0; pf_addr <= 32'd0;
 		pm_sent <= 1'b0; pm_got <= 1'b0; pm_mmusr <= 32'd0;
+		cinv_req <= 1'b0; cinv_ic <= 1'b0; cinv_dc <= 1'b0;
 		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
 		cm_v <= 1'b0; cm_ea <= 32'd0; cm_pc <= 32'd0; r_ea <= 32'd0; r_ssw <= 16'd0;
@@ -1367,6 +1380,8 @@ always @(posedge clk) begin
 							if (st.disp) ph <= P_STOP;
 						end else if (!st.exc_go && i.cls == CL_RSTO) begin
 							ph <= P_RSTO; rs_cnt <= RSTO_CLKS[9:0] - 10'd1;
+						end else if (!st.exc_go && i.cls == CL_CINV) begin
+							ph <= P_CINV; pm_sent <= 1'b0; pm_got <= 1'b0;
 						end else if (!st.exc_go && i.cls == CL_PMMU) begin
 							ph <= P_PMMU; pm_sent <= 1'b0; pm_got <= 1'b0;
 						end else if (!st.exc_go && i.cls == CL_RTE) begin
@@ -1417,6 +1432,18 @@ always @(posedge clk) begin
 					end
 				end
 				P_RSTO: if (rs_cnt != 10'd0) rs_cnt <= rs_cnt - 10'd1;
+				P_CINV: begin
+					// the request is a level until the cache answers; it goes
+					// out once the memory port is idle, so no transfer is in
+					// flight while lines are dropped
+					if (!pm_sent && bus_idle) begin
+						pm_sent <= 1'b1;
+						cinv_req <= 1'b1; cinv_ic <= i.imm[1]; cinv_dc <= i.imm[0];
+					end
+					if (cinv_req && cinv_done) begin
+						cinv_req <= 1'b0; pm_got <= 1'b1;
+					end
+				end
 				P_PMMU: begin
 					if (!pm_sent && bus_idle) begin
 						pm_sent <= 1'b1;
