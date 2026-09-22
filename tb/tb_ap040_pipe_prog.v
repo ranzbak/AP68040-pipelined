@@ -50,6 +50,7 @@ wire  [1:0] mem_size;
 wire [31:0] mem_addr, mem_wdata;
 wire  [2:0] mem_fc;
 reg         m_ack = 1'b0;
+reg         m_flt = 1'b0;         // (bus mode) the answer is an access error
 reg  [31:0] m_rdata = 32'd0;
 
 ap040_pipe_core #(
@@ -61,7 +62,7 @@ ap040_pipe_core #(
 	.clk(clk), .nreset(nreset), .ce(ce),
 	.mem_req(mem_req), .mem_write(mem_write), .mem_instr(mem_instr), .mem_size(mem_size),
 	.mem_addr(mem_addr), .mem_wdata(mem_wdata), .mem_fc(mem_fc),
-	.mem_ack(m_ack), .mem_rdata(m_rdata), .mem_flt(1'b0), .bus_st_err(),
+	.mem_ack(m_ack), .mem_rdata(m_rdata), .mem_flt(m_flt), .mem_atc(1'b0), .bus_st_err(),
 	.dbg_if_valid(), .dbg_if_pc(), .dbg_id_valid(), .dbg_id_pc(),
 	.dbg_eac_valid(), .dbg_eac_pc(), .dbg_eaf_valid(), .dbg_eaf_pc(),
 	.dbg_ex_valid(), .dbg_ex_pc(), .dbg_wb_valid(dbg_wb_valid), .dbg_wb_pc(dbg_wb_pc),
@@ -70,6 +71,11 @@ ap040_pipe_core #(
 	.dbg_ccr(dbg_ccr), .dbg_sr(dbg_sr)
 );
 
+// "berr" lines (bus mode only)
+reg [31:0] be_at [0:7];
+reg  [7:0] be_kind [0:7];
+reg        be_used [0:7];
+integer    n_be = 0, kbe;
 `ifdef BUS_MODE
 reg [15:0] bmem [0:32767];            // 64K at address 0 (high bits alias, as the L1)
 function [7:0] mb(input [31:0] a);
@@ -120,6 +126,30 @@ endfunction
 task mwb(input [31:0] a, input [7:0] b);
 	if (a[0]) bmem[(a >> 1) & 32'h7FFF][7:0] = b; else bmem[(a >> 1) & 32'h7FFF][15:8] = b;
 endtask
+// "berr <addr> <r|w|f>": the first data read / data write / fetch that
+// touches <addr> ends in a bus error instead (one-shot per line), M6
+function automatic be_hit(input [31:0] a, input [1:0] sz, input w, input ins);
+	integer kk; reg h; reg [31:0] n;
+	begin
+		h = 1'b0; n = (sz == 2'd0) ? 1 : (sz == 2'd1) ? 2 : 4;
+		for (kk = 0; kk < n_be; kk = kk + 1)
+			if (!be_used[kk] && be_at[kk] >= a && be_at[kk] < a + n &&
+			    ((be_kind[kk] == "r" && !w && !ins) || (be_kind[kk] == "w" && w) || (be_kind[kk] == "f" && ins)))
+				h = 1'b1;
+		be_hit = h;
+	end
+endfunction
+task be_use(input [31:0] a, input [1:0] sz, input w, input ins);
+	integer kk; reg [31:0] n;
+	begin
+		n = (sz == 2'd0) ? 1 : (sz == 2'd1) ? 2 : 4;
+		for (kk = 0; kk < n_be; kk = kk + 1)
+			if (!be_used[kk] && be_at[kk] >= a && be_at[kk] < a + n &&
+			    ((be_kind[kk] == "r" && !w && !ins) || (be_kind[kk] == "w" && w) || (be_kind[kk] == "f" && ins)))
+				be_used[kk] = 1'b1;
+	end
+endtask
+
 // the memory: a request is taken when it appears, answered m_lat clocks
 // later; the ack stays up until a clock-enabled edge has seen it
 always @(posedge clk) begin
@@ -127,11 +157,16 @@ always @(posedge clk) begin
 	if (!nreset) begin m_busy <= 1'b0; m_ack <= 1'b0; m_first <= 1'b0; end
 	else begin
 		m_first <= 1'b0;
-		if (m_ack && ce) m_ack <= 1'b0;
+		if (m_ack && ce) begin m_ack <= 1'b0; m_flt <= 1'b0; end
 		if (!m_busy && mem_req && !m_ack) begin
 			m_busy <= 1'b1; m_lat <= mlat(prof, m_n); m_n <= m_n + 1;
 		end else if (m_busy) begin
-			if (m_lat == 0) begin
+			if (m_lat == 0 && be_hit(mem_addr, mem_size, mem_write, mem_instr)) begin
+				// a bus error ends the transfer: the fault, no data, no write
+				be_use(mem_addr, mem_size, mem_write, mem_instr);
+				m_busy <= 1'b0; m_ack <= 1'b1; m_flt <= 1'b1;
+				m_rdata <= 32'hDEAD_BEEF;
+			end else if (m_lat == 0) begin
 				m_busy <= 1'b0; m_ack <= 1'b1; m_first <= 1'b1;
 				m_rdata <= mrd(mem_addr, mem_size);
 			end else m_lat <= m_lat - 1;
@@ -342,6 +377,10 @@ initial begin
 			else if (key == "readonce") begin rc = $fscanf(fd, "%h", a); ro_at[n_ro] = a; ro_n[n_ro] = 0; n_ro = n_ro + 1; end
 			else if (key == "rbcount") rc = $fscanf(fd, "%d", want_rb);
 			else if (key == "syncpc") begin rc = $fscanf(fd, "%h", a); sync_at[n_sync] = a; n_sync = n_sync + 1; end
+			else if (key == "berr") begin
+				rc = $fscanf(fd, "%h %s", a, key);
+				be_at[n_be] = a; be_kind[n_be] = key[7:0]; be_used[n_be] = 1'b0; n_be = n_be + 1;
+			end
 			else if (key == "fc") begin rc = $fscanf(fd, "%h %d", a, v); fc_at[n_fc] = a; fc_want[n_fc] = v[2:0]; n_fc = n_fc + 1; end
 			else if (key == "rb") begin rc = $fscanf(fd, "%h", a); rb_at[n_rbl] = a; n_rbl = n_rbl + 1; end
 			else rc = $fscanf(fd, "%h", v);
@@ -373,6 +412,7 @@ initial begin
 		else if (key == "readonce") rc = $fscanf(fd, "%h", v);
 		else if (key == "rbcount") rc = $fscanf(fd, "%d", v);
 		else if (key == "syncpc") rc = $fscanf(fd, "%h", v);
+		else if (key == "berr") rc = $fscanf(fd, "%h %s", v, key);
 		else if (key == "fc") rc = $fscanf(fd, "%h %d", a, v);
 		else if (key == "rb") rc = $fscanf(fd, "%h", v);
 		else if (key == "#") begin : skipline2

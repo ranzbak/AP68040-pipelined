@@ -51,6 +51,11 @@ if command -v vasmm68k_mot > /dev/null; then
 	for s in pipe_asm/*.s; do
 		n=$(basename "$s" .s)
 		[ -f "pipe_asm/$n.exp" ] || continue
+		# bus errors exist only on the memory port: such programs run in the bus legs only
+		if grep -q "expect-berr" "$s"; then
+			( cd pipe_asm && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "../$WORK/$n.bin" "$n.s" ) && python3 bin2hex.py "$WORK/$n.bin" "$WORK/$n.hex"
+			continue
+		fi
 		( cd pipe_asm && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "../$WORK/$n.bin" "$n.s" ) || { echo "  FAIL  prog:$n (assembler)"; fail=1; continue; }
 		python3 bin2hex.py "$WORK/$n.bin" "$WORK/$n.hex"
 		# a program's "; diff: --cycles N" line sets its clock budget here too

@@ -84,7 +84,10 @@ module ap040_pipe_bcu
 	output reg        mem_rb,     // the store in progress is a locked write-back (debug)
 	input             mem_ack,
 	input      [31:0] mem_rdata,
-	input             mem_flt
+	input             mem_flt,
+	input             mem_atc,    // (with mem_flt) the MMU's fault, not the bus's (M7)
+	output reg        rd_atc,
+	output reg        f_atc
 );
 
 //--------------------------------------------------------------- store FIFO
@@ -129,7 +132,7 @@ always @(posedge clk) begin
 		kind <= K_ST;
 		sb_rp <= '0; sb_wp <= '0; sb_cnt <= '0;
 		dq_v <= 1'b0; dq_a <= 32'd0; dq_s <= SZ_L; dq_f <= 3'd5;
-		rd_ack <= 1'b0; rd_data <= 32'd0; rd_err <= 1'b0;
+		rd_ack <= 1'b0; rd_data <= 32'd0; rd_err <= 1'b0; rd_atc <= 1'b0; f_atc <= 1'b0;
 		f_ack <= 1'b0; f_data <= 32'd0; f_err <= 1'b0;
 		st_err <= 1'b0;
 		for (k = 0; k < SB_N; k = k + 1) begin sb_a[k] <= 32'd0; sb_d[k] <= 32'd0; sb_s[k] <= SZ_L; sb_f[k] <= 3'd5; sb_b[k] <= 1'b0; end
@@ -153,9 +156,9 @@ always @(posedge clk) begin
 					sb_rp <= sb_rp + 1'b1;
 					if (mem_flt) st_err <= 1'b1;
 				end
-				K_RD: begin rd_ack <= 1'b1; rd_data <= mem_rdata; rd_err <= mem_flt; end
+				K_RD: begin rd_ack <= 1'b1; rd_data <= mem_rdata; rd_err <= mem_flt; rd_atc <= mem_flt && mem_atc; end
 				default: begin                // a word fetch answers right-aligned: IF wants it on top
-					f_ack <= 1'b1; f_err <= mem_flt;
+					f_ack <= 1'b1; f_err <= mem_flt; f_atc <= mem_flt && mem_atc;
 					f_data <= (mem_size == SZ_W) ? {mem_rdata[15:0], 16'h4E71} : mem_rdata;
 				end
 			endcase

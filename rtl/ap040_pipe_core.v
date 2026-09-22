@@ -61,6 +61,7 @@ module ap040_pipe_core
 	input         mem_ack,
 	input  [31:0] mem_rdata,
 	input         mem_flt,
+	input         mem_atc,       // (with mem_flt) an MMU fault, not a bus error (M7; 0 until then)
 	output        bus_st_err,    // a posted store bus-errored (fatal)
 
 	// status for the wrapper (cacr_out/vbr_out, debug_status)
@@ -173,6 +174,7 @@ assign dbg_halted = eaf_halted;
 assign dbg_sr  = sr;
 
 //--------------------------------------------------------------- register file
+wire        d_rd_err, d_rd_atc;   // the read's access error (bus mode)
 wire  [2:0] d_rd_fc;    // data read function code (the MMU's c_fc in M7; benches read it)
 wire [4:0]  ra_sb, ra_si, ra_db, ra_di, ra_a, ra_b, ra_c, ra_d;
 wire [31:0] rd_sb, rd_si, rd_db, rd_di, rd_a, rd_b, rd_c, rd_d;
@@ -242,8 +244,9 @@ generate if (BUS == 0) begin : g_l1
 	assign sb_full = 1'b0; assign sb_busy = 1'b0;
 	assign mem_req = 1'b0; assign mem_write = 1'b0; assign mem_instr = 1'b0; assign mem_size = 2'd0;
 	assign mem_addr = 32'd0; assign mem_wdata = 32'd0; assign mem_fc = 3'd0; assign bus_st_err = 1'b0;
+	assign d_rd_err = 1'b0; assign d_rd_atc = 1'b0;
 end else begin : g_bus
-	wire rd_err_w, f_err_w;
+	wire f_err_w, f_atc_w;
 	assign l1_addr_a = '0;
 	assign l1_en_a   = 1'b0;
 	ap040_pipe_bcu u_bcu
@@ -254,13 +257,14 @@ end else begin : g_bus
 		.sb_full(sb_full), .sb_busy(sb_busy),
 		.older_st(fw_st_v || (exe_valid && exe_o.st_v)),
 		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
-		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(rd_err_w),
+		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(d_rd_err),
 		.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_fc(sr_now[13] ? 3'd6 : 3'd2),
 		.f_gnt(f_gnt), .f_ack(f_ack), .f_data(f_data), .f_err(f_err_w),
 		.st_err(bus_st_err),
 		.mem_req(mem_req), .mem_write(mem_write), .mem_instr(mem_instr), .mem_size(mem_size),
 		.mem_addr(mem_addr), .mem_wdata(mem_wdata), .mem_fc(mem_fc),
-		.mem_ack(mem_ack), .mem_rdata(mem_rdata), .mem_flt(mem_flt)
+		.mem_ack(mem_ack), .mem_rdata(mem_rdata), .mem_flt(mem_flt), .mem_atc(mem_atc),
+		.rd_atc(d_rd_atc), .f_atc(f_atc_w)
 	);
 end endgenerate
 
@@ -340,6 +344,7 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020)) u_e
 	.ex_ccr_v(fw_ccr_v), .ex_ccr(fw_ccr),
 	.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
 	.rd_ack(d_rd_ack), .rd_data_raw(d_rd_data),
+	.rd_err(d_rd_err), .rd_atc(d_rd_atc), .bus_wdata(mem_wdata),
 	.wb_st_v(retire && exe_o.st_v), .wb_st_addr(exe_o.st_addr), .wb_st_size(exe_o.st_size), .wb_st_data(exe_o.st_data),
 	.ex_st_v(fw_st_v), .ex_st_addr(fw_st_addr), .ex_st_size(fw_st_size), .ex_st_data(fw_st_data),
 	.eaf_stall(eaf_stall), .eaf_blk(eaf_blk),

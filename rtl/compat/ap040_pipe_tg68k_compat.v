@@ -200,7 +200,9 @@ ap040_bus_timeout #(.COUNTER_BITS(21)) core_stall_watchdog (
 	.complete(mem_ack | mem_flt_mmu),
 	.berr(core_stall_flt)
 );
-wire        mem_flt = mem_flt_mmu | core_stall_flt;
+// (the reference core samples berr itself while it holds a request: mem_err
+// = mem_req && (mem_flt | berr); here it reaches the core as an access error)
+wire        mem_flt = mem_flt_mmu | core_stall_flt | berr;
 
 // MMU to cache
 wire        mm_req, mm_write, mm_instr;
@@ -271,6 +273,7 @@ ap040_pipe_core #(
 	.mem_ack(mem_ack),
 	.mem_rdata(mem_rdata),
 	.mem_flt(mem_flt),
+	.mem_atc(mem_flt_mmu),
 	.bus_st_err(core_st_err),
 
 	.cacr_q(cacr_out),

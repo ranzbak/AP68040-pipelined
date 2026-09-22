@@ -1,7 +1,10 @@
 ; vectors.inc - common vector table for the pipe_asm programs.
 ; ISP = $1F00, PC = start; every vector -> unexp except the ones a
 ; program overrides by defining the symbols below before including this
-; (v_divz/v_chk/v_trapv are optional).
+; (v_berr/v_divz/v_chk/v_trapv are optional).
+	ifnd	v_berr
+v_berr	equ	unexp
+	endif
 	ifnd	v_divz
 v_divz	equ	unexp
 	endif
@@ -14,7 +17,7 @@ v_trapv	equ	unexp
 	org	0
 	dc.l	$1F00
 	dc.l	start
-	dc.l	unexp		; 2 bus error
+	dc.l	v_berr		; 2 access error
 	dc.l	v_adr		; 3 address error
 	dc.l	v_ill		; 4 illegal
 	dc.l	v_divz		; 5 divide by zero

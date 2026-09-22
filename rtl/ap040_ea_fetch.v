@@ -86,6 +86,9 @@ module ap040_ea_fetch
 	output      [2:0] rd_fc,      // the read's function code (MOVES: SFC)
 	input             rd_ack,
 	input      [31:0] rd_data_raw,
+	input             rd_err,     // the read ended in an access error (M6)
+	input             rd_atc,     // ... from the MMU (else a physical bus error)
+	input      [31:0] bus_wdata,  // the memory port's last write data (the reference's stale WB3D)
 	// the older stores not yet in memory when a read sampled it: the one in
 	// WB now (it was in EX then) and the one in EX now (it was here then)
 	input             wb_st_v, input [31:0] wb_st_addr, input [1:0] wb_st_size, input [31:0] wb_st_data,
@@ -131,6 +134,7 @@ reg [31:0] x_pc, x_addr;
 reg  [2:0] x_step;         // 0 frame stores, 3 vector read, 4 final, 5 wait + latch SR/SP
 reg  [3:0] x_k;            // the frame longword being stored (0 .. size/4 - 1)
 reg [31:0] x7 [2:14];      // format $7 longwords 2-14 (frame bytes 8-59), set when the fault is taken
+integer    xk;
 reg [15:0] x_sr;           // SR stacked
 reg [31:0] x_sp;           // new SP (reset: the loaded ISP)
 reg  [4:0] x_bank;
@@ -247,13 +251,18 @@ wire rdreq_t nx = next_rd(need_smi, done_smi, need_dmi, done_dmi, needs_ld_src, 
 // and EX; their bytes are merged in, WB's first, then EX's (the younger).
 // So a load never waits for an older store (M68040UM 10.6: ADD Dn,(An) one
 // clock back to back).
-reg  [31:0] rd_a_q;        // address and size of the outstanding read
+reg  [31:0] rd_a_q;        // address, size and function code of the outstanding read
 reg   [1:0] rd_sz_q;
+reg   [2:0] rd_fc_q;
 wire [31:0] rd_data = (STFWD == 0) ? rd_data_raw : st_merge(st_merge(rd_data_raw, rd_a_q, rd_sz_q, wb_st_v, wb_st_addr, wb_st_size, wb_st_data),
                                rd_a_q, rd_sz_q, ex_st_v, ex_st_addr, ex_st_size, ex_st_data);
 
 // the capture in this cycle, as the dispatch sees it
-wire        cap      = rd_pend && rd_ack && !rd_drop;
+wire        cap      = rd_pend && rd_ack && !rd_drop && !rd_err;
+// an access error on the answer (M6): the instruction takes vector 2
+// (format $7) and restarts; during exception entry, RTE or reset it is a
+// double fault (M68040UM 7.6.3, p. 7-43: the processor halts)
+wire        cap_err  = rd_pend && rd_ack && !rd_drop && rd_err;
 wire [31:0] s_addr_c = (cap && rd_tag == T_SMI) ? rd_data + eac_i.src_add : s_addr_now;
 wire [31:0] d_addr_c = (cap && rd_tag == T_DMI) ? rd_data + eac_i.dst_add : d_addr_now;
 wire        dn_smi   = done_smi || (cap && rd_tag == T_SMI);
@@ -768,6 +777,34 @@ wire stp_t st0 = stepf(ph, eac_valid, rst_pending, i, older_busy, !bf_rdblk, rd_
                       indexed_mode, two_uop, bf_step, sync_busy, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes);
 
+//--------------------------------------------------------------- access errors
+// A data read that ends in an access error (M68040UM 8.2.1, p. 8-6): the
+// instruction is abandoned -- it has committed nothing except, for MOVEM,
+// registers a restart loads again -- and takes vector 2 with a format $7
+// frame whose PC is the instruction itself (restart).  The frame words
+// follow the reference core (lib/AP68040 ap040_core.v aerr_start /
+// aerr_word): EA = FA = the transfer's first byte (MOVE16: EA line
+// aligned), SSW {CP CU CT CM = 0, MA = 0, ATC, LK, RW = !LK, X = 0, SIZE,
+// TT, TM}, WB1S-WB3S = 0, WB3A = FA, WB3D = the port's last write data,
+// the rest 0.
+function automatic logic [15:0] ssw_f(input logic atc, input logic lk, input logic wr, input logic [1:0] sz,
+                                      input logic m16, input logic moves, input logic [2:0] fc);
+	logic [1:0] tt, szf;
+	logic [2:0] tm;
+	tt = 2'b00; tm = fc;
+	if (moves && (fc[1:0] == 2'b00 || fc[1:0] == 2'b11)) tt = 2'b10;
+	else if (moves && fc[1]) tm = {fc[2], 2'b01};         // FC 2/6: data space (p. 8-28)
+	if (m16) tt = 2'b01;
+	szf = m16 ? 2'b11 : (sz == SZ_B) ? 2'b01 : (sz == SZ_W) ? 2'b10 : 2'b00;
+	return {4'b0000, 1'b0, atc, lk, !wr && !lk, 1'b0, szf, tt, tm};
+endfunction
+wire        aer_lk   = (i.cls == CL_CAS) || (i.cls == CL_CAS2) ||
+                       (i.cls == CL_ALU && i.alu == `AP040_ALU_TAS && i.dst.kind == EK_MEM);
+wire        aer_m16  = (i.cls == CL_MOVEM) && i.imm[2];
+wire [15:0] aer_ssw  = ssw_f(rd_atc, aer_lk, 1'b0, rd_sz_q, aer_m16, i.fcsel != 2'd0, rd_fc_q);
+wire        aerr_go  = cap_err && eac_valid && (ph == P_START || ph == P_OPS || ph == P_MOVEM);
+wire        aerr_dbl = cap_err && (ph == P_EXC || ph == P_RTE || ph == P_RESET);
+
 //--------------------------------------------------------------- MOVEM
 // PRM 4-128..4-131.  Mask bit k names D0..D7, A0..A7 (k = 0..15), reversed
 // for -(An).  One micro-op per register: a store (the register read through
@@ -926,9 +963,19 @@ function automatic stp_t m16_st_f(input stp_t t0, input logic sd, input logic sf
 	t = t0; t.disp = sd; t.fin = sf;
 	return t;
 endfunction
-wire stp_t st = (ph != P_MOVEM) ? st0 :
-                mm_16 ? m16_st_f(mm_st(mms, mm_addr, i.size), m16_sd, m16_sf) :
-                mm_st(mms, mm_addr, mm_p ? SZ_B : i.size);
+wire stp_t st1 = (ph != P_MOVEM) ? st0 :
+                 mm_16 ? m16_st_f(mm_st(mms, mm_addr, i.size), m16_sd, m16_sf) :
+                 mm_st(mms, mm_addr, mm_p ? SZ_B : i.size);
+function automatic stp_t aerr_st(input stp_t t0, input logic go, input id_t i, input logic [31:0] fa);
+	stp_t t;
+	t = t0;
+	if (go) begin
+		t = '0;
+		t.exc_go = 1'b1; t.ev = 8'd2; t.ef = 4'd7; t.epc = i.pc; t.eaddr = fa;
+	end
+	return t;
+endfunction
+wire stp_t st = aerr_st(st1, aerr_go, i, rd_a_q);
 
 // RTR to an odd PC: the CCR alone commits
 function automatic ex_t ccr_only_uop(input ex_t x);
@@ -1032,7 +1079,7 @@ always @(posedge clk) begin
 		end
 		// read bookkeeping.  A read still outstanding when a flush arrives
 		// is answered later; rd_drop throws that answer away.
-		if (rd_req) begin rd_pend <= 1'b1; rd_tag <= rd_t; rd_a_q <= rd_addr; rd_sz_q <= rd_size; end
+		if (rd_req) begin rd_pend <= 1'b1; rd_tag <= rd_t; rd_a_q <= rd_addr; rd_sz_q <= rd_size; rd_fc_q <= rd_fc; end
 		else if (rd_ack) begin rd_pend <= 1'b0; rd_drop <= 1'b0; end
 		if (flush) begin
 			ph <= P_START; bf_step <= 1'b0; mm_have <= 1'b0; mm_empty <= 1'b0;
@@ -1108,6 +1155,16 @@ always @(posedge clk) begin
 			endcase
 			// an exception starts: step 5 waits for everything older to
 			// commit, then latches SR and the supervisor SP
+			if (aerr_go) begin
+				x7[2]  <= aer_m16 ? {rd_a_q[31:4], 4'd0} : rd_a_q;      // EA
+				x7[3]  <= {aer_ssw, 16'h0000};                           // SSW, WB3S
+				x7[4]  <= 32'd0;                                         // WB2S, WB1S
+				x7[5]  <= rd_a_q;                                        // FA
+				x7[6]  <= rd_a_q;                                        // WB3A
+				x7[7]  <= bus_wdata;                                     // WB3D
+				for (xk = 8; xk <= 14; xk = xk + 1) x7[xk] <= 32'd0;
+				mm_have <= 1'b0;
+			end
 			if (st.exc_go) begin
 				ph     <= P_EXC;
 				x_vec  <= st.ev; x_fmt <= st.ef; x_pc <= st.epc; x_addr <= st.eaddr;
@@ -1146,6 +1203,7 @@ always @(posedge clk) begin
 				if (mms.from_buf) mm_have <= 1'b0;
 				if (mms.fin) mm_empty <= 1'b0;
 			end
+			if (aerr_dbl) ph <= P_HALT;
 			if (st.fin) begin
 				ph <= P_START; bf_step <= 1'b0;
 				done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
