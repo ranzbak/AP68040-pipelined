@@ -112,8 +112,10 @@ reg  [1:0] kind;           // what the transfer in progress is
 
 wire idle    = !mem_req;         // (a new request never starts in the ack clock: one low enabled edge)
 wire go_st   = idle && (sb_cnt != 0);
-wire rd_now  = dq_v || rd_req;                  // (a read requested this clock can go at once)
-wire go_rd   = idle && (sb_cnt == 0) && !st_v && !older_st && rd_now;
+// A read goes from the slot, never in the clock it is requested: EA-fetch
+// may be sending the older instruction's store to EX in that same clock
+// (an early read), and older_st sees it only once it is there.
+wire go_rd   = idle && (sb_cnt == 0) && !st_v && !older_st && dq_v;
 wire go_if   = idle && !go_st && !go_rd && f_req;
 assign f_gnt = go_if;
 
@@ -165,8 +167,7 @@ always @(posedge clk) begin
 			mem_rb <= sb_b[sb_rp];
 		end else if (go_rd) begin
 			mem_req <= 1'b1; kind <= K_RD; mem_write <= 1'b0; mem_instr <= 1'b0;
-			mem_addr <= dq_v ? dq_a : rd_addr; mem_size <= dq_v ? dq_s : rd_size;
-			mem_fc <= dq_v ? dq_f : rd_fc;
+			mem_addr <= dq_a; mem_size <= dq_s; mem_fc <= dq_f;
 			dq_v <= 1'b0;
 		end else if (go_if) begin
 			mem_req <= 1'b1; kind <= K_IF; mem_write <= 1'b0; mem_instr <= 1'b1;

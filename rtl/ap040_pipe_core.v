@@ -100,8 +100,13 @@ wire [31:0] redirect_pc    = ex_redirect ? ex_redirect_pc :
 //--------------------------------------------------------------- commit (WB)
 // (BUS: a store waits in WB while the posted-store buffer is full)
 wire sb_full, sb_busy;
+// A held micro-op keeps writing its registers, CCR/SR and control registers
+// (the same values each clock -- nothing younger can pass it), so the stages
+// in front see them through the register file's write-through as usual;
+// only its store and its retirement wait (retire).
 wire wb_hold = exe_valid && exe_o.st_v && sb_full;
-wire commit  = exe_valid && !wb_hold;
+wire commit  = exe_valid;
+wire retire  = exe_valid && !wb_hold;
 
 reg [15:0] sr;
 reg [31:0] vbr;
@@ -226,7 +231,7 @@ end else begin : g_bus
 	ap040_pipe_bcu u_bcu
 	(
 		.clk(clk), .nreset(nreset), .ce(ce),
-		.st_v(ce && commit && exe_o.st_v), .st_addr(exe_o.st_addr), .st_size(exe_o.st_size),
+		.st_v(ce && retire && exe_o.st_v), .st_addr(exe_o.st_addr), .st_size(exe_o.st_size),
 		.st_data(exe_o.st_data), .st_fc(exe_o.st_fc), .st_rb(exe_o.st_rb), .mem_rb(),
 		.sb_full(sb_full), .sb_busy(sb_busy),
 		.older_st(fw_st_v || (exe_valid && exe_o.st_v)),
@@ -317,7 +322,7 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1)) u_eaf
 	.ex_ccr_v(fw_ccr_v), .ex_ccr(fw_ccr),
 	.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
 	.rd_ack(d_rd_ack), .rd_data_raw(d_rd_data),
-	.wb_st_v(commit && exe_o.st_v), .wb_st_addr(exe_o.st_addr), .wb_st_size(exe_o.st_size), .wb_st_data(exe_o.st_data),
+	.wb_st_v(retire && exe_o.st_v), .wb_st_addr(exe_o.st_addr), .wb_st_size(exe_o.st_size), .wb_st_data(exe_o.st_data),
 	.ex_st_v(fw_st_v), .ex_st_addr(fw_st_addr), .ex_st_size(fw_st_size), .ex_st_data(fw_st_data),
 	.eaf_stall(eaf_stall), .eaf_blk(eaf_blk),
 	.eaf_valid(eaf_valid), .eaf_o(eaf_o),
@@ -358,7 +363,7 @@ ap040_execute u_ex
 ap040_writeback u_wb
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(1'b0),
-	.exe_valid(commit && exe_o.last), .exe_pc(exe_o.pc),
+	.exe_valid(retire && exe_o.last), .exe_pc(exe_o.pc),
 	.wb_stall(), .wb_valid(wb_valid), .wb_pc(wb_pc)
 );
 
