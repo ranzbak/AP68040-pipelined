@@ -7,8 +7,8 @@
 ; value read, so memory contents are the same with or without it; the
 ; differential W stream sees it as L lines (PLAN D6).
 ; expect-inimage
-; expect-rbcount: 6   (CAS mismatches 3, CAS2 mismatches 3; manual count, the reference makes none)
-; expect-rb: 1401 1402 1404 1408 1408 1418
+; expect-rbcount: 7   (CAS mismatches 3, CAS2 mismatches 4; manual count, the reference makes none)
+; expect-rb: 1401 1402 1404 1408 1408 1418 1424
 ; expect-mem: m32 1400 m32 1404 m32 1408 m32 140c m32 1410 m32 1414 m32 1418 m32 141c
 ; expect-mem: m32 1500 m32 1504 m32 1508 m32 150c m32 1510 m32 1514 m32 1518 m32 151c m32 1520 m32 1524 m32 1528 m32 152c
 ; expect-mem: m32 1530 m32 1534 m32 1538 m32 153c m32 1540 m32 1544 m32 1548 m32 154c m32 1550 m32 1554 m32 1558 m32 155c
@@ -92,6 +92,15 @@ start:
 	cas2.w	d2:d3,d4:d5,(a0):(d7)	; first matches? no: mem1 now $0101
 	res	d2
 	res	d3
+	; CAS2 with Dc1 = Dc2 and a failed compare: the 68040 leaves memory
+	; operand 2 in the register (WinUAE's 68040 order; PLAN D7)
+	move.l	#$11110001,($1420).l
+	move.l	#$22220002,($1424).l
+	lea	($1420).l,a2
+	lea	($1424).l,a3
+	moveq	#0,d6			; Dc1 = Dc2 = d6: the first compare fails
+	cas2.l	d6:d6,d4:d5,(a2):(a3)
+	move.l	d6,($1560).l		; $22220002 (operand 2)
 halt:
 	bra.s	halt
 unexp:

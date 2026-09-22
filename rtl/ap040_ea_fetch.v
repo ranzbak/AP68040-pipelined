@@ -41,7 +41,12 @@ module ap040_ea_fetch
 	// 1: merge the stores still in EX/WB into a read's answer (the L1 test
 	// substrate answers the next clock, before they reach memory); 0: the
 	// bus controller holds every read until older stores are in memory
-	parameter STFWD = 1
+	parameter STFWD = 1,
+	// CAS2 with Dc1 = Dc2 and a failed compare: 0 = the 68040 (memory
+	// operand 2 ends in the register: WinUAE's cpu_level >= 4 order, verified
+	// on hardware -- Paul's decision, PLAN D7); 1 = the 020/030 (operand 1,
+	// PRM 4-68)
+	parameter CAS2_DC_ORDER_020 = 0
 )
 (
 	input             clk,
@@ -123,7 +128,9 @@ reg        rst_pending;    // reset sequence still to run
 reg  [7:0] x_vec;
 reg  [3:0] x_fmt;
 reg [31:0] x_pc, x_addr;
-reg  [2:0] x_step;         // 0-2 frame stores, 3 vector read, 4 final, 5 wait + latch SR/SP
+reg  [2:0] x_step;         // 0 frame stores, 3 vector read, 4 final, 5 wait + latch SR/SP
+reg  [3:0] x_k;            // the frame longword being stored (0 .. size/4 - 1)
+reg [31:0] x7 [2:14];      // format $7 longwords 2-14 (frame bytes 8-59), set when the fault is taken
 reg [15:0] x_sr;           // SR stacked
 reg [31:0] x_sp;           // new SP (reset: the loaded ISP)
 reg  [4:0] x_bank;
@@ -468,7 +475,7 @@ function automatic ex_t cas2_uop(input ex_t x0, input logic sec, input eac_t e,
                                  input logic [31:0] dc1, input logic [31:0] dc2,
                                  input logic [31:0] du1, input logic [31:0] du2,
                                  input logic [31:0] a1, input logic [31:0] m1,
-                                 input logic [31:0] a2, input logic [31:0] m2);
+                                 input logic [31:0] a2, input logic [31:0] m2, input logic order020);
 	ex_t x;
 	logic [1:0] sz;
 	logic eq1, eq2;
@@ -488,8 +495,14 @@ function automatic ex_t cas2_uop(input ex_t x0, input logic sec, input eac_t e,
 		x.last = sec;
 		if (sec) x.wr_ccr = 1'b0;
 	end else begin
-		x.dk = DK_REG; x.dr = {2'b00, e.i.ext[2:0]}; x.c = mrg(dc1, m1, sz);
-		x.u1_v = 1'b1; x.u1_r = {2'b00, e.i.ext2[2:0]}; x.u1_val = mrg(dc2, m2, sz);
+		// w0 beats u1 in WB, so the register w0 names wins when Dc1 = Dc2
+		if (order020) begin
+			x.dk = DK_REG; x.dr = {2'b00, e.i.ext[2:0]}; x.c = mrg(dc1, m1, sz);
+			x.u1_v = 1'b1; x.u1_r = {2'b00, e.i.ext2[2:0]}; x.u1_val = mrg(dc2, m2, sz);
+		end else begin
+			x.dk = DK_REG; x.dr = {2'b00, e.i.ext2[2:0]}; x.c = mrg(dc2, m2, sz);
+			x.u1_v = 1'b1; x.u1_r = {2'b00, e.i.ext[2:0]}; x.u1_val = mrg(dc1, m1, sz);
+		end
 		x.st_addr = a2; x.st_data = m2 & szmask(sz); x.st_rb = 1'b1;
 	end
 	return x;
@@ -504,7 +517,8 @@ wire cas2_two = (i.cls == CL_CAS2) &&
 reg bf_step;               // the second micro-op (bitfield trailing byte, CAS2 Du2) is next
 wire ex_t x_ord0 = is_bf ? bf_uop(x_ord1, bf_step, eac_i, bfr, bf_mem, bf_modify, bf_two, bf_n, bf_addr) :
                    (i.cls == CL_CAS2) ? cas2_uop(x_ord1, bf_step, eac_i, op_a, op_b, op_c, op_d,
-                                                 s_addr_c, s_val, d_addr_c, d_val) :   // (vhold: loads captured)
+                                                 s_addr_c, s_val, d_addr_c, d_val,     // (vhold: loads captured)
+                                                 CAS2_DC_ORDER_020 != 0) :
                    x_ord1;
 wire two_uop = bf_two || cas2_two;
 function automatic ex_t with_cc(input ex_t x, input logic c);
@@ -564,18 +578,21 @@ function automatic logic [31:0] fsize(input logic [3:0] f);
 endfunction
 
 // one exception-frame store
-function automatic ex_t exc_uop(input id_t i, input logic [2:0] st, input logic [31:0] sp,
+// longword k of the frame: {SR, PC}, {PC, format/vector}, then format $2's
+// address, or format $7's words 8-59 (x7[k-2], M6)
+function automatic ex_t exc_uop(input id_t i, input logic [3:0] k, input logic [31:0] sp,
                                 input logic [15:0] sr, input logic [31:0] pc, input logic [3:0] fmt,
-                                input logic [7:0] vec, input logic [31:0] addr);
+                                input logic [7:0] vec, input logic [31:0] addr, input logic [31:0] x7w);
 	ex_t x;
 	x = base_uop(i);
 	x.cls  = CL_EXC;
 	x.last = 1'b0;
 	x.st_v = 1'b1; x.st_size = SZ_L;
-	case (st)
-		3'd0:    begin x.st_addr = sp;         x.st_data = {sr, pc[31:16]}; end
-		3'd1:    begin x.st_addr = sp + 32'd4; x.st_data = {pc[15:0], fmt, 2'b00, vec, 2'b00}; end
-		default: begin x.st_addr = sp + 32'd8; x.st_data = addr; end
+	x.st_addr = sp + {26'd0, k, 2'b00};
+	case (k)
+		4'd0:    x.st_data = {sr, pc[31:16]};
+		4'd1:    x.st_data = {pc[15:0], fmt, 2'b00, vec, 2'b00};
+		default: x.st_data = (fmt == 4'd7) ? x7w : addr;
 	endcase
 	return x;
 endfunction
@@ -703,7 +720,7 @@ function automatic stp_t stepf(
 			end
 		end
 		P_EXC: begin
-			if (x_step <= 3'd2) begin
+			if (x_step == 3'd0) begin
 				if (!stall) begin s.disp = 1'b1; s.dsel = 3'd1; end
 			end else if (x_step == 3'd3) begin
 				if (!rd_pend && can_rd) begin
@@ -942,7 +959,7 @@ function automatic ex_t dmux(input logic [2:0] sel, input ex_t o, input ex_t f, 
 endfunction
 
 wire ex_t disp_x0 = dmux(st.dsel, x_ord,
-                        exc_uop(i, x_step, x_sp, x_sr, x_pc, x_fmt, x_vec, x_addr),
+                        exc_uop(i, x_k, x_sp, x_sr, x_pc, x_fmt, x_vec, x_addr, x7[(x_k < 4'd2) ? 4'd2 : x_k]),
                         exc_final(i, x_bank, x_sp, x_sr, x_target),
                         rte_final(i, bank_now, rd_a, r_fv, r_sr, r_pc),
                         reset_final(i, x_sp, r_pc),
@@ -998,7 +1015,7 @@ always @(posedge clk) begin
 		ph <= P_START; rd_pend <= 1'b0; rd_tag <= 3'd0; rd_drop <= 1'b0;
 		done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
 		s_addr <= 32'd0; d_addr <= 32'd0; s_val <= 32'd0; d_val <= 32'd0;
-		x_vec <= 8'd0; x_fmt <= 4'd0; x_pc <= 32'd0; x_addr <= 32'd0; x_step <= 3'd0;
+		x_vec <= 8'd0; x_fmt <= 4'd0; x_pc <= 32'd0; x_addr <= 32'd0; x_step <= 3'd0; x_k <= 4'd0;
 		x_sr <= 16'd0; x_sp <= 32'd0; x_bank <= R_ISP; x_target <= 32'd0;
 		bf_step <= 1'b0;
 		mm_mask <= 16'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0;
@@ -1048,8 +1065,10 @@ always @(posedge clk) begin
 					end
 				end
 				P_EXC: begin
-					if (x_step <= 3'd2 && st.disp)
-						x_step <= (x_step == 3'd1 && x_fmt != 4'd2 && x_fmt != 4'd3) ? 3'd3 : x_step + 3'd1;
+					if (x_step == 3'd0 && st.disp) begin
+						x_k <= x_k + 4'd1;
+						if ({28'd0, x_k} == (fsize(x_fmt) >> 2) - 32'd1) x_step <= 3'd3;
+					end
 					if (x_step == 3'd4 && st.disp && x_target[0]) begin
 						// odd handler address: an address error on top (reference
 						// S_EXC_JMP), or a double fault for vectors 2 and 3
@@ -1065,7 +1084,7 @@ always @(posedge clk) begin
 						x_sr   <= sr_in;
 						x_bank <= bank_now;
 						x_sp   <= rd_a - fsize(x_fmt);  // ra_a = bank_now in P_EXC
-						x_step <= 3'd0;
+						x_step <= 3'd0; x_k <= 4'd0;
 					end
 				end
 				P_RTE: begin
