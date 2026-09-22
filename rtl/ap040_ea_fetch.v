@@ -62,6 +62,7 @@ module ap040_ea_fetch
 	input             ce,
 	input             stall_in,   // EX cannot accept this cycle
 	input             flush,
+	input             keep_out,    // the flush is EX's own redirect while EX holds eaf_o: keep it
 
 	input             eac_valid,
 	input  eac_t      eac_i,
@@ -1240,7 +1241,7 @@ always @(posedge clk) begin
 		eaf_valid <= 1'b0; eaf_o <= '0;
 	end else if (ce) begin
 		// the EX-side output register
-		if (flush || wf_go) eaf_valid <= 1'b0;
+		if ((flush && !keep_out) || wf_go) eaf_valid <= 1'b0;
 		else if (!stall_in) begin
 			eaf_valid <= st.disp;
 			if (st.disp) eaf_o <= disp_x;

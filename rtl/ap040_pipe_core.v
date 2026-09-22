@@ -379,6 +379,7 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HA
                  .MM_TAIL(BUS ? 1 : 0)) u_eaf
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ex_stall), .flush(flush),
+	.keep_out(ex_redir_q && ex_stall),
 	.eac_valid(eac_valid), .eac_i(eac_o),
 	.sr_in(sr_now), .vbr_in(vbr), .sfc_in(sfc), .dfc_in(dfc),
 	.older_busy(older_busy), .older_store(older_store),

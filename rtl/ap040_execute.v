@@ -394,7 +394,18 @@ assign fw_w0_v   = eaf_valid && w.w0_v;
 assign fw_w0_r   = w.w0_r;
 assign fw_w0_val = w.w0_val;
 
-assign ex_redirect    = eaf_valid && redir && !stall_in;
+// The redirect goes out in the micro-op's first clock here, whether or not WB
+// holds an older store (timing: st_done -- the memory's acknowledge -- must
+// not reach IF's fetch address; the gate build's clk_114 -> clk_38 path,
+// M7), and only once: ex_rdone remembers it while WB holds this micro-op
+// here.  EA-fetch keeps its output register (this micro-op) through its own
+// redirect's flush (keep_out, core).  An older store that faults squashes
+// this micro-op anyway, and its exception redirects IF again.
+reg  ex_rdone;
+assign ex_redirect    = eaf_valid && redir && !ex_rdone;
+always @(posedge clk)
+	if (!nreset) ex_rdone <= 1'b0;
+	else if (ce) ex_rdone <= eaf_valid && stall_in && !wb_drop && (ex_rdone || (redir && !ex_rdone));
 assign ex_redirect_pc = redir_pc;
 assign ex_redirect_s  = w.sr_v ? w.sr_val[13] : sr_in[13];
 
