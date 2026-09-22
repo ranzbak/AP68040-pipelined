@@ -174,8 +174,12 @@ wire [31:0] op_b = (eac_i.u0_v && eac_i.u0_r == ra_b) ? eac_i.u0_val :
 // L / L+B by span (S_BF_WR1/2).
 wire        is_bf   = (i.cls == CL_BF);
 wire        bf_mem  = is_bf && (i.dst.kind == EK_MEM);
-wire [31:0] bf_off  = (i.reg_c != R_NONE) ? op_c : {27'd0, i.ext[10:6]};
-wire  [4:0] bf_w5   = (i.reg_d != R_NONE) ? op_d[4:0] : i.ext[4:0];
+// Offset and width come from the register file (WB write-through), not
+// from EX: a bitfield waits while EX is writing one of its registers
+// (bf_rdblk, vhold below), so the read address and the span -- which decide
+// reads and micro-ops -- stay off EX's result path (timing, plan M3).
+wire [31:0] bf_off  = (i.reg_c != R_NONE) ? rd_c : {27'd0, i.ext[10:6]};
+wire  [4:0] bf_w5   = (i.reg_d != R_NONE) ? rd_d[4:0] : i.ext[4:0];
 wire  [5:0] bf_w    = (bf_w5 == 5'd0) ? 6'd32 : {1'b0, bf_w5};
 wire [31:0] bf_addr = eac_i.dst_ea + {{3{bf_off[31]}}, bf_off[31:3]};
 wire  [6:0] bf_bits = {4'd0, bf_off[2:0]} + {1'b0, bf_w} + 7'd7;
@@ -241,8 +245,23 @@ wire        dn_sld   = done_sld || (cap && rd_tag == T_SLD);
 wire        dn_dld   = done_dld || (cap && rd_tag == T_DLD);
 wire [31:0] s_val_c  = (cap && rd_tag == T_SLD) ? rd_data : s_val;
 wire [31:0] d_val_c  = (cap && rd_tag == T_DLD) ? rd_data : d_val;
+// Timing (plan M3 OOC, WNS -8.6 ns before this): instructions whose
+// EA-fetch decision -- trap or not, one micro-op or two, the field address
+// -- depends on operand VALUES do not take them straight from EX's result
+// or from a load answering this clock; they wait one clock and use the
+// register-file write-through / the captured load instead.  (The EX write
+// ports themselves never depend on a result: ap040_execute.v.)
+wire vdep = (i.cls == CL_CHK) || (i.cls == CL_CHK2) || (i.cls == CL_MULDIV && i.imm[0]) ||
+            (i.cls == CL_BF) || (i.cls == CL_CAS2);
+function automatic logic hz(input logic v, input logic [4:0] r, input logic [4:0] a, input logic [4:0] b,
+                            input logic [4:0] c, input logic [4:0] d);
+	return v && (r == a || r == b || r == c || r == d);
+endfunction
+wire ex_haz = hz(ex_w0_v, ex_w0_r, ra_a, ra_b, ra_c, ra_d) || hz(ex_u0_v, ex_u0_r, ra_a, ra_b, ra_c, ra_d) ||
+              hz(ex_u1_v, ex_u1_r, ra_a, ra_b, ra_c, ra_d);
+wire vhold = vdep && (cap || ex_haz);
 wire ops_done = (!need_smi || dn_smi) && (!need_dmi || dn_dmi) &&
-                (!needs_ld_src || dn_sld) && (!needs_ld_dst || dn_dld);
+                (!needs_ld_src || dn_sld) && (!needs_ld_dst || dn_dld) && !vhold;
 
 // odd control-flow targets (M68040UM 8.2.2; reference ap040_core.v S_JMP1/S_JSR1/S_RET2)
 wire jmp_odd = (i.cls == CL_JMP || i.cls == CL_JSR) && s_addr_c[0];
@@ -382,7 +401,7 @@ function automatic bfres_t bf_eval(input logic [2:0] op, input logic [63:0] win,
 endfunction
 
 wire bfres_t bfr = bf_eval(i.alu[2:0],
-                           bf_mem ? {d_val_c, s_val_c[7:0], 24'd0} : {op_b, op_b},
+                           bf_mem ? {d_val, s_val[7:0], 24'd0} : {op_b, op_b},   // (vhold: loads captured)
                            bf_mem ? {3'd0, bf_off[2:0]} : {1'b0, bf_off[4:0]},
                            bf_w, op_a, bf_off, !bf_mem);
 
@@ -462,14 +481,16 @@ function automatic ex_t cas2_uop(input ex_t x0, input logic sec, input eac_t e,
 	return x;
 endfunction
 
+// decided from the register file and the captured loads (vhold: no EX
+// hazard, no load answering this clock), off EX's result path
 wire cas2_two = (i.cls == CL_CAS2) &&
-                ((i.size == SZ_W) ? (s_val_c[15:0] == op_a[15:0]) : (s_val_c == op_a)) &&
-                ((i.size == SZ_W) ? (d_val_c[15:0] == op_b[15:0]) : (d_val_c == op_b));
+                ((i.size == SZ_W) ? (s_val[15:0] == rd_a[15:0]) : (s_val == rd_a)) &&
+                ((i.size == SZ_W) ? (d_val[15:0] == rd_b[15:0]) : (d_val == rd_b));
 
 reg bf_step;               // the second micro-op (bitfield trailing byte, CAS2 Du2) is next
 wire ex_t x_ord0 = is_bf ? bf_uop(x_ord1, bf_step, eac_i, bfr, bf_mem, bf_modify, bf_two, bf_n, bf_addr) :
                    (i.cls == CL_CAS2) ? cas2_uop(x_ord1, bf_step, eac_i, op_a, op_b, op_c, op_d,
-                                                 s_addr_c, s_val_c, d_addr_c, d_val_c) :
+                                                 s_addr_c, s_val, d_addr_c, d_val) :   // (vhold: loads captured)
                    x_ord1;
 wire two_uop = bf_two || cas2_two;
 function automatic ex_t with_cc(input ex_t x, input logic c);
@@ -486,14 +507,25 @@ wire       br_cc       = cond_true(i.cond, ex_ccr_here);
 function automatic logic signed [31:0] sized_s(input logic [31:0] v, input logic [1:0] sz);
 	return (sz == SZ_B) ? $signed(sext8(v[7:0])) : (sz == SZ_W) ? $signed(sext16(v[15:0])) : $signed(v);
 endfunction
-wire signed [31:0] chk_v  = sized_s(op_b, i.size);
-wire signed [31:0] chk_b  = sized_s(x_ord0.a, i.size);
-wire signed [31:0] c2_rn  = (i.dst.kind == EK_AREG) ? $signed(op_b) : sized_s(op_b, i.size);
-wire signed [31:0] c2_lb  = sized_s(x_ord0.a, i.size);
-wire signed [31:0] c2_ub  = sized_s(x_ord0.c, i.size);
+// The trap decisions use the register file and the captured loads, never
+// EX's result or a load answering this clock (vhold guarantees they are
+// the same values when the decision is taken): timing, plan M3.
+function automatic logic [31:0] dsrc(input id_t i, input logic [31:0] ra, input logic [31:0] sv);
+	case (i.src.kind)
+		EK_DREG, EK_AREG: return ra;
+		EK_IMM:           return i.src.bd;
+		default:          return sv;
+	endcase
+endfunction
+wire [31:0] dec_src = dsrc(i, rd_a, s_val);
+wire signed [31:0] chk_v  = sized_s(rd_b, i.size);
+wire signed [31:0] chk_b  = sized_s(dec_src, i.size);
+wire signed [31:0] c2_rn  = (i.dst.kind == EK_AREG) ? $signed(rd_b) : sized_s(rd_b, i.size);
+wire signed [31:0] c2_lb  = sized_s(s_val, i.size);
+wire signed [31:0] c2_ub  = sized_s(d_val, i.size);
 wire c2_oob   = (c2_lb <= c2_ub) ? (c2_rn < c2_lb || c2_rn > c2_ub) : (c2_rn < c2_lb && c2_rn > c2_ub);
 wire divz     = (i.cls == CL_MULDIV) && i.imm[0] &&
-                ((i.size == SZ_W) ? (x_ord0.a[15:0] == 16'd0) : (x_ord0.a == 32'd0));
+                ((i.size == SZ_W) ? (dec_src[15:0] == 16'd0) : (dec_src == 32'd0));
 wire trap_u   = (i.cls == CL_CHK && (chk_v < 0 || chk_v > chk_b)) ||   // CHK: vector 6
                 (i.cls == CL_CHK2 && i.ext[11] && c2_oob) ||            // CHK2: vector 6
                 divz;                                                   // DIVx by zero: vector 5
@@ -502,7 +534,11 @@ wire [7:0] trap_vec = divz ? 8'd5 : trap_n ? 8'd7 : 8'd6;
 
 // MUL/DIV carry "divide by zero" in cc (EX then only clears C, 68040
 // DIVU/DIVS by zero: X N Z V kept, reference S_MDL_RDQ)
-wire ex_t  x_ord       = with_cc(x_ord0, (i.cls == CL_MULDIV) ? divz : br_cc);
+// CAS: the compare's equality is decided here, so EX's store data and Dc
+// value are selected by a register, not by its own compare (timing)
+wire       cas_eq = (i.size == SZ_B) ? (x_ord0.a[7:0] == x_ord0.b[7:0]) :
+                    (i.size == SZ_W) ? (x_ord0.a[15:0] == x_ord0.b[15:0]) : (x_ord0.a == x_ord0.b);
+wire ex_t  x_ord       = with_cc(x_ord0, (i.cls == CL_MULDIV) ? divz : (i.cls == CL_CAS) ? cas_eq : br_cc);
 
 function automatic logic [31:0] fsize(input logic [3:0] f);
 	case (f)
@@ -688,7 +724,9 @@ function automatic stp_t stepf(
 endfunction
 
 // reads never wait for older stores (store-to-load forwarding, above)
-wire stp_t st = stepf(ph, eac_valid, rst_pending, i, older_busy, 1'b1, rd_pend, rd_ack, cap,
+// a bitfield's read address uses the register file: no read while EX writes one of its registers
+wire bf_rdblk = is_bf && ex_haz;
+wire stp_t st = stepf(ph, eac_valid, rst_pending, i, older_busy, !bf_rdblk, rd_pend, rd_ack, cap,
                       s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, trap_n, trap_vec,
                       indexed_mode, two_uop, bf_step, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes);

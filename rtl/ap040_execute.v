@@ -274,15 +274,16 @@ always @* begin
 		end
 		CL_CAS: begin                     // equal: Du -> <ea>; else <ea> -> Dc
 			w.ccr_v = 1'b1; w.ccr_val = alu_flags;   // CMP <ea> - Dc
-			if (alu_flags[2]) begin
-				w.st_v = 1'b1; w.st_addr = x.daddr; w.st_data = x.c & szmask(x.size); w.st_size = x.size;
-			end else begin
-				w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = merge(x.a, x.b, x.size);   // x.dr = Dc
-				// the M68040 ends the locked sequence with a write of the value
-				// read (M68040UM 7.4.5 p. 7-26; PRM 4-68 note)
-				w.st_v = 1'b1; w.st_addr = x.daddr; w.st_data = x.b & szmask(x.size); w.st_size = x.size;
-				w.st_rb = 1'b1;
-			end
+			// Timing: which ports write must not depend on the compare (it is
+			// forwarded to EA-fetch).  So Dc is always written (with itself
+			// when equal) and there is always a store: Du when equal, else the
+			// M68040's write-back of the value read (M68040UM 7.4.5 p. 7-26).
+			w.w0_v = 1'b1; w.w0_r = x.dr;                 // x.dr = Dc
+			// x.cc: EA-fetch's equality (the same as the compare's Z)
+			w.w0_val = x.cc ? x.a : merge(x.a, x.b, x.size);
+			w.st_v = 1'b1; w.st_addr = x.daddr; w.st_size = x.size;
+			w.st_data = (x.cc ? x.c : x.b) & szmask(x.size);
+			w.st_rb = !x.cc;
 		end
 		CL_MULDIV: begin
 			if (x.cc) begin               // divide by zero: C cleared, then vector 5
@@ -293,9 +294,12 @@ always @* begin
 					ovf_w = md_ovf | (md_sgn ? (($signed(md_rlo) > 32'sd32767) || ($signed(md_rlo) < -32'sd32768))
 					                         : (md_rlo > 32'h0000_FFFF));
 					w.ccr_v = 1'b1;
-					if (ovf_w) w.ccr_val = {ccr_in[4:2], 1'b1, 1'b0};
+					// (overflow: Dq rewritten with itself -- the write ports do not
+					// depend on the result, which is forwarded)
+					w.w0_v = 1'b1; w.w0_r = x.dr;
+					if (ovf_w) begin w.ccr_val = {ccr_in[4:2], 1'b1, 1'b0}; w.w0_val = x.b; end
 					else begin
-						w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = {md_rhi[15:0], md_rlo[15:0]};
+						w.w0_val = {md_rhi[15:0], md_rlo[15:0]};
 						w.ccr_val = {ccr_in[4], md_rlo[15], (md_rlo[15:0] == 16'd0), 2'b00};
 					end
 				end else begin
@@ -305,11 +309,15 @@ always @* begin
 			end else if (md_div) begin
 				// 68040 divide overflow: V=1 C=0, N Z and the registers unchanged
 				w.ccr_v = 1'b1;
-				if (md_ovf) w.ccr_val = {ccr_in[4:2], 1'b1, 1'b0};
-				else begin
-					w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = md_rlo;           // quotient -> Dq
+				w.w0_v = 1'b1; w.w0_r = x.dr;
+				if (x.dr2 != x.dr) begin w.u1_v = 1'b1; w.u1_r = x.dr2; end
+				if (md_ovf) begin                    // registers rewritten with themselves
+					w.ccr_val = {ccr_in[4:2], 1'b1, 1'b0};
+					w.w0_val = x.b; w.u1_val = x.c;
+				end else begin
+					w.w0_val = md_rlo;                   // quotient -> Dq
 					w.ccr_val = {ccr_in[4], md_rlo[31], (md_rlo == 32'd0), 2'b00};
-					if (x.dr2 != x.dr) begin w.u1_v = 1'b1; w.u1_r = x.dr2; w.u1_val = md_rhi; end
+					w.u1_val = md_rhi;
 				end
 			end else begin
 				w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = md_rlo;               // low product -> Dl
