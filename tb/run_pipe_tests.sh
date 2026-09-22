@@ -53,7 +53,9 @@ if command -v vasmm68k_mot > /dev/null; then
 		[ -f "pipe_asm/$n.exp" ] || continue
 		( cd pipe_asm && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "../$WORK/$n.bin" "$n.s" ) || { echo "  FAIL  prog:$n (assembler)"; fail=1; continue; }
 		python3 bin2hex.py "$WORK/$n.bin" "$WORK/$n.hex"
-		if timeout 600 vvp "$WORK/tb_pipe_prog.vvp" +prog="$WORK/$n.hex" +expect="pipe_asm/$n.exp" > "$WORK/prog_$n.log" 2>&1 &&
+		# a program's "; diff: --cycles N" line sets its clock budget here too
+		cyc=$(sed -n 's/^; diff:.*--cycles \([0-9]*\).*/\1/p' "$s" | head -1)
+		if timeout 600 vvp "$WORK/tb_pipe_prog.vvp" +prog="$WORK/$n.hex" +expect="pipe_asm/$n.exp" +cycles=${cyc:-20000} > "$WORK/prog_$n.log" 2>&1 &&
 		   grep -q "ALL TESTS PASSED" "$WORK/prog_$n.log"; then
 			echo "  pass  prog:$n"
 		else
