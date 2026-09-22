@@ -159,14 +159,16 @@ wire eares_t sres = eacomp(id_i.src, id_i.size, r_sb, f_sb[31:0], f_si[31:0]);
 // the destination sees the source's update of the same register
 wire [31:0]  db_v = (sres.upd && r_sb == r_db) ? sres.nv : f_db[31:0];
 wire [31:0]  di_v = (sres.upd && r_sb == r_di) ? sres.nv : f_di[31:0];
-wire eares_t dres = eacomp(id_i.dst, id_i.size, r_db, db_v, di_v);
+wire eares_t dres = eacomp(id_i.dst, id_i.size2, r_db, db_v, di_v);   // size2: PACK/UNPK
 
 // the result register this instruction will write (w0), for the stages behind
 function automatic logic w0_of(input id_t i);
 	case (i.cls)
 		CL_ALU:  return (i.dst.kind == EK_DREG || i.dst.kind == EK_AREG) && !i.nowrite;
 		CL_DBCC: return 1'b1;
-		CL_SCC, CL_MOVEFSR: return i.dst.kind == EK_DREG;
+		CL_SCC, CL_MOVEFSR, CL_PACK, CL_UNPK: return i.dst.kind == EK_DREG;
+		CL_SHIFT, CL_BIT: return i.dst.kind == EK_DREG && !i.nowrite;
+		CL_MULDIV, CL_CAS: return 1'b1;
 		CL_LEA, CL_UNLK, CL_EXG: return 1'b1;
 		CL_MOVEC: return !i.imm[4] || i.imm[3:0] == CR_USP || i.imm[3:0] == CR_ISP || i.imm[3:0] == CR_MSP;
 		default: return 1'b0;
@@ -205,6 +207,12 @@ function automatic eac_t mk(input id_t i, input eares_t s, input eares_t d,
 		// RTR: SP <- SP+6 (CCR word and PC long read from (SP) and 2(SP))
 		CL_RTR: begin
 			o.u1_v = 1'b1; o.u1_r = resolve_sp(R_A7L, sb, mb); o.u1_val = s.ea + 32'd6;
+		end
+		// CAS: Dc (the source register) may be written with the memory value
+		CL_CAS: o.w0_r = rsb;
+		// MUL.L 64 / DIV.L with Dr != Dq: a second result register
+		CL_MULDIV: if (i.imm[2] && i.reg_c != rdb && (i.imm[0] || i.imm[3])) begin
+			o.w1_v = 1'b1; o.w1_r = i.reg_c;
 		end
 		// EXG Rx,Ry: Rx <- Ry (w0), Ry <- Rx (w1; EA-fetch knows its value)
 		CL_EXG: begin

@@ -205,7 +205,11 @@ localparam [5:0]
 	F_EXT = 6'd20, F_SWAP = 6'd21, F_PEA = 6'd22, F_LEA = 6'd23, F_LINK = 6'd24,
 	F_UNLK = 6'd25, F_RTD = 6'd26, F_RTR = 6'd27, F_MOVEFCCR = 6'd28, F_MOVEFSR = 6'd29,
 	F_MOVE2CCR = 6'd30, F_ADDQ = 6'd31, F_EA_DN = 6'd32, F_DN_EA = 6'd33, F_ADDA = 6'd34,
-	F_ADDX = 6'd35, F_CMPM = 6'd36, F_EXG = 6'd37;
+	F_ADDX = 6'd35, F_CMPM = 6'd36, F_EXG = 6'd37,
+	F_BITD = 6'd38, F_BITS = 6'd39, F_CAS = 6'd40, F_CAS2 = 6'd41, F_CHK2 = 6'd42,
+	F_CHK = 6'd43, F_TAS = 6'd44, F_NBCD = 6'd45, F_MDW = 6'd46, F_MDL = 6'd47,
+	F_TRAPCC = 6'd48, F_BCD = 6'd49, F_PACK = 6'd50, F_UNPK = 6'd51, F_SHR = 6'd52,
+	F_SHM = 6'd53, F_BF = 6'd54;
 
 // What an opcode word implies about the words that follow it.
 typedef struct packed {
@@ -231,6 +235,16 @@ function automatic logic [5:0] grp_alu(input logic [3:0] g, input logic eor);
 	endcase
 endfunction
 
+// shift/rotate ALU op from the type field and the direction bit
+function automatic logic [5:0] shift_alu(input logic [1:0] t, input logic left);
+	case (t)
+		2'b00:   return left ? `AP040_ALU_ASL1  : `AP040_ALU_ASR1;
+		2'b01:   return left ? `AP040_ALU_LSL1  : `AP040_ALU_LSR1;
+		2'b10:   return left ? `AP040_ALU_ROXL1 : `AP040_ALU_ROXR1;
+		default: return left ? `AP040_ALU_ROL1  : `AP040_ALU_ROR1;
+	endcase
+endfunction
+
 function automatic shape_t shape(input logic [15:0] op);
 	shape_t s;
 	logic [1:0] ss;
@@ -249,6 +263,43 @@ function automatic shape_t shape(input logic [15:0] op);
 		16'h007C, 16'h027C, 16'h0A7C: begin      // ORI/ANDI/EORI #,SR
 			s.ok = 1'b1; s.form = F_IMMSR; s.npre = 2'd1; s.sz = SZ_W;
 			s.alu = (op[11:9] == 3'd0) ? `AP040_ALU_OR : (op[11:9] == 3'd1) ? `AP040_ALU_AND : `AP040_ALU_EOR;
+		end
+		16'b0000_1000_11??_????: begin           // BSET #,<ea> (before CAS: 0000 1ss0 11, ss=00 is BSET)
+			s.form = F_BITS; s.npre = 2'd1; s.has_dst = 1'b1;
+			s.sz = (s.dm == 3'd0) ? SZ_L : SZ_B; s.alu = `AP040_ALU_BSET;
+			s.ok = ea_ok(s.dm, s.dr, 1'b1, 1'b0, 1'b0, 1'b1);
+		end
+		16'b0000_1??0_1111_1100: begin           // CAS2 (W/L): two extension words
+			s.form = F_CAS2; s.npre = 2'd2; s.ok = 1'b0;   // not yet (M3 tail)
+		end
+		16'b0000_1??0_11??_????: begin           // CAS Dc,Du,<memory alterable>
+			s.form = F_CAS; s.npre = 2'd1; s.has_dst = 1'b1; s.alu = `AP040_ALU_CMP;
+			s.sz = (op[10:9] == 2'b01) ? SZ_B : (op[10:9] == 2'b10) ? SZ_W : SZ_L;
+			s.ok = (op[10:9] != 2'b00) && ea_ok(s.dm, s.dr, 1'b0, 1'b1, 1'b0, 1'b1);
+		end
+		16'b0000_0??0_11??_????: begin           // CHK2 / CMP2 <control>,Rn
+			s.form = F_CHK2; s.npre = 2'd1; s.has_src = 1'b1;
+			s.sz = op[10:9];
+			s.ok = (op[10:9] != 2'b11) && ea_ok(s.sm, s.sr, 1'b0, 1'b0, 1'b1, 1'b0);
+		end
+		16'b0000_1000_????_????: begin           // BTST/BCHG/BCLR/BSET #,<ea>
+			s.form = F_BITS; s.npre = 2'd1; s.has_dst = 1'b1;
+			s.sz = (s.dm == 3'd0) ? SZ_L : SZ_B;
+			s.alu = (op[7:6] == 2'd0) ? `AP040_ALU_BTST : (op[7:6] == 2'd1) ? `AP040_ALU_BCHG :
+			        (op[7:6] == 2'd2) ? `AP040_ALU_BCLR : `AP040_ALU_BSET;
+			// BTST #,<ea>: data except #imm (PC relative allowed); the others data alterable
+			s.ok = (op[7:6] == 2'd0) ? (ea_ok(s.dm, s.dr, 1'b1, 1'b0, 1'b0, 1'b0) && !(s.dm == 3'd7 && s.dr == 3'd4))
+			                         : ea_ok(s.dm, s.dr, 1'b1, 1'b0, 1'b0, 1'b1);
+		end
+		16'b0000_???1_??00_1???: s.ok = 1'b0;   // MOVEP (M4)
+		16'b0000_???1_????_????: begin           // BTST/BCHG/BCLR/BSET Dn,<ea>
+			s.form = F_BITD; s.has_dst = 1'b1;
+			s.sz = (s.dm == 3'd0) ? SZ_L : SZ_B;
+			s.alu = (op[7:6] == 2'd0) ? `AP040_ALU_BTST : (op[7:6] == 2'd1) ? `AP040_ALU_BCHG :
+			        (op[7:6] == 2'd2) ? `AP040_ALU_BCLR : `AP040_ALU_BSET;
+			// BTST Dn,<ea>: any data EA incl. #imm and PC relative
+			s.ok = (op[7:6] == 2'd0) ? ea_ok(s.dm, s.dr, 1'b1, 1'b0, 1'b0, 1'b0)
+			                         : ea_ok(s.dm, s.dr, 1'b1, 1'b0, 1'b0, 1'b1);
 		end
 		16'b0000_???0_????_????: begin           // ORI ANDI SUBI ADDI EORI CMPI #,<ea>
 			if (ss != 2'b11 && op[11:9] != 3'd4 && op[11:9] != 3'd7) begin
@@ -308,7 +359,24 @@ function automatic shape_t shape(input logic [15:0] op);
 		16'b0100_1000_1000_0???: begin s.ok = 1'b1; s.form = F_EXT; s.sz = SZ_W; s.alu = `AP040_ALU_EXT; end
 		16'b0100_1000_1100_0???: begin s.ok = 1'b1; s.form = F_EXT; s.sz = SZ_L; s.alu = `AP040_ALU_EXT; end
 		16'b0100_1001_1100_0???: begin s.ok = 1'b1; s.form = F_EXT; s.sz = SZ_L; s.alu = `AP040_ALU_EXTB; end
-		16'b0100_1010_11??_????: s.ok = 1'b0;   // TAS / ILLEGAL: M3 (ILLEGAL is vector 4 either way)
+		16'h4AFC: s.ok = 1'b0;                   // ILLEGAL (vector 4)
+		16'b0100_1010_11??_????: begin           // TAS <data alterable>
+			s.form = F_TAS; s.sz = SZ_B; s.has_dst = 1'b1; s.alu = `AP040_ALU_TAS;
+			s.ok = ea_ok(s.dm, s.dr, 1'b1, 1'b0, 1'b0, 1'b1);
+		end
+		16'b0100_1000_00??_????: begin           // NBCD <data alterable> (mode 001 = LINK.L, above)
+			s.form = F_NBCD; s.sz = SZ_B; s.has_dst = 1'b1; s.alu = `AP040_ALU_NBCD;
+			s.ok = ea_ok(s.dm, s.dr, 1'b1, 1'b0, 1'b0, 1'b1);
+		end
+		16'b0100_1100_00??_????, 16'b0100_1100_01??_????: begin   // MUL.L / DIV.L <data>
+			s.form = F_MDL; s.npre = 2'd1; s.has_src = 1'b1; s.sz = SZ_L;
+			s.ok = ea_ok(s.sm, s.sr, 1'b1, 1'b0, 1'b0, 1'b0);
+		end
+		16'b0100_???1_10??_????, 16'b0100_???1_00??_????: begin   // CHK.W / CHK.L <data>,Dn
+			s.form = F_CHK; s.has_src = 1'b1; s.sz = op[7] ? SZ_W : SZ_L;
+			s.ok = ea_ok(s.sm, s.sr, 1'b1, 1'b0, 1'b0, 1'b0);
+		end
+		16'h4E76: begin s.ok = 1'b1; s.form = F_TRAPCC; end    // TRAPV
 		16'b0100_1010_????_????: begin           // TST <ea> (68020+: An for W/L, #imm, PC relative)
 			s.form = F_TST; s.sz = ss; s.has_src = 1'b1; s.alu = `AP040_ALU_TST;
 			s.ok = ea_ok(s.sm, s.sr, 1'b0, 1'b0, 1'b0, 1'b0) && !(ss == SZ_B && s.sm == 3'd1);
@@ -332,6 +400,9 @@ function automatic shape_t shape(input logic [15:0] op);
 		16'h4E75: begin s.ok = 1'b1; s.form = F_RTS; end
 		//------------------------------------------------ group 5
 		16'b0101_????_1100_1???: begin s.ok = 1'b1; s.form = F_DBCC; s.npre = 2'd1; end
+		16'b0101_????_1111_1010: begin s.ok = 1'b1; s.form = F_TRAPCC; s.npre = 2'd1; end   // TRAPcc.W
+		16'b0101_????_1111_1011: begin s.ok = 1'b1; s.form = F_TRAPCC; s.npre = 2'd2; end   // TRAPcc.L
+		16'b0101_????_1111_1100: begin s.ok = 1'b1; s.form = F_TRAPCC; end                 // TRAPcc
 		16'b0101_????_11??_????: begin           // Scc <data alterable>
 			s.form = F_SCC; s.sz = SZ_B; s.has_dst = 1'b1;
 			s.ok = ea_ok(s.dm, s.dr, 1'b1, 1'b0, 1'b0, 1'b1);
@@ -363,7 +434,18 @@ function automatic shape_t shape(input logic [15:0] op);
 			s.form = F_ADDX; s.sz = ss; s.ok = (ss != 2'b11);
 			s.alu = op[14] ? `AP040_ALU_ADDX : `AP040_ALU_SUBX;
 		end
-		16'b1000_???1_??00_????, 16'b1100_???1_??00_????: s.ok = 1'b0;  // SBCD/PACK/UNPK, ABCD: M3
+		16'b1000_???0_11??_????, 16'b1000_???1_11??_????,
+		16'b1100_???0_11??_????, 16'b1100_???1_11??_????: begin   // DIVU/DIVS.W, MULU/MULS.W <data>,Dn
+			s.form = F_MDW; s.has_src = 1'b1; s.sz = SZ_W;
+			s.ok = ea_ok(s.sm, s.sr, 1'b1, 1'b0, 1'b0, 1'b0);
+		end
+		16'b1000_???1_0000_????, 16'b1100_???1_0000_????: begin   // SBCD / ABCD (Dy,Dx or -(Ay),-(Ax))
+			s.ok = 1'b1; s.form = F_BCD; s.sz = SZ_B;
+			s.alu = op[14] ? `AP040_ALU_ABCD : `AP040_ALU_SBCD;
+		end
+		16'b1000_???1_0100_????: begin s.ok = 1'b1; s.form = F_PACK; s.npre = 2'd1; end
+		16'b1000_???1_1000_????: begin s.ok = 1'b1; s.form = F_UNPK; s.npre = 2'd1; end
+		16'b1000_???1_??00_????, 16'b1100_???1_??00_????: s.ok = 1'b0;  // reserved
 		16'b1000_????_????_????, 16'b1001_????_????_????, 16'b1011_????_????_????,
 		16'b1100_????_????_????, 16'b1101_????_????_????: begin
 			if (ss != 2'b11) begin
@@ -380,6 +462,19 @@ function automatic shape_t shape(input logic [15:0] op);
 					                           : ea_ok(s.dm, s.dr, 1'b0, 1'b1, 1'b0, 1'b1);
 				end
 			end
+		end
+		//------------------------------------------------ group E: shifts, bitfields
+		16'b1110_1???_11??_????: begin           // bitfields: extension word first
+			s.form = F_BF; s.npre = 2'd1; s.has_dst = 1'b1; s.ok = 1'b0;   // not yet (M3 tail)
+		end
+		16'b1110_0???_11??_????: begin           // memory shift/rotate by one, word
+			s.form = F_SHM; s.sz = SZ_W; s.has_dst = 1'b1;
+			s.alu = shift_alu(op[10:9], op[8]);
+			s.ok = ea_ok(s.dm, s.dr, 1'b0, 1'b1, 1'b0, 1'b1);
+		end
+		16'b1110_????_????_????: begin           // register shift/rotate
+			s.ok = 1'b1; s.form = F_SHR; s.sz = ss;
+			s.alu = shift_alu(op[4:3], op[8]);
 		end
 		default: s.ok = 1'b0;
 	endcase
@@ -480,11 +575,15 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 	int tot;
 	logic [15:0] op, x1;
 	logic [31:0] ipre;
+	logic        s2set;        // the destination EA has its own size (size2)
+	logic [1:0]  s2;
 	int ks, kd; elen_t e;
 	tot = tot_w;
 	op = vbuf[0];
 	x1 = vbuf[1];
 	d = '0;
+	s2set = 1'b0; s2 = SZ_L;
+	d.reg_c = R_NONE;
 	d.pc = vpc;
 	d.next_pc = vpc + 32'(2 * tot);
 	d.opcode = op;
@@ -557,6 +656,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 			end
 			F_RTR: begin                        // CCR from (SP), PC from 2(SP), SP += 6
 				d.cls = CL_RTR; d.size = SZ_W; d.src = ea_sp(UPD_NONE, 32'd0);
+				s2set = 1'b1; s2 = SZ_L;         // the PC at 2(SP) is a long
 				d.dst = ea_sp(UPD_NONE, 32'd2); d.rmw = 1'b1;
 			end
 			F_MOVEFCCR: begin d.cls = CL_MOVEFSR; d.ccr_only = 1'b1; end
@@ -606,6 +706,77 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					5'b01001: begin d.src = ea_reg(EK_AREG, {2'b01, op[11:9]}); d.dst = ea_reg(EK_AREG, {2'b01, op[2:0]}); end
 					default:  begin d.src = ea_reg(EK_DREG, {2'b00, op[11:9]}); d.dst = ea_reg(EK_AREG, {2'b01, op[2:0]}); end
 				endcase
+			end
+			//-------------------------------------------- M3
+			F_BITD, F_BITS: begin               // bit number from Dn or #; mod 32 (Dn) / 8 (memory) in EX
+				d.cls = CL_BIT; d.wr_ccr = 1'b1; d.rmw = 1'b1;
+				d.src = (sh.form == F_BITD) ? ea_reg(EK_DREG, {2'b00, op[11:9]}) : ea_imm({24'd0, x1[7:0]});
+				d.nowrite = (sh.alu == `AP040_ALU_BTST);
+			end
+			F_CAS: begin                        // CAS Dc,Du,<ea>: Dc = src, Du = reg_c
+				d.cls = CL_CAS; d.wr_ccr = 1'b1; d.rmw = 1'b1;
+				d.src = ea_reg(EK_DREG, {2'b00, x1[2:0]});
+				d.reg_c = {2'b00, x1[8:6]};
+			end
+			F_CHK2: begin                       // bounds at <ea>, <ea>+size; Rn from the ext word
+				d.cls = CL_CHK2; d.wr_ccr = 1'b1; d.nowrite = 1'b1;
+				d.dst = ea_reg(x1[15] ? EK_AREG : EK_DREG, {1'b0, x1[15], x1[14:12]});
+			end
+			F_CHK: begin                        // bound = src, Dn = dst (read only)
+				d.cls = CL_CHK; d.wr_ccr = 1'b1; d.nowrite = 1'b1;
+				d.dst = ea_reg(EK_DREG, {2'b00, op[11:9]});
+			end
+			F_TAS, F_NBCD: begin d.cls = CL_ALU; d.wr_ccr = 1'b1; d.rmw = 1'b1; end
+			F_MDW: begin                        // 16 x 16 -> 32, 32 / 16 -> 16r:16q
+				d.cls = CL_MULDIV; d.wr_ccr = 1'b1;
+				d.dst = ea_reg(EK_DREG, {2'b00, op[11:9]});
+				d.imm[0] = !op[14];             // divide (group 8)
+				d.imm[1] = op[8];               // signed
+			end
+			F_MDL: begin                        // MUL.L / DIV.L: Dl/Dq in ext 14:12, Dh/Dr in 2:0
+				d.cls = CL_MULDIV; d.wr_ccr = 1'b1;
+				d.dst = ea_reg(EK_DREG, {2'b00, x1[14:12]});
+				d.reg_c = {2'b00, x1[2:0]};
+				d.imm[0] = op[6];               // divide
+				d.imm[1] = x1[11];              // signed
+				d.imm[2] = 1'b1;                // long form
+				d.imm[3] = x1[10];              // 64-bit (Dh:Dl product / Dr:Dq dividend)
+			end
+			F_TRAPCC: begin
+				d.cls = CL_TRAPCC;
+				if (op == 16'h4E76) d.cond = 4'h9;   // TRAPV: V set
+			end
+			F_BCD: begin                        // ABCD/SBCD Dy,Dx or -(Ay),-(Ax)
+				d.cls = CL_ALU; d.wr_ccr = 1'b1; d.rmw = 1'b1;
+				if (!op[3]) begin
+					d.src = ea_reg(EK_DREG, {2'b00, op[2:0]});
+					d.dst = ea_reg(EK_DREG, {2'b00, op[11:9]});
+				end else begin
+					d.src = ea_build(3'd4, op[2:0], SZ_B, vbuf, 1, vpc);
+					d.dst = ea_build(3'd4, op[11:9], SZ_B, vbuf, 1, vpc);
+				end
+			end
+			F_PACK, F_UNPK: begin               // Dy,Dx,#adj or -(Ay),-(Ax),#adj
+				d.cls = (sh.form == F_PACK) ? CL_PACK : CL_UNPK;
+				d.imm = {16'd0, x1};
+				d.size = (sh.form == F_PACK) ? SZ_W : SZ_B;    // the source
+				s2set = 1'b1; s2 = (sh.form == F_PACK) ? SZ_B : SZ_W;   // the destination
+				if (!op[3]) begin
+					d.src = ea_reg(EK_DREG, {2'b00, op[2:0]});
+					d.dst = ea_reg(EK_DREG, {2'b00, op[11:9]});
+				end else begin
+					d.src = ea_build(3'd4, op[2:0], d.size, vbuf, 1, vpc);
+					d.dst = ea_build(3'd4, op[11:9], s2, vbuf, 1, vpc);
+				end
+			end
+			F_SHR: begin                        // count #1-8 or Dn (mod 64), Dn destination
+				d.cls = CL_SHIFT; d.wr_ccr = 1'b1; d.rmw = 1'b1;
+				d.src = op[5] ? ea_reg(EK_DREG, {2'b00, op[11:9]}) : ea_imm({28'd0, (op[11:9] == 3'd0), op[11:9]});
+				d.dst = ea_reg(EK_DREG, {2'b00, op[2:0]});
+			end
+			F_SHM: begin                        // <ea> by one, word
+				d.cls = CL_SHIFT; d.wr_ccr = 1'b1; d.rmw = 1'b1;
+				d.src = ea_imm(32'd1);
 			end
 			F_BCC: begin                        // Bcc / BRA / BSR
 				d.cls = (op[11:8] == 4'h1) ? CL_BSR : CL_BCC;
@@ -666,6 +837,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 	// an illegal instruction is one word long for PC purposes
 	if (d.cls == CL_EXC && !d.exc_next && d.exc_fmt == 4'd0) d.next_pc = vpc + 32'd2;
 	if (d.cls == CL_EXC) d.serialize = 1'b1;
+	d.size2 = s2set ? s2 : d.size;
 	return d;
 endfunction
 

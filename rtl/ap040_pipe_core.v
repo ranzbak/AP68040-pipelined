@@ -112,8 +112,8 @@ assign dbg_ccr = sr[4:0];
 assign dbg_sr  = sr;
 
 //--------------------------------------------------------------- register file
-wire [4:0]  ra_sb, ra_si, ra_db, ra_di, ra_a, ra_b;
-wire [31:0] rd_sb, rd_si, rd_db, rd_di, rd_a, rd_b;
+wire [4:0]  ra_sb, ra_si, ra_db, ra_di, ra_a, ra_b, ra_c;
+wire [31:0] rd_sb, rd_si, rd_db, rd_di, rd_a, rd_b, rd_c;
 wire [31:0] usp_q, isp_q, msp_q;
 
 ap040_pipe_regfile u_regfile
@@ -122,8 +122,8 @@ ap040_pipe_regfile u_regfile
 	.w0_we(commit && exe_o.w0_v), .w0_r(exe_o.w0_r), .w0_d(exe_o.w0_val),
 	.u1_we(commit && exe_o.u1_v), .u1_r(exe_o.u1_r), .u1_d(exe_o.u1_val),
 	.u0_we(commit && exe_o.u0_v), .u0_r(exe_o.u0_r), .u0_d(exe_o.u0_val),
-	.ra0(ra_sb), .ra1(ra_si), .ra2(ra_db), .ra3(ra_di), .ra4(ra_a), .ra5(ra_b),
-	.rd0(rd_sb), .rd1(rd_si), .rd2(rd_db), .rd3(rd_di), .rd4(rd_a), .rd5(rd_b),
+	.ra0(ra_sb), .ra1(ra_si), .ra2(ra_db), .ra3(ra_di), .ra4(ra_a), .ra5(ra_b), .ra6(ra_c),
+	.rd0(rd_sb), .rd1(rd_si), .rd2(rd_db), .rd3(rd_di), .rd4(rd_a), .rd5(rd_b), .rd6(rd_c),
 	.usp_q(usp_q), .isp_q(isp_q), .msp_q(msp_q),
 	.dbg_d0(dbg_d0), .dbg_d1(dbg_d1), .dbg_d2(dbg_d2), .dbg_d3(dbg_d3),
 	.dbg_d4(dbg_d4), .dbg_d5(dbg_d5), .dbg_d6(dbg_d6), .dbg_d7(dbg_d7)
@@ -228,7 +228,7 @@ ap040_ea_fetch u_eaf
 	.older_busy(older_busy), .older_store(older_store),
 	.reset_seq(RESET_FROM_VECTORS != 0),
 	.early_v(early_v), .early(early_rd),
-	.ra_a(ra_a), .ra_b(ra_b), .rd_a(rd_a), .rd_b(rd_b),
+	.ra_a(ra_a), .ra_b(ra_b), .ra_c(ra_c), .rd_a(rd_a), .rd_b(rd_b), .rd_c(rd_c),
 	.ex_w0_v(fw_w0_v), .ex_w0_r(fw_w0_r), .ex_w0_val(fw_w0_val),
 	.ex_u0_v(eaf_valid && (eaf_o.u0_v || eaf_o.sp_v)), .ex_u0_r(eaf_o.sp_v ? eaf_o.sp_r : eaf_o.u0_r),
 	.ex_u0_val(eaf_o.sp_v ? eaf_o.sp_val : eaf_o.u0_val),

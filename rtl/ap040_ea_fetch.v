@@ -58,8 +58,8 @@ module ap040_ea_fetch
 	input  rdreq_t    early,
 
 	// register reads (with the regfile's WB write-through)
-	output      [4:0] ra_a, ra_b,
-	input      [31:0] rd_a, rd_b,
+	output      [4:0] ra_a, ra_b, ra_c,
+	input      [31:0] rd_a, rd_b, rd_c,
 	// EX-stage writes, forwarded
 	input             ex_w0_v, input [4:0] ex_w0_r, input [31:0] ex_w0_val,
 	input             ex_u0_v, input [4:0] ex_u0_r, input [31:0] ex_u0_val,
@@ -152,6 +152,10 @@ endfunction
 wire [31:0] op_a = fwd(ra_a, rd_a, ex_w0_v, ex_w0_r, ex_w0_val, ex_u0_v, ex_u0_r, ex_u0_val,
                        ex_u1_v, ex_u1_r, ex_u1_val);
 // the destination register sees this instruction's own source update
+// the third register operand (CAS Du, DIV.L Dr): no A7, no own update
+assign ra_c = eac_i.i.reg_c;
+wire [31:0] op_c = fwd(ra_c, rd_c, ex_w0_v, ex_w0_r, ex_w0_val, ex_u0_v, ex_u0_r, ex_u0_val,
+                       ex_u1_v, ex_u1_r, ex_u1_val);
 wire [31:0] op_b = (eac_i.u0_v && eac_i.u0_r == ra_b) ? eac_i.u0_val :
                    fwd(ra_b, rd_b, ex_w0_v, ex_w0_r, ex_w0_val, ex_u0_v, ex_u0_r, ex_u0_val,
                        ex_u1_v, ex_u1_r, ex_u1_val);
@@ -159,12 +163,15 @@ wire [31:0] op_b = (eac_i.u0_v && eac_i.u0_r == ra_b) ? eac_i.u0_val :
 //--------------------------------------------------------------- ordinary instructions
 wire addr_only    = (i.cls == CL_JMP || i.cls == CL_JSR || i.cls == CL_LEA || i.cls == CL_PEA);
 wire needs_ld_src = (i.src.kind == EK_MEM) && !addr_only;
-wire needs_ld_dst = (i.dst.kind == EK_MEM) && i.rmw;
+// CHK2/CMP2 read the upper bound from <ea>+size into the "destination" load
+wire needs_ld_dst = ((i.dst.kind == EK_MEM) && i.rmw) || (i.cls == CL_CHK2);
 wire need_smi = (i.src.kind == EK_MEM) && (i.src.mi != MI_NONE);
 wire need_dmi = (i.dst.kind == EK_MEM) && (i.dst.mi != MI_NONE);
 
 wire [31:0] s_addr_now = done_smi ? s_addr : eac_i.src_ea;
-wire [31:0] d_addr_now = done_dmi ? d_addr : eac_i.dst_ea;
+wire [31:0] d_addr_now = done_dmi ? d_addr :
+                         (i.cls == CL_CHK2) ? s_addr_now + ((i.size == SZ_B) ? 32'd1 : (i.size == SZ_W) ? 32'd2 : 32'd4) :
+                         eac_i.dst_ea;
 
 // next read the instruction needs: {valid, tag, addr, size}
 function automatic rdreq_t next_rd(input logic nsmi, input logic dsmi, input logic ndmi, input logic ddmi,
@@ -184,7 +191,7 @@ endfunction
 // RTR's second read (the PC at 2(SP)) is a long, its first (the CCR) a word
 wire rdreq_t nx = next_rd(need_smi, done_smi, need_dmi, done_dmi, needs_ld_src, done_sld, needs_ld_dst, done_dld,
                           eac_i.src_ea, eac_i.dst_ea, s_addr_now, d_addr_now, i.size,
-                          (i.cls == CL_RTR) ? SZ_L : i.size);
+                          (i.cls == CL_CHK2) ? i.size : i.size2);
 
 // Store-to-load forwarding.  The memory answers with what it held at the
 // clock edge ending the read's issue clock (a store committing on that edge
@@ -229,6 +236,7 @@ function automatic ex_t base_uop(input id_t i);
 endfunction
 
 function automatic ex_t xord(input eac_t e, input logic [31:0] opa, input logic [31:0] opb,
+                             input logic [31:0] opc,
                              input logic [31:0] sa, input logic [31:0] sv,
                              input logic [31:0] da, input logic [31:0] dv);
 	ex_t x;
@@ -238,6 +246,12 @@ function automatic ex_t xord(input eac_t e, input logic [31:0] opa, input logic 
 	x.wr_ccr   = i.wr_ccr;
 	x.nowrite  = i.nowrite;
 	x.ccr_only = i.ccr_only;
+	x.ext      = i.ext;
+	x.dr2      = i.reg_c;
+	// the third operand: CAS Du / DIV.L Dr (register), CHK2's upper bound
+	// (the second load), PACK/UNPK's adjustment
+	x.c = (i.cls == CL_CHK2) ? dv : (i.cls == CL_PACK || i.cls == CL_UNPK) ? i.imm : opc;
+	if (i.cls == CL_MULDIV) x.imm4 = i.imm[3:0];
 	case (i.src.kind)
 		EK_DREG, EK_AREG: x.a = opa;
 		EK_IMM:           x.a = i.src.bd;
@@ -247,6 +261,7 @@ function automatic ex_t xord(input eac_t e, input logic [31:0] opa, input logic 
 	case (i.dst.kind)
 		EK_DREG, EK_AREG: begin x.b = opb; x.dk = DK_REG; x.dr = e.dst_r; end
 		EK_MEM:           begin x.b = dv;  x.dk = DK_MEM; x.daddr = da; end
+		EK_IMM:           x.b = i.dst.bd;                // BTST Dn,#imm
 		default: ;
 	endcase
 	x.u0_v = e.u0_v; x.u0_r = e.u0_r; x.u0_val = e.u0_val;
@@ -261,6 +276,7 @@ function automatic ex_t xord(input eac_t e, input logic [31:0] opa, input logic 
 		// An -> (SP)), i.e. the push address
 		CL_LINK:        x.a = (e.src_r == e.dst_r) ? da : opa;
 		// EXG: Rx <- Ry (w0), Ry <- Rx (u0: the value is known here)
+		CL_CAS: x.dr = e.src_r;           // Dc, written when the compare fails
 		CL_EXG: begin
 			x.dk = DK_REG; x.dr = e.src_r;
 			x.u0_v = 1'b1; x.u0_r = e.dst_r; x.u0_val = opa;
@@ -283,7 +299,7 @@ function automatic ex_t xord(input eac_t e, input logic [31:0] opa, input logic 
 	return x;
 endfunction
 
-wire ex_t x_ord0 = xord(eac_i, op_a, op_b, s_addr_c, s_val_c, d_addr_c, d_val_c);
+wire ex_t x_ord0 = xord(eac_i, op_a, op_b, op_c, s_addr_c, s_val_c, d_addr_c, d_val_c);
 function automatic ex_t with_cc(input ex_t x, input logic c);
 	ex_t y;
 	y = x; y.cc = c;
@@ -291,7 +307,30 @@ function automatic ex_t with_cc(input ex_t x, input logic c);
 endfunction
 wire [4:0] ex_ccr_here = ex_ccr_v ? ex_ccr : sr_in[4:0];
 wire       br_cc       = cond_true(i.cond, ex_ccr_here);
-wire ex_t  x_ord       = with_cc(x_ord0, br_cc);
+
+// M3 traps, decided here where every operand is in hand (M68040UM 8.2.3
+// p. 8-8: format $2, stacked PC = the next instruction, address field = the
+// trapping one).  An (An)+/-(An) update of the trapping instruction stands.
+function automatic logic signed [31:0] sized_s(input logic [31:0] v, input logic [1:0] sz);
+	return (sz == SZ_B) ? $signed(sext8(v[7:0])) : (sz == SZ_W) ? $signed(sext16(v[15:0])) : $signed(v);
+endfunction
+wire signed [31:0] chk_v  = sized_s(op_b, i.size);
+wire signed [31:0] chk_b  = sized_s(x_ord0.a, i.size);
+wire signed [31:0] c2_rn  = (i.dst.kind == EK_AREG) ? $signed(op_b) : sized_s(op_b, i.size);
+wire signed [31:0] c2_lb  = sized_s(x_ord0.a, i.size);
+wire signed [31:0] c2_ub  = sized_s(x_ord0.c, i.size);
+wire c2_oob   = (c2_lb <= c2_ub) ? (c2_rn < c2_lb || c2_rn > c2_ub) : (c2_rn < c2_lb && c2_rn > c2_ub);
+wire divz     = (i.cls == CL_MULDIV) && i.imm[0] &&
+                ((i.size == SZ_W) ? (x_ord0.a[15:0] == 16'd0) : (x_ord0.a == 32'd0));
+wire trap_u   = (i.cls == CL_CHK && (chk_v < 0 || chk_v > chk_b)) ||   // CHK: vector 6
+                (i.cls == CL_CHK2 && i.ext[11] && c2_oob) ||            // CHK2: vector 6
+                divz;                                                   // DIVx by zero: vector 5
+wire trap_n   = (i.cls == CL_TRAPCC) && br_cc;                        // TRAPcc/TRAPV: vector 7
+wire [7:0] trap_vec = divz ? 8'd5 : trap_n ? 8'd7 : 8'd6;
+
+// MUL/DIV carry "divide by zero" in cc (EX then only clears C, 68040
+// DIVU/DIVS by zero: X N Z V kept, reference S_MDL_RDQ)
+wire ex_t  x_ord       = with_cc(x_ord0, (i.cls == CL_MULDIV) ? divz : br_cc);
 
 function automatic logic [31:0] fsize(input logic [3:0] f);
 	case (f)
@@ -376,6 +415,7 @@ function automatic stp_t stepf(
 	input logic older_busy, input logic can_rd, input logic rd_pend, input logic rd_ack, input logic cap,
 	input logic s_bit, input logic stall,
 	input rdreq_t nx, input logic ops_done, input logic jmp_odd, input logic rts_odd, input logic rtr_odd,
+	input logic trap_u, input logic trap_n, input logic [7:0] trap_vec,
 	input logic indexed,
 	input logic [31:0] s_addr_c, input logic [31:0] s_val_c, input logic [31:0] d_val_c,
 	input logic [2:0] x_step, input logic [31:0] vbr, input logic [7:0] x_vec, input logic [31:0] x_target,
@@ -408,6 +448,17 @@ function automatic stp_t stepf(
 						// the pop is backed out (reference S_RET2): no micro-op, SP untouched
 						s.exc_go = 1'b1; s.ev = 8'd3; s.ef = 4'd2;
 						s.epc = i.pc; s.eaddr = {s_val_c[31:1], 1'b0};
+					end else if (trap_u) begin
+						// CHK/CHK2/DIV by zero: the micro-op (flags; An updates stand)
+						// commits, then the trap is taken with that SR
+						if (!stall) begin
+							s.disp = 1'b1; s.dsel = 3'd6;
+							s.exc_go = 1'b1; s.ev = trap_vec; s.ef = 4'd2;
+							s.epc = i.next_pc; s.eaddr = i.pc;
+						end
+					end else if (trap_n) begin
+						s.exc_go = 1'b1; s.ev = trap_vec; s.ef = 4'd2;
+						s.epc = i.next_pc; s.eaddr = i.pc;
 					end else if (rtr_odd) begin
 						// RTR to an odd PC: the popped CCR stands, SP does not move, and
 						// the frame stacks the SR with that CCR (reference S_RET3)
@@ -465,7 +516,8 @@ endfunction
 
 // reads never wait for older stores (store-to-load forwarding, above)
 wire stp_t st = stepf(ph, eac_valid, rst_pending, i, older_busy, 1'b1, rd_pend, rd_ack, cap,
-                      s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, indexed_mode, s_addr_c, s_val_c,
+                      s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, trap_n, trap_vec,
+                      indexed_mode, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes);
 
 // RTR to an odd PC: the CCR alone commits
@@ -475,14 +527,22 @@ function automatic ex_t ccr_only_uop(input ex_t x);
 	return y;
 endfunction
 
+// a trapping CHK/CHK2/DIV: the micro-op commits, the exception follows
+function automatic ex_t no_last(input ex_t x);
+	ex_t y;
+	y = x; y.redirect = 1'b0; y.last = 1'b0;
+	return y;
+endfunction
+
 function automatic ex_t dmux(input logic [2:0] sel, input ex_t o, input ex_t f, input ex_t e,
-                             input ex_t r, input ex_t z, input ex_t c);
+                             input ex_t r, input ex_t z, input ex_t c, input ex_t n);
 	case (sel)
 		3'd0: return o;
 		3'd1: return f;
 		3'd2: return e;
 		3'd3: return r;
 		3'd5: return c;
+		3'd6: return n;
 		default: return z;
 	endcase
 endfunction
@@ -492,7 +552,8 @@ wire ex_t disp_x = dmux(st.dsel, x_ord,
                         exc_final(i, x_bank, x_sp, x_sr, x_target),
                         rte_final(i, bank_now, rd_a, r_fv, r_sr, r_pc),
                         reset_final(i, x_sp, r_pc),
-                        ccr_only_uop(x_ord));
+                        ccr_only_uop(x_ord),
+                        no_last(x_ord));
 
 // the early read goes out when this stage leaves the port free and is
 // taking the next instruction (its current one finishes, or it is empty)

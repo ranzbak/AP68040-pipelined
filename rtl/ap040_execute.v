@@ -52,28 +52,104 @@ module ap040_execute
 	output wb_t       exe_o
 );
 
-assign ex_stall = stall_in;
+//--------------------------------------------------------------- MUL/DIV
+// The reference's multiply/divide unit, run for the micro-op in EX; EX
+// holds (ex_stall) until it is done.  Operand setup and flag/overflow rules
+// follow the reference (ap040_core.v EK_MD_W / S_MDL_RDQ / S_MD_WAIT, all
+// validated on the cputest corpus).  imm4 = {64-bit, long, signed, divide}.
+wire        md_div  = x.imm4[0];
+wire        md_sgn  = x.imm4[1];
+wire        md_long = x.imm4[2];
+wire        md_64   = x.imm4[3];
+wire        md_uop  = eaf_valid && (x.cls == CL_MULDIV) && !x.cc;   // (cc: divide by zero)
+reg         md_busy;
+wire        md_done;
+wire [31:0] md_rhi, md_rlo;
+wire        md_ovf;
+wire        md_start = md_uop && !md_busy;
+wire [31:0] md_a  = md_long ? x.a : (md_sgn ? sext16(x.a[15:0]) : {16'd0, x.a[15:0]});
+wire [31:0] md_hi = !md_div ? 32'd0 :
+                    (md_long && md_64) ? x.c :
+                    (md_sgn ? {32{x.b[31]}} : 32'd0);
+wire [31:0] md_lo = (md_div || md_long) ? x.b : (md_sgn ? sext16(x.b[15:0]) : {16'd0, x.b[15:0]});
+
+ap040_pipe_muldiv u_md
+(
+	.clk(clk), .nreset(nreset), .ce(ce),
+	.start(md_start), .is_div(md_div), .sign_op(md_sgn),
+	.op_a(md_a), .op_hi(md_hi), .op_lo(md_lo),
+	.done(md_done), .res_hi(md_rhi), .res_lo(md_rlo), .ovf(md_ovf)
+);
+
+always @(posedge clk) begin
+	if (!nreset) md_busy <= 1'b0;
+	else if (ce) begin
+		if (md_start) md_busy <= 1'b1;
+		else if (md_done) md_busy <= 1'b0;
+	end
+end
+
+// EX holds while a MUL/DIV runs: from its start until the clock its result is there
+wire md_wait = md_uop && !(md_busy && md_done);
+assign ex_stall = stall_in || md_wait;
 
 wire [31:0] alu_result;
 wire  [4:0] alu_flags;
 
 // An destination (MOVEA ADDA SUBA CMPA ADDQ/SUBQ to An): the operation is a
-// 32-bit one on the sign-extended word source (PRM ADDA 4-7 / CMPA 4-77)
+// 32-bit one on the sign-extended word source (PRM ADDA 4-7 / CMPA 4-77).
+// Bit ops: the bit number is mod 32 for Dn, mod 8 for a memory byte.
 wire        an_dst = (x.dk == DK_REG) && (x.dr[4:3] != 2'b00);
-wire [31:0] alu_a  = (an_dst && x.size == SZ_W) ? sext16(x.a[15:0]) : x.a;
+wire [31:0] alu_a  = (an_dst && x.size == SZ_W) ? sext16(x.a[15:0]) :
+                     (x.cls == CL_BIT) ? ((x.size == SZ_B) ? {29'd0, x.a[2:0]} : {27'd0, x.a[4:0]}) :
+                     x.a;
 wire  [1:0] alu_sz = an_dst ? SZ_L : x.size;
+// shift count: #1-8, Dn mod 64, or 1 (memory); 0 is handled below
+wire  [5:0] sh_cnt = x.a[5:0];
+// (never name a package constant inside a port connection: Icarus makes an
+// implicit net of an identifier it meets there before the wildcard import
+// resolves it -- CL_SHIFT came out as 'z' and no shift ever happened)
+wire  [5:0] alu_cnt = (x.cls == CL_SHIFT) ? sh_cnt : 6'd1;
 
 ap040_pipe_alu alu
 (
 	.op        (x.alu),
 	.size      (alu_sz),
-	.shcnt     (6'd1),
+	.shcnt     (alu_cnt),
 	.a         (alu_a),
 	.b         (x.b),
 	.flags_in  (ccr_in),
 	.result    (alu_result),
 	.flags_out (alu_flags)
 );
+
+// shift/rotate by zero: value unchanged, X kept, N Z from it, V=0, C=0
+// (C=X for ROXL/ROXR) -- reference S_SHIFT with sh_cnt == 0
+wire        sh_rox  = (x.alu == `AP040_ALU_ROXL1) || (x.alu == `AP040_ALU_ROXR1);
+wire [31:0] sh_bm   = x.b & szmask(x.size);
+wire        sh_n0   = (x.size == SZ_B) ? x.b[7] : (x.size == SZ_W) ? x.b[15] : x.b[31];
+wire  [4:0] sh_f0   = {ccr_in[4], sh_n0, (sh_bm == 32'd0), 1'b0, sh_rox ? ccr_in[4] : 1'b0};
+
+// CHK: N = the value's sign; C only on a trap, for these sign cases; Z V X
+// kept (reference EK_CHK, "cputest 68040_default reference on hardware")
+function automatic logic signed [31:0] sgn(input logic [31:0] v, input logic [1:0] sz);
+	return (sz == SZ_B) ? $signed(sext8(v[7:0])) : (sz == SZ_W) ? $signed(sext16(v[15:0])) : $signed(v);
+endfunction
+wire signed [31:0] chk_v = sgn(x.b, x.size);
+wire signed [31:0] chk_b = sgn(x.a, x.size);
+wire        chk_trap = (chk_v < 0) || (chk_v > chk_b);
+wire        chk_c    = chk_trap && ((chk_v < 0 && chk_b >= 0) || (chk_b >= 0 && chk_v >= chk_b) ||
+                                    (chk_v < 0 && chk_b < chk_v));
+// CHK2/CMP2: Z = equal to a bound, C = out of bounds (reference S_CHK2_D)
+wire signed [31:0] c2_rn = (x.dr[4:3] != 2'b00) ? $signed(x.b) : sgn(x.b, x.size);
+wire signed [31:0] c2_lb = sgn(x.a, x.size);
+wire signed [31:0] c2_ub = sgn(x.c, x.size);
+wire        c2_oob = (c2_lb <= c2_ub) ? (c2_rn < c2_lb || c2_rn > c2_ub) : (c2_rn < c2_lb && c2_rn > c2_ub);
+
+// PACK / UNPK (PRM 4-157 / 4-190)
+wire [15:0] pk_t   = x.a[15:0] + x.c[15:0];
+wire [31:0] pk_res = {24'd0, pk_t[11:8], pk_t[3:0]};
+wire [31:0] up_res = {16'd0, 4'd0, x.a[7:4], 4'd0, x.a[3:0]} + {16'd0, x.c[15:0]};
 
 wire cond = cond_true(x.cond, ccr_in);
 
@@ -158,6 +234,82 @@ always @* begin
 		CL_EXG: begin                     // Rx <- Ry here; Ry <- Rx came as u0
 			w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = x.b;
 		end
+		//-------------------------------------------------------- M3
+		CL_SHIFT, CL_BIT: begin
+			w.ccr_v = 1'b1;
+			w.ccr_val = (x.cls == CL_SHIFT && sh_cnt == 6'd0) ? sh_f0 : alu_flags;
+			if (x.nowrite) ;              // BTST
+			else if (x.dk == DK_REG) begin
+				w.w0_v = 1'b1; w.w0_r = x.dr;
+				w.w0_val = merge(x.b, (x.cls == CL_SHIFT && sh_cnt == 6'd0) ? x.b : alu_result, x.size);
+			end else if (x.dk == DK_MEM) begin
+				w.st_v = 1'b1; w.st_addr = x.daddr; w.st_data = alu_result; w.st_size = x.size;
+			end
+		end
+		CL_CHK: begin
+			w.ccr_v = 1'b1; w.ccr_val = {ccr_in[4], (chk_v < 0), ccr_in[2], ccr_in[1], chk_c};
+		end
+		CL_CHK2: begin
+			w.ccr_v = 1'b1;
+			w.ccr_val = {ccr_in[4], ccr_in[3], (c2_rn == c2_lb) || (c2_rn == c2_ub), ccr_in[1], c2_oob};
+		end
+		CL_PACK, CL_UNPK: begin           // no flags
+			if (x.dk == DK_REG) begin
+				w.w0_v = 1'b1; w.w0_r = x.dr;
+				w.w0_val = (x.cls == CL_PACK) ? merge(x.b, pk_res, SZ_B) : merge(x.b, up_res, SZ_W);
+			end else if (x.dk == DK_MEM) begin
+				w.st_v = 1'b1; w.st_addr = x.daddr;
+				w.st_data = (x.cls == CL_PACK) ? pk_res : up_res;
+				w.st_size = (x.cls == CL_PACK) ? SZ_B : SZ_W;
+			end
+		end
+		CL_CAS: begin                     // equal: Du -> <ea>; else <ea> -> Dc
+			w.ccr_v = 1'b1; w.ccr_val = alu_flags;   // CMP <ea> - Dc
+			if (alu_flags[2]) begin
+				w.st_v = 1'b1; w.st_addr = x.daddr; w.st_data = x.c & szmask(x.size); w.st_size = x.size;
+			end else begin
+				w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = merge(x.a, x.b, x.size);   // x.dr = Dc
+			end
+		end
+		CL_MULDIV: begin
+			if (x.cc) begin               // divide by zero: C cleared, then vector 5
+				w.ccr_v = 1'b1; w.ccr_val = {ccr_in[4:1], 1'b0};
+			end else if (!md_long) begin
+				if (md_div) begin : mdw_div
+					logic ovf_w;
+					ovf_w = md_ovf | (md_sgn ? (($signed(md_rlo) > 32'sd32767) || ($signed(md_rlo) < -32'sd32768))
+					                         : (md_rlo > 32'h0000_FFFF));
+					w.ccr_v = 1'b1;
+					if (ovf_w) w.ccr_val = {ccr_in[4:2], 1'b1, 1'b0};
+					else begin
+						w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = {md_rhi[15:0], md_rlo[15:0]};
+						w.ccr_val = {ccr_in[4], md_rlo[15], (md_rlo[15:0] == 16'd0), 2'b00};
+					end
+				end else begin
+					w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = md_rlo;
+					w.ccr_v = 1'b1; w.ccr_val = {ccr_in[4], md_rlo[31], (md_rlo == 32'd0), 2'b00};
+				end
+			end else if (md_div) begin
+				// 68040 divide overflow: V=1 C=0, N Z and the registers unchanged
+				w.ccr_v = 1'b1;
+				if (md_ovf) w.ccr_val = {ccr_in[4:2], 1'b1, 1'b0};
+				else begin
+					w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = md_rlo;           // quotient -> Dq
+					w.ccr_val = {ccr_in[4], md_rlo[31], (md_rlo == 32'd0), 2'b00};
+					if (x.dr2 != x.dr) begin w.u1_v = 1'b1; w.u1_r = x.dr2; w.u1_val = md_rhi; end
+				end
+			end else begin
+				w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = md_rlo;               // low product -> Dl
+				w.ccr_v = 1'b1;
+				if (md_64) begin
+					w.ccr_val = {ccr_in[4], md_rhi[31], (md_rhi == 32'd0) && (md_rlo == 32'd0), 2'b00};
+					// the 68040 writes Dh before Dl: Dh == Dl keeps the LOW half
+					if (x.dr2 != x.dr) begin w.u1_v = 1'b1; w.u1_r = x.dr2; w.u1_val = md_rhi; end
+				end else
+					w.ccr_val = {ccr_in[4], md_rlo[31], (md_rlo == 32'd0),
+					             md_sgn ? (md_rhi != {32{md_rlo[31]}}) : (md_rhi != 32'd0), 1'b0};
+			end
+		end
 		CL_BCC: begin
 			redir = 1'b0;            // resolved (and redirected) in EA-fetch
 		end
@@ -213,8 +365,9 @@ always @(posedge clk) begin
 		exe_valid <= 1'b0;
 		exe_o     <= '0;
 	end else if (ce && !stall_in) begin
-		exe_valid <= eaf_valid;
-		if (eaf_valid) exe_o <= w;
+		// a MUL/DIV still running sends a bubble to WB
+		exe_valid <= eaf_valid && !md_wait;
+		if (eaf_valid && !md_wait) exe_o <= w;
 	end
 end
 

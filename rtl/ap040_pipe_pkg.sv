@@ -93,7 +93,18 @@ typedef enum logic [5:0] {
 	CL_RTR     = 6'd22,
 	CL_MOVEFSR = 6'd23,  // MOVE SR,<ea> / MOVE CCR,<ea> (ccr_only)
 	CL_MOVE2CCR= 6'd24,
-	CL_EXG     = 6'd25
+	CL_EXG     = 6'd25,
+	CL_SHIFT   = 6'd26,  // ASx LSx ROx ROXx (count in a; 0 = special flags)
+	CL_BIT     = 6'd27,  // BTST BCHG BCLR BSET
+	CL_MULDIV  = 6'd28,  // MULU MULS DIVU DIVS .W/.L (multi-cycle EX)
+	CL_CHK     = 6'd29,
+	CL_CHK2    = 6'd30,  // CHK2 / CMP2
+	CL_TRAPCC  = 6'd31,  // TRAPcc / TRAPV
+	CL_PACK    = 6'd32,
+	CL_UNPK    = 6'd33,
+	CL_CAS     = 6'd34,
+	CL_CAS2    = 6'd35,
+	CL_BF      = 6'd36   // bitfields
 } cls_t;
 
 typedef struct packed {
@@ -119,6 +130,9 @@ typedef struct packed {
 	logic [3:0]  exc_fmt;      // CL_EXC: frame format ($0, $2)
 	logic [31:0] exc_addr;     // CL_EXC format $2: the address field
 	logic [31:0] btarget;      // CL_BCC/BSR/DBCC: branch target
+	logic [1:0]  size2;        // the destination EA's operand size (PACK/UNPK, RTR)
+	logic [4:0]  reg_c;        // a third register operand (CAS Du, DIV.L Dr, MUL.L Dh)
+	logic [15:0] ext2;         // second extension word (CAS2)
 } id_t;
 
 typedef struct packed {
@@ -161,7 +175,7 @@ function automatic rdreq_t first_rd(input id_t i, input logic [31:0] src_ea, inp
 	if (i.src.kind == EK_MEM && i.src.mi != MI_NONE)      begin r.v = 1'b1; r.t = T_SMI; r.a = src_ea; end
 	else if (i.dst.kind == EK_MEM && i.dst.mi != MI_NONE) begin r.v = 1'b1; r.t = T_DMI; r.a = dst_ea; end
 	else if (ld_src) begin r.v = 1'b1; r.t = T_SLD; r.a = src_ea; r.sz = i.size; end
-	else if (ld_dst) begin r.v = 1'b1; r.t = T_DLD; r.a = dst_ea; r.sz = (i.cls == CL_RTR) ? SZ_L : i.size; end
+	else if (ld_dst) begin r.v = 1'b1; r.t = T_DLD; r.a = dst_ea; r.sz = i.size2; end
 	return r;
 endfunction
 
@@ -232,6 +246,10 @@ typedef struct packed {
 	logic        cc;           // Bcc/DBcc/Scc condition, evaluated in EA-fetch
 	logic        nowrite;      // flags only (CMP family, TST)
 	logic        ccr_only;     // MOVE from CCR
+	logic [31:0] c;            // third operand (CAS Du, DIV.L high dividend)
+	logic [15:0] ext;          // the first extension word (MUL/DIV.L, CAS, bitfields)
+	logic [4:0]  dr2;          // second result register (MUL.L Dh, DIV.L Dr)
+	logic [3:0]  imm4;         // MUL/DIV: {64-bit, long, signed, divide}
 } ex_t;
 
 typedef struct packed {
