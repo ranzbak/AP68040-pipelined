@@ -89,4 +89,27 @@ else
 	echo "  (vasmm68k_mot not found: program benches skipped)"
 fi
 
+# the wrapper (plan M5): ap040_pipe_tg68k_compat with the reference's cache
+# and 16-bit adapter, lib/AP68040's program bench (three wait profiles) on
+# the reference's t_integer.s.  AP040_REF points at lib/AP68040.
+AP040_REF=${AP040_REF:-$(cd ../../MinimigAGA_TC64/lib/AP68040 2>/dev/null && pwd)}
+if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v vasmm68k_mot > /dev/null; then
+	CSRC="$SRC $(ls $RTL/compat/*.v | tr '\n' ' ') $RTL/compat/primitives/dpram.v"
+	iverilog -g2012 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_compat.vvp" tb_ap040_pipe_compat.v $CSRC > "$WORK/tb_compat.clog" 2>&1 || {
+		echo "  COMPILE-ERROR compat bench"; grep -v "constant selects" "$WORK/tb_compat.clog" | head -5; exit 1; }
+	for t in t_integer; do
+		( cd "$AP040_REF/tb/asm" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OLDPWD/$WORK/$t.bin" "$t.s" )
+		python3 bin2hex.py "$WORK/$t.bin" "$WORK/$t.hex"
+		if timeout 1800 vvp "$WORK/tb_compat.vvp" +prog="$WORK/$t.hex" > "$WORK/compat_$t.log" 2>&1 &&
+		   grep -q "ALL TESTS PASSED" "$WORK/compat_$t.log"; then
+			echo "  pass  compat:$t"
+		else
+			echo "  FAIL  compat:$t  (see $WORK/compat_$t.log)"
+			fail=1
+		fi
+	done
+else
+	echo "  (lib/AP68040 not found: compat bench skipped)"
+fi
+
 if [ $fail -eq 0 ]; then echo "AP040_PIPE: ALL TESTS PASSED"; else echo "AP040_PIPE: FAILURES"; exit 1; fi

@@ -59,7 +59,16 @@ module ap040_pipe_core
 	input         mem_ack,
 	input  [31:0] mem_rdata,
 	input         mem_flt,
-	output        bus_st_err     // a posted store bus-errored (fatal)
+	output        bus_st_err,    // a posted store bus-errored (fatal)
+
+	// status for the wrapper (cacr_out/vbr_out, debug_status)
+	output [31:0] cacr_q,
+	output [31:0] vbr_q,
+	output [31:0] dbg_a0,
+	output [31:0] dbg_sp,        // the A7 the SR selects
+	output [31:0] dbg_usp,
+	output [31:0] dbg_isp,
+	output        dbg_halted     // double fault
 );
 
 //--------------------------------------------------------------- stage wires
@@ -153,6 +162,12 @@ wire [15:0] sr_now = (commit && exe_o.sr_v)  ? exe_o.sr_val :
                      (commit && exe_o.ccr_v) ? {sr[15:5], exe_o.ccr_val} : sr;
 
 assign dbg_ccr = sr[4:0];
+assign cacr_q  = cacr;
+assign vbr_q   = vbr;
+assign dbg_usp = usp_q;
+assign dbg_isp = isp_q;
+assign dbg_sp  = !sr[13] ? usp_q : sr[12] ? msp_q : isp_q;
+assign dbg_halted = eaf_halted;
 assign dbg_sr  = sr;
 
 //--------------------------------------------------------------- register file
@@ -171,7 +186,8 @@ ap040_pipe_regfile u_regfile
 	.rd0(rd_sb), .rd1(rd_si), .rd2(rd_db), .rd3(rd_di), .rd4(rd_a), .rd5(rd_b), .rd6(rd_c), .rd7(rd_d),
 	.usp_q(usp_q), .isp_q(isp_q), .msp_q(msp_q),
 	.dbg_d0(dbg_d0), .dbg_d1(dbg_d1), .dbg_d2(dbg_d2), .dbg_d3(dbg_d3),
-	.dbg_d4(dbg_d4), .dbg_d5(dbg_d5), .dbg_d6(dbg_d6), .dbg_d7(dbg_d7)
+	.dbg_d4(dbg_d4), .dbg_d5(dbg_d5), .dbg_d6(dbg_d6), .dbg_d7(dbg_d7),
+	.dbg_a0(dbg_a0)
 );
 
 //--------------------------------------------------------------- memory

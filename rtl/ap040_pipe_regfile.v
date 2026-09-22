@@ -41,7 +41,8 @@ module ap040_pipe_regfile
 	output     [31:0] msp_q,
 
 	output     [31:0] dbg_d0, dbg_d1, dbg_d2, dbg_d3,
-	output     [31:0] dbg_d4, dbg_d5, dbg_d6, dbg_d7
+	output     [31:0] dbg_d4, dbg_d5, dbg_d6, dbg_d7,
+	output     [31:0] dbg_a0
 );
 
 reg [31:0] dreg [0:7];
@@ -113,5 +114,6 @@ assign dbg_d4 = dreg[4];
 assign dbg_d5 = dreg[5];
 assign dbg_d6 = dreg[6];
 assign dbg_d7 = dreg[7];
+assign dbg_a0 = areg[0];
 
 endmodule
