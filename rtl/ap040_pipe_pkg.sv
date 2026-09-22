@@ -131,7 +131,8 @@ typedef struct packed {
 	logic [31:0] exc_addr;     // CL_EXC format $2: the address field
 	logic [31:0] btarget;      // CL_BCC/BSR/DBCC: branch target
 	logic [1:0]  size2;        // the destination EA's operand size (PACK/UNPK, RTR)
-	logic [4:0]  reg_c;        // a third register operand (CAS Du, DIV.L Dr, MUL.L Dh)
+	logic [4:0]  reg_c;        // a third register operand (CAS Du, DIV.L Dr, MUL.L Dh, BF offset)
+	logic [4:0]  reg_d;        // a fourth (bitfield width)
 	logic [15:0] ext2;         // second extension word (CAS2)
 } id_t;
 
@@ -171,7 +172,7 @@ function automatic rdreq_t first_rd(input id_t i, input logic [31:0] src_ea, inp
 	r = '0; r.sz = SZ_L;
 	ld_src = (i.src.kind == EK_MEM) && !(i.cls == CL_JMP || i.cls == CL_JSR || i.cls == CL_LEA || i.cls == CL_PEA);
 	ld_dst = (i.dst.kind == EK_MEM) && i.rmw;
-	if (i.serialize) return r;
+	if (i.serialize || i.cls == CL_BF) return r;   // a bitfield's address needs its offset register
 	if (i.src.kind == EK_MEM && i.src.mi != MI_NONE)      begin r.v = 1'b1; r.t = T_SMI; r.a = src_ea; end
 	else if (i.dst.kind == EK_MEM && i.dst.mi != MI_NONE) begin r.v = 1'b1; r.t = T_DMI; r.a = dst_ea; end
 	else if (ld_src) begin r.v = 1'b1; r.t = T_SLD; r.a = src_ea; r.sz = i.size; end

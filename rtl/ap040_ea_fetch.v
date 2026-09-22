@@ -58,8 +58,8 @@ module ap040_ea_fetch
 	input  rdreq_t    early,
 
 	// register reads (with the regfile's WB write-through)
-	output      [4:0] ra_a, ra_b, ra_c,
-	input      [31:0] rd_a, rd_b, rd_c,
+	output      [4:0] ra_a, ra_b, ra_c, ra_d,
+	input      [31:0] rd_a, rd_b, rd_c, rd_d,
 	// EX-stage writes, forwarded
 	input             ex_w0_v, input [4:0] ex_w0_r, input [31:0] ex_w0_val,
 	input             ex_u0_v, input [4:0] ex_u0_r, input [31:0] ex_u0_val,
@@ -156,15 +156,38 @@ wire [31:0] op_a = fwd(ra_a, rd_a, ex_w0_v, ex_w0_r, ex_w0_val, ex_u0_v, ex_u0_r
 assign ra_c = eac_i.i.reg_c;
 wire [31:0] op_c = fwd(ra_c, rd_c, ex_w0_v, ex_w0_r, ex_w0_val, ex_u0_v, ex_u0_r, ex_u0_val,
                        ex_u1_v, ex_u1_r, ex_u1_val);
+// the fourth (bitfield width in Dn)
+assign ra_d = eac_i.i.reg_d;
+wire [31:0] op_d = fwd(ra_d, rd_d, ex_w0_v, ex_w0_r, ex_w0_val, ex_u0_v, ex_u0_r, ex_u0_val,
+                       ex_u1_v, ex_u1_r, ex_u1_val);
 wire [31:0] op_b = (eac_i.u0_v && eac_i.u0_r == ra_b) ? eac_i.u0_val :
                    fwd(ra_b, rd_b, ex_w0_v, ex_w0_r, ex_w0_val, ex_u0_v, ex_u0_r, ex_u0_val,
                        ex_u1_v, ex_u1_r, ex_u1_val);
 
+//--------------------------------------------------------------- bitfields
+// M68040UM / PRM BFxxx: offset = Do ? Dn (signed, 32 bits) : ext[10:6];
+// width = Dw ? Dn mod 32 : ext[4:0], 0 meaning 32.  Memory: the field
+// starts at bit (offset mod 8) of the byte at <ea> + (offset >> 3), and
+// spans 1-5 bytes.  Reads as the reference core (lib/AP68040 S_BF_MEM0):
+// a longword, plus the fifth byte for a 5-byte span; writes B / W / W+B /
+// L / L+B by span (S_BF_WR1/2).
+wire        is_bf   = (i.cls == CL_BF);
+wire        bf_mem  = is_bf && (i.dst.kind == EK_MEM);
+wire [31:0] bf_off  = (i.reg_c != R_NONE) ? op_c : {27'd0, i.ext[10:6]};
+wire  [4:0] bf_w5   = (i.reg_d != R_NONE) ? op_d[4:0] : i.ext[4:0];
+wire  [5:0] bf_w    = (bf_w5 == 5'd0) ? 6'd32 : {1'b0, bf_w5};
+wire [31:0] bf_addr = eac_i.dst_ea + {{3{bf_off[31]}}, bf_off[31:3]};
+wire  [6:0] bf_bits = {4'd0, bf_off[2:0]} + {1'b0, bf_w} + 7'd7;
+wire  [2:0] bf_n    = bf_bits[5:3];               // 1..5 bytes
+wire        bf_modify = (i.alu[2:0] == 3'd2) || (i.alu[2:0] == 3'd4) || (i.alu[2:0] == 3'd6) || (i.alu[2:0] == 3'd7);
+// a second store (the byte past a word or longword) needs a second micro-op
+wire        bf_two  = bf_mem && bf_modify && (bf_n == 3'd3 || bf_n == 3'd5);
+
 //--------------------------------------------------------------- ordinary instructions
 wire addr_only    = (i.cls == CL_JMP || i.cls == CL_JSR || i.cls == CL_LEA || i.cls == CL_PEA);
-wire needs_ld_src = (i.src.kind == EK_MEM) && !addr_only;
+wire needs_ld_src = ((i.src.kind == EK_MEM) && !addr_only) || (bf_mem && bf_n == 3'd5);
 // CHK2/CMP2 read the upper bound from <ea>+size into the "destination" load
-wire needs_ld_dst = ((i.dst.kind == EK_MEM) && i.rmw) || (i.cls == CL_CHK2);
+wire needs_ld_dst = ((i.dst.kind == EK_MEM) && i.rmw) || (i.cls == CL_CHK2) || bf_mem;
 wire need_smi = (i.src.kind == EK_MEM) && (i.src.mi != MI_NONE);
 wire need_dmi = (i.dst.kind == EK_MEM) && (i.dst.mi != MI_NONE);
 
@@ -189,9 +212,12 @@ function automatic rdreq_t next_rd(input logic nsmi, input logic dsmi, input log
 endfunction
 
 // RTR's second read (the PC at 2(SP)) is a long, its first (the CCR) a word
+// a bitfield's longword at the field address, its fifth byte as the "source"
 wire rdreq_t nx = next_rd(need_smi, done_smi, need_dmi, done_dmi, needs_ld_src, done_sld, needs_ld_dst, done_dld,
-                          eac_i.src_ea, eac_i.dst_ea, s_addr_now, d_addr_now, i.size,
-                          (i.cls == CL_CHK2) ? i.size : i.size2);
+                          eac_i.src_ea, eac_i.dst_ea,
+                          is_bf ? bf_addr + 32'd4 : s_addr_now, is_bf ? bf_addr : d_addr_now,
+                          is_bf ? SZ_B : i.size,
+                          (i.cls == CL_CHK2) ? i.size : is_bf ? SZ_L : i.size2);
 
 // Store-to-load forwarding.  The memory answers with what it held at the
 // clock edge ending the read's issue clock (a store committing on that edge
@@ -299,7 +325,104 @@ function automatic ex_t xord(input eac_t e, input logic [31:0] opa, input logic 
 	return x;
 endfunction
 
-wire ex_t x_ord0 = xord(eac_i, op_a, op_b, op_c, s_addr_c, s_val_c, d_addr_c, d_val_c);
+wire ex_t x_ord1 = xord(eac_i, op_a, op_b, op_c, s_addr_c, s_val_c, d_addr_c, d_val_c);
+
+// Bitfield evaluation on a 64-bit window: {Dn, Dn} for a register field
+// (offset mod 32; a field past bit 0 wraps to bit 31), or the memory bytes
+// {long, byte 5, 24'b0} (offset mod 8).  Flags per PRM BFxxx: N = the
+// field's (BFINS: the inserted value's) most significant bit, Z = all zero,
+// V = C = 0, X kept.  BFFFO: offset + the first set bit, or offset + width.
+function automatic logic [5:0] clz32(input logic [31:0] v);
+	logic [5:0] n;
+	int k;
+	n = 6'd32;
+	for (k = 0; k < 32; k = k + 1)
+		if (v[k]) n = 6'd31 - k[5:0];
+	return n;
+endfunction
+
+typedef struct packed {
+	logic [1:0]  nz;       // N, Z
+	logic [31:0] val;      // BFEXTU/BFEXTS/BFFFO result, or the new field register
+	logic [63:0] nw;       // the window with the new field in it (memory form)
+} bfres_t;
+
+function automatic bfres_t bf_eval(input logic [2:0] op, input logic [63:0] win, input logic [5:0] o,
+                                   input logic [5:0] w, input logic [31:0] du, input logic [31:0] off,
+                                   input logic regf);
+	bfres_t r;
+	logic [63:0] sh, m64, n64;
+	logic [31:0] fl, maskl, ones, field, nf, al;
+	sh    = win << o;
+	fl    = sh[63:32];                                   // field left aligned
+	maskl = (w == 6'd32) ? 32'hFFFF_FFFF : ~(32'hFFFF_FFFF >> w);
+	ones  = (w == 6'd32) ? 32'hFFFF_FFFF : ((32'd1 << w) - 32'd1);
+	field = (w == 6'd32) ? fl : (fl >> (6'd32 - w));
+	case (op)
+		3'd2:    nf = (~field) & ones;                   // BFCHG
+		3'd4:    nf = 32'd0;                             // BFCLR
+		3'd6:    nf = ones;                              // BFSET
+		default: nf = du & ones;                         // BFINS
+	endcase
+	r.nz[1] = (op == 3'd7) ? nf[w - 6'd1] : field[w - 6'd1];
+	r.nz[0] = (op == 3'd7) ? (nf == 32'd0) : (field == 32'd0);
+	al = fl & maskl;
+	m64 = {maskl, 32'd0} >> o;
+	n64 = {((w == 6'd32) ? nf : (nf << (6'd32 - w))), 32'd0} >> o;
+	r.nw = (win & ~m64) | (n64 & m64);
+	case (op)
+		3'd1:    r.val = field;
+		3'd3:    r.val = field | (field[w - 6'd1] ? ~ones : 32'd0);
+		3'd5:    r.val = off + {26'd0, (al == 32'd0) ? w : clz32(al)};
+		default: r.val = (win[63:32] & ~(m64[63:32] | m64[31:0])) |
+		                 (n64[63:32] & m64[63:32]) | (n64[31:0] & m64[31:0]);   // register field
+	endcase
+	return r;
+endfunction
+
+wire bfres_t bfr = bf_eval(i.alu[2:0],
+                           bf_mem ? {d_val_c, s_val_c[7:0], 24'd0} : {op_b, op_b},
+                           bf_mem ? {3'd0, bf_off[2:0]} : {1'b0, bf_off[4:0]},
+                           bf_w, op_a, bf_off, !bf_mem);
+
+// the bitfield micro-ops: 0 flags + register result + first store,
+// 1 the trailing byte store of a 3- or 5-byte field
+function automatic ex_t bf_uop(input ex_t x0, input logic sec, input eac_t e, input bfres_t r,
+                               input logic mem, input logic modify, input logic two,
+                               input logic [2:0] n, input logic [31:0] a);
+	ex_t x;
+	logic [2:0] op;
+	op = e.i.alu[2:0];
+	x = x0;
+	x.a = {28'd0, r.nz, 2'b00};
+	x.c = r.val;
+	x.dk = DK_NONE; x.dr = R_NONE;
+	x.st_v = 1'b0;
+	if (op == 3'd1 || op == 3'd3 || op == 3'd5) begin x.dk = DK_REG; x.dr = e.src_r; end
+	else if (!mem && modify)                    begin x.dk = DK_REG; x.dr = e.dst_r; end
+	if (mem && modify) begin
+		x.st_v = 1'b1; x.st_addr = a;
+		case (n)
+			3'd1:       begin x.st_size = SZ_B; x.st_data = {24'd0, r.nw[63:56]}; end
+			3'd2, 3'd3: begin x.st_size = SZ_W; x.st_data = {16'd0, r.nw[63:48]}; end
+			default:    begin x.st_size = SZ_L; x.st_data = r.nw[63:32]; end
+		endcase
+	end
+	x.last = !two;
+	if (sec) begin
+		x.wr_ccr = 1'b0; x.dk = DK_NONE; x.dr = R_NONE;
+		x.u0_v = 1'b0; x.u1_v = 1'b0;
+		x.st_size = SZ_B;
+		x.st_addr = a + ((n == 3'd3) ? 32'd2 : 32'd4);
+		x.st_data = {24'd0, (n == 3'd3) ? r.nw[47:40] : r.nw[31:24]};
+		x.last = 1'b1;
+	end
+	return x;
+endfunction
+
+reg bf_step;               // the bitfield's second micro-op is next
+wire ex_t x_ord0 = is_bf ? bf_uop(x_ord1, bf_step, eac_i, bfr, bf_mem, bf_modify, bf_two, bf_n, bf_addr)
+                         : x_ord1;
 function automatic ex_t with_cc(input ex_t x, input logic c);
 	ex_t y;
 	y = x; y.cc = c;
@@ -416,7 +539,7 @@ function automatic stp_t stepf(
 	input logic s_bit, input logic stall,
 	input rdreq_t nx, input logic ops_done, input logic jmp_odd, input logic rts_odd, input logic rtr_odd,
 	input logic trap_u, input logic trap_n, input logic [7:0] trap_vec,
-	input logic indexed,
+	input logic indexed, input logic two, input logic tstep,
 	input logic [31:0] s_addr_c, input logic [31:0] s_val_c, input logic [31:0] d_val_c,
 	input logic [2:0] x_step, input logic [31:0] vbr, input logic [7:0] x_vec, input logic [31:0] x_target,
 	input logic [2:0] r_step, input logic [31:0] sp_now, input logic fmt_ok, input logic rte_goes);
@@ -468,7 +591,8 @@ function automatic stp_t stepf(
 							s.epc = i.pc; s.eaddr = {d_val_c[31:1], 1'b0};
 						end
 					end else if (!stall) begin
-						s.disp = 1'b1; s.dsel = 3'd0; s.fin = 1'b1;
+						// a two-micro-op instruction (bitfield trailing byte) finishes on the second
+						s.disp = 1'b1; s.dsel = 3'd0; s.fin = !two || tstep;
 					end
 				end
 			end
@@ -517,7 +641,7 @@ endfunction
 // reads never wait for older stores (store-to-load forwarding, above)
 wire stp_t st = stepf(ph, eac_valid, rst_pending, i, older_busy, 1'b1, rd_pend, rd_ack, cap,
                       s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, trap_n, trap_vec,
-                      indexed_mode, s_addr_c, s_val_c,
+                      indexed_mode, bf_two, bf_step, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes);
 
 // RTR to an odd PC: the CCR alone commits
@@ -590,6 +714,7 @@ always @(posedge clk) begin
 		s_addr <= 32'd0; d_addr <= 32'd0; s_val <= 32'd0; d_val <= 32'd0;
 		x_vec <= 8'd0; x_fmt <= 4'd0; x_pc <= 32'd0; x_addr <= 32'd0; x_step <= 3'd0;
 		x_sr <= 16'd0; x_sp <= 32'd0; x_bank <= R_ISP; x_target <= 32'd0;
+		bf_step <= 1'b0;
 		r_step <= 3'd0; r_sr <= 16'd0; r_pc <= 32'd0; r_fv <= 16'd0;
 		rst_pending <= reset_seq;
 		eaf_valid <= 1'b0; eaf_o <= '0;
@@ -605,7 +730,7 @@ always @(posedge clk) begin
 		if (rd_req) begin rd_pend <= 1'b1; rd_tag <= rd_t; rd_a_q <= rd_addr; rd_sz_q <= rd_size; end
 		else if (rd_ack) begin rd_pend <= 1'b0; rd_drop <= 1'b0; end
 		if (flush) begin
-			ph <= P_START;
+			ph <= P_START; bf_step <= 1'b0;
 			done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
 			if (rd_pend && !rd_ack) rd_drop <= 1'b1;
 		end else begin
@@ -681,8 +806,9 @@ always @(posedge clk) begin
 				x_vec  <= st.ev; x_fmt <= st.ef; x_pc <= st.epc; x_addr <= st.eaddr;
 				x_step <= 3'd5;
 			end
+			if (st.disp && st.dsel == 3'd0 && bf_two && !st.fin) bf_step <= 1'b1;
 			if (st.fin) begin
-				ph <= P_START;
+				ph <= P_START; bf_step <= 1'b0;
 				done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
 			end
 		end

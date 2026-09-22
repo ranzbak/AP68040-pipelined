@@ -33,8 +33,8 @@ module ap040_pipe_regfile
 	input             u1_we, input [4:0] u1_r, input [31:0] u1_d,
 	input             u0_we, input [4:0] u0_r, input [31:0] u0_d,
 
-	input       [4:0] ra0, ra1, ra2, ra3, ra4, ra5, ra6,
-	output     [31:0] rd0, rd1, rd2, rd3, rd4, rd5, rd6,
+	input       [4:0] ra0, ra1, ra2, ra3, ra4, ra5, ra6, ra7,
+	output     [31:0] rd0, rd1, rd2, rd3, rd4, rd5, rd6, rd7,
 
 	output     [31:0] usp_q,
 	output     [31:0] isp_q,
@@ -74,6 +74,7 @@ assign rd3 = `AP040_RF_RD(ra3);
 assign rd4 = `AP040_RF_RD(ra4);
 assign rd5 = `AP040_RF_RD(ra5);
 assign rd6 = `AP040_RF_RD(ra6);
+assign rd7 = `AP040_RF_RD(ra7);
 `undef AP040_RF_RD
 
 task automatic wr(input [4:0] r, input [31:0] v);

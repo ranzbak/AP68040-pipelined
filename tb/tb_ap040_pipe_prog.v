@@ -103,6 +103,21 @@ always @(posedge clk)
 			end
 	end
 
+// "inimage": no data access may fall outside the image.  The L1 model
+// aliases the high address bits (ea_all relies on it), so a wrong high
+// address (a bitfield offset shifted without its sign, say) would otherwise
+// go unseen.
+reg inimage = 0;
+always @(posedge clk)
+	if (nreset && inimage && ((dut.u_l1.rd_req && (dut.u_l1.rd_addr >> (L1_AW + 1)) != 0) ||
+	               (dut.u_l1.wr_req && (dut.u_l1.wr_addr >> (L1_AW + 1)) != 0))) begin
+		reads_bad = reads_bad + 1;
+		if (dut.u_l1.rd_req && (dut.u_l1.rd_addr >> (L1_AW + 1)) != 0)
+			$display("FAIL: data read outside the image at %h", dut.u_l1.rd_addr);
+		else
+			$display("FAIL: data write outside the image at %h", dut.u_l1.wr_addr);
+	end
+
 initial begin
 	if (!$value$plusargs("prog=%s", progf) || !$value$plusargs("expect=%s", expf)) begin
 		$display("usage: +prog=<image.hex> +expect=<file.exp> [+cycles=N]");
@@ -131,7 +146,8 @@ initial begin
 			else if (key == "noread") begin
 				rc = $fscanf(fd, "%h", a);
 				noread[n_noread] = a; n_noread = n_noread + 1;
-			end else rc = $fscanf(fd, "%h", v);
+			end else if (key == "inimage") inimage = 1;
+			else rc = $fscanf(fd, "%h", v);
 		end
 	end
 	$fclose(fd);
@@ -151,6 +167,7 @@ initial begin
 		if (!ok) ;
 		else if (key == "halt") rc = $fscanf(fd, "%h", v);
 		else if (key == "noread") rc = $fscanf(fd, "%h", v);
+		else if (key == "inimage") ;
 		else if (key == "#") begin : skipline2
 			integer ch;
 			ch = 0;

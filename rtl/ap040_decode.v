@@ -465,7 +465,12 @@ function automatic shape_t shape(input logic [15:0] op);
 		end
 		//------------------------------------------------ group E: shifts, bitfields
 		16'b1110_1???_11??_????: begin           // bitfields: extension word first
-			s.form = F_BF; s.npre = 2'd1; s.has_dst = 1'b1; s.ok = 1'b0;   // not yet (M3 tail)
+			s.form = F_BF; s.npre = 2'd1; s.has_dst = 1'b1; s.sz = SZ_L;
+			// Dn or a control EA; CHG/CLR/SET/INS need it alterable (no PC relative)
+			s.ok = (s.dm == 3'd0) ||
+			       ((op[8] == 1'b0 && op[10:9] != 2'b00) || op[10:8] == 3'b110 || op[10:8] == 3'b111 ?
+			        ea_ok(s.dm, s.dr, 1'b0, 1'b0, 1'b1, 1'b1) :
+			        ea_ok(s.dm, s.dr, 1'b0, 1'b0, 1'b1, 1'b0));
 		end
 		16'b1110_0???_11??_????: begin           // memory shift/rotate by one, word
 			s.form = F_SHM; s.sz = SZ_W; s.has_dst = 1'b1;
@@ -584,6 +589,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 	d = '0;
 	s2set = 1'b0; s2 = SZ_L;
 	d.reg_c = R_NONE;
+	d.reg_d = R_NONE;
 	d.pc = vpc;
 	d.next_pc = vpc + 32'(2 * tot);
 	d.opcode = op;
@@ -773,6 +779,13 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				d.cls = CL_SHIFT; d.wr_ccr = 1'b1; d.rmw = 1'b1;
 				d.src = op[5] ? ea_reg(EK_DREG, {2'b00, op[11:9]}) : ea_imm({28'd0, (op[11:9] == 3'd0), op[11:9]});
 				d.dst = ea_reg(EK_DREG, {2'b00, op[2:0]});
+			end
+			F_BF: begin                         // field at Dn or <ea>; ext: Dn, Do/offset, Dw/width
+				d.cls = CL_BF; d.wr_ccr = 1'b1;
+				d.alu = {3'd0, op[10:8]};         // 0 TST 1 EXTU 2 CHG 3 EXTS 4 CLR 5 FFO 6 SET 7 INS
+				d.src = ea_reg(EK_DREG, {2'b00, x1[14:12]});   // INS source / EXTU EXTS FFO destination
+				d.reg_c = x1[11] ? {2'b00, x1[8:6]} : R_NONE;  // offset in Dn
+				d.reg_d = x1[5]  ? {2'b00, x1[2:0]} : R_NONE;  // width in Dn
 			end
 			F_SHM: begin                        // <ea> by one, word
 				d.cls = CL_SHIFT; d.wr_ccr = 1'b1; d.rmw = 1'b1;

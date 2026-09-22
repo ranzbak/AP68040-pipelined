@@ -169,6 +169,9 @@ function automatic logic w0_of(input id_t i);
 		CL_SCC, CL_MOVEFSR, CL_PACK, CL_UNPK: return i.dst.kind == EK_DREG;
 		CL_SHIFT, CL_BIT: return i.dst.kind == EK_DREG && !i.nowrite;
 		CL_MULDIV, CL_CAS: return 1'b1;
+		// BFEXTU/BFEXTS/BFFFO write Dn (w0_r moved below); CHG/CLR/SET/INS a field register
+		CL_BF: return (i.alu[2:0] == 3'd1 || i.alu[2:0] == 3'd3 || i.alu[2:0] == 3'd5) ||
+		              (i.dst.kind == EK_DREG && i.alu[2:0] != 3'd0);
 		CL_LEA, CL_UNLK, CL_EXG: return 1'b1;
 		CL_MOVEC: return !i.imm[4] || i.imm[3:0] == CR_USP || i.imm[3:0] == CR_ISP || i.imm[3:0] == CR_MSP;
 		default: return 1'b0;
@@ -193,6 +196,7 @@ function automatic eac_t mk(input id_t i, input eares_t s, input eares_t d,
 	o.redirected = (i.cls == CL_JMP || i.cls == CL_JSR) && i.src.mi == MI_NONE && !s.ea[0];
 	o.w0_r   = rdb;
 	case (i.cls)
+		CL_BF: if (i.alu[2:0] == 3'd1 || i.alu[2:0] == 3'd3 || i.alu[2:0] == 3'd5) o.w0_r = rsb;
 		// LINK An,#d: An <- SP-4 (u0), SP <- SP-4+d (u1, wins if An is A7)
 		CL_LINK: begin
 			o.u0_v = 1'b1; o.u0_r = rsb; o.u0_val = d.nv;

@@ -246,6 +246,10 @@ always @* begin
 				w.st_v = 1'b1; w.st_addr = x.daddr; w.st_data = alu_result; w.st_size = x.size;
 			end
 		end
+		CL_BF: begin                      // EA-fetch evaluated it; stores come in x.st_*
+			if (x.wr_ccr) begin w.ccr_v = 1'b1; w.ccr_val = {ccr_in[4], x.a[3:2], 2'b00}; end
+			if (x.dk == DK_REG) begin w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = x.c; end
+		end
 		CL_CHK: begin
 			w.ccr_v = 1'b1; w.ccr_val = {ccr_in[4], (chk_v < 0), ccr_in[2], ccr_in[1], chk_c};
 		end
