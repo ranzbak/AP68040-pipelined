@@ -430,15 +430,25 @@ assign smc_hit = exe_valid && exe_o.st_v && !exe_o.stf.exc &&
                   ovl(exe_o.st_addr, exe_o.st_size, id_valid, id_o.pc, id_o.next_pc) ||
                   ovl(exe_o.st_addr, exe_o.st_size, id_g_v, id_g_lo, id_g_hi) ||
                   ovl(exe_o.st_addr, exe_o.st_size, 1'b1, if_q_lo, if_q_hi));
+// The refetch goes out in the store's first clock in WB, not when memory
+// acknowledges it (timing: the acknowledge must not reach IF's fetch address,
+// the gate build's clk_114 -> clk_38 path), once (smc_fired while WB holds
+// the store).  On the bus IF's fetch cannot pass the store: the controller
+// sends a store first.  EX's micro-op is squashed through EA-fetch's flush
+// and in_drop; a store that then faults takes its exception as usual.
 reg  smc_pend;
-assign wb_smc = retire && exe_o.last && (smc_hit || smc_pend) && !wb_fault && ce;
+reg  smc_fired;
+assign wb_smc = exe_valid && exe_o.last && (smc_hit || smc_pend) && !smc_fired && ce;
+always @(posedge clk)
+	if (!nreset) smc_fired <= 1'b0;
+	else if (ce) smc_fired <= exe_valid && wb_hold && !wb_fault && (smc_fired || wb_smc);
 always @(posedge clk)
 	if (!nreset) smc_pend <= 1'b0;
 	else if (ce && retire) smc_pend <= !exe_o.last && (smc_pend || smc_hit);
 
 ap040_execute u_ex
 (
-	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(wb_hold), .wb_drop(wb_fault || wb_smc),
+	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(wb_hold), .wb_drop(wb_fault), .in_drop(wb_smc),
 	.eaf_valid(eaf_valid), .x(eaf_o),
 	.ccr_in(sr_now[4:0]), .sr_in(sr_now),
 	.sfc_in({29'd0, sfc}), .dfc_in({29'd0, dfc}), .cacr_in(cacr), .vbr_in(vbr),

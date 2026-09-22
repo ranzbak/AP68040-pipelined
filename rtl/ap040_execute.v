@@ -24,6 +24,7 @@ module ap040_execute
 	input             ce,
 	input             stall_in,   // WB cannot accept
 	input             wb_drop,    // WB's store faulted (M6): its micro-op is gone
+	input             in_drop,    // WB's self-modifying-code refetch: this micro-op does not go to WB
 
 	input             eaf_valid,
 	input  ex_t       x,
@@ -418,7 +419,7 @@ always @(posedge clk) begin
 		exe_valid <= 1'b0;
 	end else if (ce && !stall_in) begin
 		// a MUL/DIV still running sends a bubble to WB
-		exe_valid <= eaf_valid && !md_wait;
+		exe_valid <= eaf_valid && !md_wait && !in_drop;
 		if (eaf_valid && !md_wait) exe_o <= w;
 	end
 end
