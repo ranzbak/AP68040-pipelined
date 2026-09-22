@@ -70,7 +70,8 @@ module ap040_inst_fetch
 	output reg [31:0] pf_addr,      // the faulted fetch: address, two words, ATC
 	output reg        pf_long,
 	output reg        pf_atc,
-	// the code held here: every word queued or in flight lies in [q_lo, q_hi)
+	// the code held here: see the note on q_hi below -- with the bus it is the
+	// last fetch's address and the range runs to the end of that 8-byte block
 	output     [31:0] q_lo,
 	output     [31:0] q_hi
 );
@@ -128,7 +129,23 @@ wire        use_ans   = got && !fdrop && !redirect_valid;  // ... that goes into
 wire  [2:0] after_c   = redirect_valid ? 3'd0 : (qcnt - {1'b0, consume});
 wire  [2:0] pend      = (!redirect_valid && infl && !fdrop) ? {1'b0, infl_n} : 3'd0;
 assign q_lo = qpc;
-assign q_hi = fpc;
+// What q_hi means depends on LONG_ANY, i.e. on which memory this core has:
+//
+//   LONG_ANY = 0 (the bus, the Minimig build): a two-word fetch is longword
+//     ALIGNED, so no fetch ever crosses an 8-byte block.  q_hi is then the
+//     address the LAST fetch was issued at and the store-into-code check in
+//     ap040_pipe_core.v compares 8-byte BLOCKS: every word IF holds or has in
+//     flight lies in [q_lo, end of q_hi's block).  That is a conservative
+//     superset of [q_lo, fpc) and it keeps the 32-bit adder that makes the
+//     next fetch address out of the comparison -- with `fpc` here, the store
+//     address had to be compared against a SUM, which landed in the clk_38
+//     critical path of build/stage_ap040_pipe_m9sd.
+//
+//   LONG_ANY = 1 (the L1 test substrate): a four-byte fetch may start at any
+//     word address and so may cross a block, which the block test would
+//     under-cover.  There q_hi is the end of the range as before; the
+//     substrate exists only in the benches, where the adder costs nothing.
+assign q_hi = (LONG_ANY != 0) ? fpc : fpc_b;
 // a request goes out when there is room for the answer and no other fetch
 // is outstanding (or it answers now)
 wire        want_req  = (running || redirect_valid) && !hold && !(redirect_valid && redirect_hold) &&
