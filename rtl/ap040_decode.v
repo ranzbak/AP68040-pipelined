@@ -209,7 +209,7 @@ localparam [5:0]
 	F_BITD = 6'd38, F_BITS = 6'd39, F_CAS = 6'd40, F_CAS2 = 6'd41, F_CHK2 = 6'd42,
 	F_CHK = 6'd43, F_TAS = 6'd44, F_NBCD = 6'd45, F_MDW = 6'd46, F_MDL = 6'd47,
 	F_TRAPCC = 6'd48, F_BCD = 6'd49, F_PACK = 6'd50, F_UNPK = 6'd51, F_SHR = 6'd52,
-	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55;
+	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55, F_MOVEUSP = 6'd56;
 
 // What an opcode word implies about the words that follow it.
 typedef struct packed {
@@ -406,6 +406,7 @@ function automatic shape_t shape(input logic [15:0] op);
 		end
 		16'b0100_1110_0100_????: begin s.ok = 1'b1; s.form = F_TRAP; end
 		16'b0100_1110_0111_101?: begin s.ok = 1'b1; s.form = F_MOVEC; s.npre = 2'd1; end
+		16'b0100_1110_0110_????: begin s.ok = 1'b1; s.form = F_MOVEUSP; end   // MOVE An,USP / USP,An
 		16'h4E71: begin s.ok = 1'b1; s.form = F_NOP; end
 		16'h4E73: begin s.ok = 1'b1; s.form = F_RTE; end
 		16'h4E75: begin s.ok = 1'b1; s.form = F_RTS; end
@@ -866,6 +867,11 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				if (d.imm[3:0] == CR_BAD) begin
 					d.cls = CL_EXC; d.exc_vec = 8'd4;
 				end
+			end
+			F_MOVEUSP: begin                    // as MOVEC USP (PRM MOVE USP 6-21: privileged)
+				d.cls = CL_MOVEC; d.priv = 1'b1; d.serialize = 1'b1;
+				d.imm[3:0] = CR_USP; d.imm[4] = !op[3];
+				d.src = ea_reg(EK_AREG, {2'b01, op[2:0]});
 			end
 			F_NOP: d.cls = CL_NOP;
 			F_RTE: begin d.cls = CL_RTE; d.priv = 1'b1; d.serialize = 1'b1; end
