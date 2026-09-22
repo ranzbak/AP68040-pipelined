@@ -287,7 +287,7 @@ wire [31:0] d_val_c  = (cap && rd_tag == T_DLD) ? rd_data : d_val;
 // or from a load answering this clock; they wait one clock and use the
 // register-file write-through / the captured load instead.  (The EX write
 // ports themselves never depend on a result: ap040_execute.v.)
-wire vdep = (i.cls == CL_CHK) || (i.cls == CL_CHK2) || (i.cls == CL_MULDIV && i.imm[0]) ||
+wire vdep = (i.cls == CL_CHK) || (i.cls == CL_CHK2) || (i.cls == CL_MULDIV && i.imm[0]) || (i.cls == CL_DBCC) ||
             (i.cls == CL_BF) || (i.cls == CL_CAS2);
 function automatic logic hz(input logic v, input logic [4:0] r, input logic [4:0] a, input logic [4:0] b,
                             input logic [4:0] c, input logic [4:0] d);
@@ -441,9 +441,9 @@ function automatic bfres_t bf_eval(input logic [2:0] op, input logic [63:0] win,
 endfunction
 
 wire bfres_t bfr = bf_eval(i.alu[2:0],
-                           bf_mem ? {d_val, s_val[7:0], 24'd0} : {op_b, op_b},   // (vhold: loads captured)
+                           bf_mem ? {d_val, s_val[7:0], 24'd0} : {rd_b, rd_b},   // (vhold: loads captured,
                            bf_mem ? {3'd0, bf_off[2:0]} : {1'b0, bf_off[4:0]},
-                           bf_w, op_a, bf_off, !bf_mem);
+                           bf_w, rd_a, bf_off, !bf_mem);   //  no EX hazard: the register file)
 
 // the bitfield micro-ops: 0 flags + register result + first store,
 // 1 the trailing byte store of a 3- or 5-byte field
@@ -535,7 +535,7 @@ wire cas2_two = (i.cls == CL_CAS2) &&
 
 reg bf_step;               // the second micro-op (bitfield trailing byte, CAS2 Du2) is next
 wire ex_t x_ord0 = is_bf ? bf_uop(x_ord1, bf_step, eac_i, bfr, bf_mem, bf_modify, bf_two, bf_n, bf_addr) :
-                   (i.cls == CL_CAS2) ? cas2_uop(x_ord1, bf_step, eac_i, op_a, op_b, op_c, op_d,
+                   (i.cls == CL_CAS2) ? cas2_uop(x_ord1, bf_step, eac_i, rd_a, rd_b, rd_c, rd_d,   // (vhold: no EX hazard)
                                                  s_addr_c, s_val, d_addr_c, d_val,     // (vhold: loads captured)
                                                  CAS2_DC_ORDER_020 != 0) :
                    x_ord1;
@@ -906,6 +906,7 @@ typedef struct packed {
 function automatic mms_t mm_step(input logic ld, input logic [15:0] mask, input logic empty,
                                  input logic pend, input logic cap, input logic have, input logic stall,
                                  input logic rlast, input logic hlast, input logic one, input logic mp,
+                                 input logic sblk,
                                  input logic nodisp);
 	mms_t r;
 	r = '0;
@@ -920,12 +921,16 @@ function automatic mms_t mm_step(input logic ld, input logic [15:0] mask, input 
 		end
 		r.issue = (mask != 16'd0) && (!pend || cap) && !have && !stall;
 	end else begin
-		if (!stall && mask != 16'd0) begin r.disp = 1'b1; r.fin = one; end
+		// (a store waits while EX writes the register it stores: its value
+		// comes from the register file, never from EX -- timing)
+		if (!stall && mask != 16'd0 && !sblk) begin r.disp = 1'b1; r.fin = one; end
 	end
 	return r;
 endfunction
+wire mm_sblk = hz(ex_w0_v, ex_w0_r, ra_c, ra_c, ra_c, ra_c) || hz(ex_u0_v, ex_u0_r, ra_c, ra_c, ra_c, ra_c) ||
+               hz(ex_u1_v, ex_u1_r, ra_c, ra_c, ra_c, ra_c);
 wire mms_t mms = mm_step(mm_lde, mm_mask, mm_empty, rd_pend, cap, mm_have, stall_in, mm_rlast, mm_hlast, mm_one,
-                         mm_p, mm_16);
+                         mm_p, mm_sblk, mm_16);
 
 function automatic ex_t mm_uop(input id_t i, input mms_t m, input logic ld, input logic [4:0] r,
                                input logic [31:0] v, input logic [31:0] addr, input logic last,
@@ -957,7 +962,7 @@ wire  [4:0] mm_dreg = mm_lde ? (mms.from_buf ? mm_hreg : mm_rreg) : mm_sreg;
 // MOVEP load: the last byte completes Dx (.W: its low word; op_b = Dx)
 wire [31:0] mp_val  = (i.size == SZ_W) ? {op_b[31:16], mp_acc[7:0], rd_data[7:0]} : {mp_acc, rd_data[7:0]};
 wire [31:0] mm_dval = mm_ld ? (mms.from_buf ? mm_hdata : mm_p ? mp_val : rd_data) :
-                      (mm_pre && mm_sreg == mm_base) ? op_c - mm_sz : op_c;
+                      (mm_pre && mm_sreg == mm_base) ? rd_c - mm_sz : rd_c;
 function automatic ex_t m16_upd(input ex_t x0, input logic m16, input logic last, input eac_t e);
 	ex_t x;
 	x = x0;
@@ -1087,7 +1092,9 @@ assign halted    = (ph == P_HALT);
 // with the CCR the instruction ahead of it (in EX, or committing in WB)
 // leaves -- a two-clock correction instead of the four a redirect from EX
 // costs (M68040UM 10.5 p. 10-11: Bcc not taken 3, DBcc 3/4).
-wire [15:0] dbc_dec = op_b[15:0] - 16'd1;
+// (the counter from the register file: a DBcc waits while EX writes it --
+// vdep -- so the loop test is off EX's result path, timing)
+wire [15:0] dbc_dec = rd_b[15:0] - 16'd1;
 wire       br_taken = (i.cls == CL_BCC) ? br_cc : (!br_cc && dbc_dec != 16'hFFFF);
 
 assign eaf_redir_v  = st.disp && st.dsel == 3'd0 && !flush &&

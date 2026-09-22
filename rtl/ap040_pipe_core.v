@@ -86,7 +86,7 @@ wire  [1:0] fw_st_size;
 wire        q_v0, q_v1;  wire [31:0] q_pc0;  wire [15:0] q_w0, q_w1;  wire [1:0] id_consume;
 // self-modifying code: the code the stages younger than EX hold
 wire [31:0] if_q_lo, if_q_hi, id_g_lo, id_g_hi;
-wire        id_g_v, ex_smc, smc_hit;
+wire        id_g_v, smc_hit, wb_smc;
 wire        id_valid;  id_t id_o;
 wire        eac_valid; eac_t eac_o;
 wire        eaf_valid; ex_t eaf_o;
@@ -105,11 +105,15 @@ wire [31:0] eac_redir_pc, eaf_redir_pc;
 // Redirects, oldest first: EX (not-taken branch, RTE, MOVE to SR, exception
 // entry), EA-fetch (RTS, memory-indirect JMP/JSR), EA-calc (JMP/JSR), ID
 // (guessed-taken Bcc/BSR/DBcc).  Each flushes the stages in front of it.
-wire flush     = ex_redirect;                                   // EA-fetch
-wire flush_eac = ex_redirect || eaf_redir_v;                    // EA-calc
-wire flush_id  = ex_redirect || eaf_redir_v || eac_redir_v;     // ID
-wire        redirect_valid = ex_redirect || eaf_redir_v || eac_redir_v || id_redirect_valid;
-wire [31:0] redirect_pc    = ex_redirect ? ex_redirect_pc :
+// (WB's self-modifying-code refetch is older than all of them, and squashes
+// EX's micro-op too)
+wire ex_redir_q = ex_redirect && !wb_smc;
+wire flush     = ex_redir_q || wb_smc;                                   // EA-fetch
+wire flush_eac = ex_redir_q || wb_smc || eaf_redir_v;                    // EA-calc
+wire flush_id  = ex_redir_q || wb_smc || eaf_redir_v || eac_redir_v;     // ID
+wire        redirect_valid = wb_smc || ex_redirect || eaf_redir_v || eac_redir_v || id_redirect_valid;
+wire [31:0] redirect_pc    = wb_smc ? exe_o.stf.npc :
+                             ex_redirect ? ex_redirect_pc :
                              eaf_redir_v ? eaf_redir_pc :
                              eac_redir_v ? eac_redir_pc : id_redirect_pc;
 
@@ -242,6 +246,9 @@ ap040_pipe_l1 #(
 	.wr_ready  (d_wr_ready)
 );
 
+wire older_store = eaf_valid && (eaf_o.st_v || eaf_o.dk == DK_MEM ||
+                                 eaf_o.cls == CL_BSR || eaf_o.cls == CL_JSR);
+
 generate if (BUS == 0) begin : g_l1
 	// fetches always granted, answered the next clock
 	reg f_ack_r;
@@ -270,7 +277,7 @@ end else begin : g_bus
 		.st_addr(exe_o.st_addr), .st_size(exe_o.st_size),
 		.st_data(exe_o.st_data), .st_fc(exe_o.st_fc), .st_rb(exe_o.st_rb), .mem_rb(),
 		.sb_full(sb_full), .sb_busy(sb_busy), .st_done(st_done), .st_ferr(st_ferr), .st_fatc(st_fatc),
-		.older_st(fw_st_v || (exe_valid && exe_o.st_v)),
+		.older_st(older_store || (exe_valid && exe_o.st_v)),   // (registered state only: timing)
 		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
 		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(d_rd_err),
 		.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_fc(sr_now[13] ? 3'd6 : 3'd2),
@@ -290,7 +297,7 @@ ap040_inst_fetch #(
 ) u_if
 (
 	.clk(clk), .nreset(nreset), .ce(ce),
-	.redirect_valid(redirect_valid), .redirect_pc(redirect_pc), .redirect_hold(ex_smc),
+	.redirect_valid(redirect_valid), .redirect_pc(redirect_pc), .redirect_hold(wb_smc && BUS == 0),
 	.q_lo(if_q_lo), .q_hi(if_q_hi),
 	.consume(id_consume),
 	.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_gnt(f_gnt), .f_ack(f_ack), .f_data(f_data),
@@ -310,8 +317,7 @@ ap040_decode u_id
 );
 
 wire older_busy  = eaf_valid || exe_valid || sb_busy;   // (serialising waits for posted stores too)
-wire older_store = eaf_valid && (eaf_o.st_v || eaf_o.dk == DK_MEM ||
-                                 eaf_o.cls == CL_BSR || eaf_o.cls == CL_JSR);
+// (older_store is declared above, before the bus controller uses it)
 wire    early_v;
 rdreq_t early_rd;
 
@@ -374,22 +380,36 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HA
 	.eaf_redir_v(eaf_redir_v), .eaf_redir_pc(eaf_redir_pc)
 );
 
-// EX's store against every younger instruction's code: EA-fetch's, EA-calc's
-// (ID's output), the words ID has gathered, and IF's queue plus fetch in flight
+// Self-modifying code (t_integer.s "store into the fetch queue", PLAN D10):
+// WB's store against every younger instruction's code -- EX's micro-op's
+// (another instruction's), EA-fetch's, ID's output, the words ID has
+// gathered, IF's queue and fetch in flight.  On the instruction's last
+// micro-op (a hit on an earlier one waits in smc_pend) WB redirects to the
+// instruction's architectural next PC and squashes everything younger,
+// EX's micro-op included.  In WB, on registered state, not in EX (timing).
+// On the bus the store is in memory by then (synchronous stores); on the
+// L1 substrate it lands at this edge, so IF fetches a clock later.
 function automatic logic ovl(input logic [31:0] a, input logic [1:0] sz, input logic v,
                              input logic [31:0] lo, input logic [31:0] hi);
 	logic [31:0] e;
 	e = a + ((sz == SZ_B) ? 32'd1 : (sz == SZ_W) ? 32'd2 : 32'd4);
 	return v && (a < hi) && (lo < e);
 endfunction
-assign smc_hit = ovl(fw_st_addr, fw_st_size, eac_valid, eac_o.i.pc, eac_o.i.next_pc) ||
-                 ovl(fw_st_addr, fw_st_size, id_valid, id_o.pc, id_o.next_pc) ||
-                 ovl(fw_st_addr, fw_st_size, id_g_v, id_g_lo, id_g_hi) ||
-                 ovl(fw_st_addr, fw_st_size, 1'b1, if_q_lo, if_q_hi);
+assign smc_hit = exe_valid && exe_o.st_v && !exe_o.stf.exc &&
+                 (ovl(exe_o.st_addr, exe_o.st_size, eaf_valid && eaf_o.pc != exe_o.pc, eaf_o.pc, eaf_o.next_pc) ||
+                  ovl(exe_o.st_addr, exe_o.st_size, eac_valid, eac_o.i.pc, eac_o.i.next_pc) ||
+                  ovl(exe_o.st_addr, exe_o.st_size, id_valid, id_o.pc, id_o.next_pc) ||
+                  ovl(exe_o.st_addr, exe_o.st_size, id_g_v, id_g_lo, id_g_hi) ||
+                  ovl(exe_o.st_addr, exe_o.st_size, 1'b1, if_q_lo, if_q_hi));
+reg  smc_pend;
+assign wb_smc = retire && exe_o.last && (smc_hit || smc_pend) && !wb_fault && ce;
+always @(posedge clk)
+	if (!nreset) smc_pend <= 1'b0;
+	else if (ce && retire) smc_pend <= !exe_o.last && (smc_pend || smc_hit);
 
 ap040_execute u_ex
 (
-	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(wb_hold), .wb_drop(wb_fault),
+	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(wb_hold), .wb_drop(wb_fault || wb_smc),
 	.eaf_valid(eaf_valid), .x(eaf_o),
 	.ccr_in(sr_now[4:0]), .sr_in(sr_now),
 	.sfc_in({29'd0, sfc}), .dfc_in({29'd0, dfc}), .cacr_in(cacr), .vbr_in(vbr),
@@ -400,7 +420,6 @@ ap040_execute u_ex
 	.fw_ccr_v(fw_ccr_v), .fw_ccr(fw_ccr),
 	.fw_st_v(fw_st_v), .fw_st_addr(fw_st_addr), .fw_st_size(fw_st_size), .fw_st_data(fw_st_data),
 	.ex_redirect(ex_redirect), .ex_redirect_pc(ex_redirect_pc),
-	.smc_in(smc_hit), .ex_smc(ex_smc),
 	.exe_valid(exe_valid), .exe_o(exe_o)
 );
 
