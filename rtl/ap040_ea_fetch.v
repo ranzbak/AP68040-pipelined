@@ -303,6 +303,10 @@ wire        cm_use  = cm_hit && mm_cmi && cm_mode;
 // now, again after the RTE -- and a read with a side effect (a CIA's ICR
 // read clears its flags, M68040UM 8.1.4: an interrupt is taken between
 // instructions, the one in front has not accessed memory) would lose it.
+// The deferral is bounded by the program: a boundary whose instruction takes
+// no operand from memory (a branch, a register operation, the handler's own
+// code) always comes, and t_irq_pipe.s check 33 holds every request in a run
+// of 16 back-to-back loads to the same boundary rule.
 wire        i_rd    = (rd_pend && !rd_drop) || done_smi || done_dmi || done_sld || done_dld;
 wire        irq_now = irq_req && !(cm_hit && mm_cmi) && !i_rd;
 wire [31:0] s_addr_now = done_smi ? s_addr : eac_i.src_ea;
@@ -780,22 +784,14 @@ function automatic stp_t stepf(
 	input logic [31:0] s_addr_c, input logic [31:0] s_val_c, input logic [31:0] d_val_c,
 	input logic [2:0] x_step, input logic [31:0] vbr, input logic [7:0] x_vec, input logic [31:0] x_target,
 	input logic [2:0] r_step, input logic [31:0] sp_now, input logic fmt_ok, input logic rte_goes,
-	input logic rx7, input logic irq_r, input logic [2:0] irq_l, input logic rs_done);
+	input logic rx7, input logic rs_done);
 	stp_t s;
 	s = '0;
 	case (ph)
 		P_START, P_OPS: if (ev_valid && !rstp) begin
-			if (irq_r && ph == P_START) begin
-				// An interrupt above the mask is taken at this instruction
-				// boundary (M68040UM 8.1.4): once everything older has
-				// committed -- the mask the decision used is then the
-				// architectural one -- vector 24 + level, format $0, PC =
-				// this instruction, which has not started
-				if (!older_busy) begin
-					s.exc_go = 1'b1; s.irq = 1'b1; s.ev = 8'd24 + {5'd0, irq_l}; s.ef = 4'd0;
-					s.epc = i.pc;
-				end
-			end else if (i.serialize && older_busy && ph == P_START) begin
+			// (an interrupt at this boundary overrides everything this chain
+			// decides -- irq_st below, not a term in the chain: timing)
+			if (i.serialize && older_busy && ph == P_START) begin
 				// wait until everything older has committed
 			end else if (i.priv && !s_bit) begin
 				s.exc_go = 1'b1; s.ev = 8'd8; s.ef = 4'd0; s.epc = i.pc;
@@ -892,15 +888,10 @@ function automatic stp_t stepf(
 				end
 			end
 		end
-		P_STOP: if (ev_valid) begin
-			// stopped: an interrupt above the (new) mask ends it, once the SR
-			// micro-op has committed; the stacked PC is the instruction after
-			// the STOP (M68040UM 8.1.4; PRM STOP)
-			if (!older_busy && irq_r) begin
-				s.exc_go = 1'b1; s.irq = 1'b1; s.ev = 8'd24 + {5'd0, irq_l}; s.ef = 4'd0;
-				s.epc = i.next_pc;
-			end
-		end
+		// P_STOP: an interrupt above the (new) mask ends the stopped state
+		// once the STOP's SR micro-op has committed, with the PC of the
+		// instruction after the STOP (M68040UM 8.1.4; PRM STOP) -- irq_st
+		// below, with the rest of the interrupt entry
 		P_RSTO: if (ev_valid) begin
 			if (rs_done && !stall) begin s.disp = 1'b1; s.dsel = 3'd0; s.fin = 1'b1; end
 		end
@@ -925,7 +916,7 @@ wire stp_t st0 = stepf(ph, eac_valid, rst_pending, i, older_busy, !bf_rdblk, rd_
                       s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, trap_n, trap_vec,
                       indexed_mode, two_uop, bf_step, sync_busy, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes,
-                      r_fv[15:12] == 4'd7, irq_now, irq_lvl, rs_cnt == 10'd0);
+                      r_fv[15:12] == 4'd7, rs_cnt == 10'd0);
 
 //--------------------------------------------------------------- access errors
 // A data read that ends in an access error (M68040UM 8.2.1, p. 8-6): the
@@ -1170,7 +1161,29 @@ function automatic stp_t pm_st(input stp_t t0, input logic inph, input logic got
 	end
 	return t;
 endfunction
-wire stp_t st = aerr_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in), aerr_go, i, rd_a_q);
+// An interrupt above the mask is taken at an instruction boundary
+// (M68040UM 8.1.4, p. 8-12): vector 24 + level, format $0, PC = the
+// instruction that has not started, mask = the level.  It overrides whatever
+// the dispatch chain decided for that instruction rather than sitting at the
+// top of it -- the chain is the core's longest combinational path (EA-fetch's
+// output to IF's fetch PC), and a term there costs ~0.9 ns of WNS.
+function automatic stp_t irq_st(input stp_t s, input logic go, input logic [2:0] lvl,
+                                input logic [31:0] pc);
+	stp_t t;
+	begin
+		t = s;
+		if (go) begin
+			t = '0;
+			t.exc_go = 1'b1; t.irq = 1'b1;
+			t.ev = 8'd24 + {5'd0, lvl}; t.ef = 4'd0; t.epc = pc;
+		end
+		return t;
+	end
+endfunction
+wire irq_go = eac_valid && !rst_pending && irq_now && !older_busy &&
+              ((ph == P_START) || (ph == P_STOP));
+wire stp_t st = aerr_st(irq_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in),
+                               irq_go, irq_lvl, (ph == P_STOP) ? i.next_pc : i.pc), aerr_go, i, rd_a_q);
 
 //--------------------------------------------------------------- PFLUSH / PTEST
 // M68040UM 3.7 (MMU instructions): privileged; they wait for everything
@@ -1268,8 +1281,7 @@ wire [2:0] fc_data = s_bit ? 3'd5 : 3'd1;
 assign rd_fc     = (st.issue && (ph == P_START || ph == P_OPS) && i.fcsel == 2'd1) ? sfc_in :
                    (ph == P_EXC || ph == P_RTE || ph == P_RESET) ? 3'd5 : fc_data;
 wire   use_early = early_v && early.v && !st.issue && (!rd_pend || rd_ack) &&
-                   (st.fin || !eac_valid) && !rst_pending &&
-                   !irq_req;   // (an interrupt pending: the next instruction starts without a read, so it is taken in front of it)
+                   (st.fin || !eac_valid) && !rst_pending;
 assign rd_req    = (st.issue || use_early) && !flush;
 assign rd_addr   = st.issue ? st.ia  : early.a;
 assign rd_size   = st.issue ? st.isz : early.sz;
