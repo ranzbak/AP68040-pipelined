@@ -34,6 +34,8 @@ module ap040_inst_fetch
 
 	input             redirect_valid,
 	input      [31:0] redirect_pc,
+	input             redirect_hold, // (with redirect_valid) take it, but fetch one clock later:
+	                                 // a store into the code is still on its way to memory
 
 	input       [1:0] consume,      // words ID takes from the head this clock
 
@@ -45,7 +47,10 @@ module ap040_inst_fetch
 	output            q_v1,         // second word valid
 	output     [31:0] q_pc0,        // address of the head word
 	output     [15:0] q_w0,
-	output     [15:0] q_w1
+	output     [15:0] q_w1,
+	// the code held here: every word queued or in flight lies in [q_lo, q_hi)
+	output     [31:0] q_lo,
+	output     [31:0] q_hi
 );
 
 localparam QN = 6;
@@ -58,6 +63,7 @@ reg        infl;          // a fetch is in flight (data next clock)
 reg  [1:0] infl_n;        // how many words it carries
 reg [31:0] issued;        // words handed to ID so far
 reg        running;
+reg        hold;          // no fetch this clock (after an SMC redirect)
 
 // PROG_WORDS bounds the words handed to ID (as the milestone-4 IF counted
 // the words it presented), not the words fetched
@@ -70,7 +76,10 @@ assign q_w1  = q[1];
 wire  [1:0] want      = 2'd2;
 wire  [2:0] after_c   = redirect_valid ? 3'd0 : (qcnt - {1'b0, consume});
 wire  [2:0] pend      = (!redirect_valid && infl) ? {1'b0, infl_n} : 3'd0;
-wire        can_issue = ce && (running || redirect_valid) && (want != 2'd0) &&
+assign q_lo = qpc;
+assign q_hi = fpc;
+wire        can_issue = ce && (running || redirect_valid) && (want != 2'd0) && !hold &&
+                        !(redirect_valid && redirect_hold) &&
                         (after_c + pend + 3'd2 <= QN);
 wire [31:0] f_addr    = redirect_valid ? redirect_pc : fpc;
 
@@ -90,6 +99,7 @@ always @(posedge clk) begin
 		infl_n  <= 2'd0;
 		issued  <= 32'd0;
 		running <= (FETCH_AT_RESET != 0);
+		hold    <= 1'b0;
 		for (k = 0; k < QN; k = k + 1) q[k] <= 16'h4E71;
 	end else if (ce) begin
 		// pop what ID took, append what arrives (not after a redirect)
@@ -109,6 +119,7 @@ always @(posedge clk) begin
 		end else begin
 			qpc <= qpc + {29'd0, consume, 1'b0};
 		end
+		hold   <= redirect_valid && redirect_hold;
 		infl   <= can_issue;
 		infl_n <= want;
 		issued <= issued + {30'd0, consume};

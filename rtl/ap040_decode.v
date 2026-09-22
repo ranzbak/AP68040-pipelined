@@ -53,7 +53,9 @@ module ap040_decode
 	output     [31:0] id_redirect_pc,
 
 	output reg        id_valid,
-	output id_t       id_o
+	output id_t       id_o,
+	output     [31:0] g_lo, g_hi,   // words gathered for the next instruction (SMC check)
+	output            g_v
 );
 
 
@@ -209,7 +211,7 @@ localparam [5:0]
 	F_BITD = 6'd38, F_BITS = 6'd39, F_CAS = 6'd40, F_CAS2 = 6'd41, F_CHK2 = 6'd42,
 	F_CHK = 6'd43, F_TAS = 6'd44, F_NBCD = 6'd45, F_MDW = 6'd46, F_MDL = 6'd47,
 	F_TRAPCC = 6'd48, F_BCD = 6'd49, F_PACK = 6'd50, F_UNPK = 6'd51, F_SHR = 6'd52,
-	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55, F_MOVEUSP = 6'd56, F_MOVEP = 6'd57, F_MOVE16 = 6'd58, F_MOVES = 6'd59;
+	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55, F_MOVEUSP = 6'd56, F_MOVEP = 6'd57, F_MOVE16 = 6'd58, F_MOVES = 6'd59, F_CINV = 6'd60;
 
 // What an opcode word implies about the words that follow it.
 typedef struct packed {
@@ -413,6 +415,11 @@ function automatic shape_t shape(input logic [15:0] op);
 		16'b0100_1110_0100_????: begin s.ok = 1'b1; s.form = F_TRAP; end
 		16'b0100_1110_0111_101?: begin s.ok = 1'b1; s.form = F_MOVEC; s.npre = 2'd1; end
 		16'b0100_1110_0110_????: begin s.ok = 1'b1; s.form = F_MOVEUSP; end   // MOVE An,USP / USP,An
+		// CINV/CPUSH (scope 01 line, 10 page, 11 all): a privileged, serialising
+		// no-op until M8 connects them to the caches (t_integer.s needs CINVA)
+		16'b1111_0100_???0_1???, 16'b1111_0100_???1_0???, 16'b1111_0100_???1_1???: begin
+			s.ok = 1'b1; s.form = F_CINV;
+		end
 		16'b1111_0110_0010_0???: begin s.ok = 1'b1; s.form = F_MOVE16; s.npre = 2'd1; s.sz = SZ_L; end  // (Ax)+,(Ay)+
 		16'b1111_0110_000?_????: begin s.ok = 1'b1; s.form = F_MOVE16; s.npre = 2'd2; s.sz = SZ_L; end  // abs.L forms
 		16'h4E71: begin s.ok = 1'b1; s.form = F_NOP; end
@@ -906,6 +913,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					d.cls = CL_EXC; d.exc_vec = 8'd4;
 				end
 			end
+			F_CINV: begin d.cls = CL_NOP; d.priv = 1'b1; d.serialize = 1'b1; end
 			F_MOVES: begin                      // a MOVE in the SFC/DFC space, no flags (PRM 6-24)
 				d.cls = CL_ALU; d.alu = `AP040_ALU_MOVE; d.priv = 1'b1; d.serialize = 1'b1;
 				if (x1[11]) begin                 // Rn -> <ea> [DFC]
@@ -947,6 +955,11 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 endfunction
 
 wire id_t d = decf(vbuf, vpc, sh, tot, ln.ea_bad);
+
+// the code gathered here (self-modifying-code check in the core)
+assign g_lo = g_pc;
+assign g_hi = g_pc + {27'd0, wcnt, 1'b0};
+assign g_v  = (wcnt != 4'd0);
 
 //--------------------------------------------------------------- emit
 

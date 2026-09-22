@@ -48,6 +48,9 @@ module ap040_pipe_core
 
 //--------------------------------------------------------------- stage wires
 wire        q_v0, q_v1;  wire [31:0] q_pc0;  wire [15:0] q_w0, q_w1;  wire [1:0] id_consume;
+// self-modifying code: the code the stages younger than EX hold
+wire [31:0] if_q_lo, if_q_hi, id_g_lo, id_g_hi;
+wire        id_g_v, ex_smc, smc_hit;
 wire        id_valid;  id_t id_o;
 wire        eac_valid; eac_t eac_o;
 wire        eaf_valid; ex_t eaf_o;
@@ -180,7 +183,8 @@ ap040_inst_fetch #(
 ) u_if
 (
 	.clk(clk), .nreset(nreset), .ce(ce),
-	.redirect_valid(redirect_valid), .redirect_pc(redirect_pc),
+	.redirect_valid(redirect_valid), .redirect_pc(redirect_pc), .redirect_hold(ex_smc),
+	.q_lo(if_q_lo), .q_hi(if_q_hi),
 	.consume(id_consume),
 	.l1_addr_a(l1_addr_a), .l1_en_a(l1_en_a), .l1_rdata_a(l1_rdata_a),
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1)
@@ -192,7 +196,7 @@ ap040_decode u_id
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1),
 	.consume(id_consume),
 	.id_redirect_valid(id_redirect_valid), .id_redirect_pc(id_redirect_pc),
-	.id_valid(id_valid), .id_o(id_o)
+	.id_valid(id_valid), .id_o(id_o), .g_lo(id_g_lo), .g_hi(id_g_hi), .g_v(id_g_v)
 );
 
 wire older_busy  = eaf_valid || exe_valid;
@@ -258,6 +262,19 @@ ap040_ea_fetch u_eaf
 	.eaf_redir_v(eaf_redir_v), .eaf_redir_pc(eaf_redir_pc)
 );
 
+// EX's store against every younger instruction's code: EA-fetch's, EA-calc's
+// (ID's output), the words ID has gathered, and IF's queue plus fetch in flight
+function automatic logic ovl(input logic [31:0] a, input logic [1:0] sz, input logic v,
+                             input logic [31:0] lo, input logic [31:0] hi);
+	logic [31:0] e;
+	e = a + ((sz == SZ_B) ? 32'd1 : (sz == SZ_W) ? 32'd2 : 32'd4);
+	return v && (a < hi) && (lo < e);
+endfunction
+assign smc_hit = ovl(fw_st_addr, fw_st_size, eac_valid, eac_o.i.pc, eac_o.i.next_pc) ||
+                 ovl(fw_st_addr, fw_st_size, id_valid, id_o.pc, id_o.next_pc) ||
+                 ovl(fw_st_addr, fw_st_size, id_g_v, id_g_lo, id_g_hi) ||
+                 ovl(fw_st_addr, fw_st_size, 1'b1, if_q_lo, if_q_hi);
+
 ap040_execute u_ex
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(1'b0),
@@ -271,6 +288,7 @@ ap040_execute u_ex
 	.fw_ccr_v(fw_ccr_v), .fw_ccr(fw_ccr),
 	.fw_st_v(fw_st_v), .fw_st_addr(fw_st_addr), .fw_st_size(fw_st_size), .fw_st_data(fw_st_data),
 	.ex_redirect(ex_redirect), .ex_redirect_pc(ex_redirect_pc),
+	.smc_in(smc_hit), .ex_smc(ex_smc),
 	.exe_valid(exe_valid), .exe_o(exe_o)
 );
 

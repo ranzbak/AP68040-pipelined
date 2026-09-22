@@ -33,6 +33,8 @@ module ap040_execute
 	input      [31:0] tc_in, itt0_in, itt1_in, dtt0_in, dtt1_in, mmusr_in, urp_in, srp_in,
 
 	output            ex_stall,
+	input             smc_in,     // this micro-op's store lands in code the pipeline holds (core)
+	output            ex_smc,     // the redirect is a self-modifying-code refetch (IF waits a clock)
 
 	// forwarding
 	output            fw_w0_v,
@@ -392,8 +394,20 @@ assign fw_w0_v   = eaf_valid && w.w0_v;
 assign fw_w0_r   = w.w0_r;
 assign fw_w0_val = w.w0_val;
 
-assign ex_redirect    = eaf_valid && redir;
-assign ex_redirect_pc = redir_pc;
+// Self-modifying code: a store into code younger instructions were fetched
+// from refetches after the storing instruction (its last micro-op; frame
+// stores excepted).  The 68040 needs CPUSH/CINV for this; the reference
+// core snoops its queue (t_integer.s "store into the fetch queue": AmigaOS
+// did not boot without it) and so does this one.
+reg  smc_pend;
+wire smc_now  = smc_in && eaf_valid && w.st_v && x.cls != CL_EXC;
+wire smc_fire = eaf_valid && x.last && (smc_now || smc_pend);
+assign ex_smc         = smc_fire;
+assign ex_redirect    = eaf_valid && (redir || smc_fire);
+assign ex_redirect_pc = redir ? redir_pc : x.next_pc;
+always @(posedge clk)
+	if (!nreset) smc_pend <= 1'b0;
+	else if (ce && eaf_valid && !md_wait) smc_pend <= !x.last && (smc_pend || smc_now);
 
 always @(posedge clk) begin
 	if (!nreset) begin
