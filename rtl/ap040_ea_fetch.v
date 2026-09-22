@@ -425,7 +425,7 @@ endfunction
 // equal: Du1 -> (Rn1), Du2 -> (Rn2) (two micro-ops); else (Rn1) -> Dc1 (w0)
 // and (Rn2) -> Dc2 (u1; w0 wins when Dc1 = Dc2: "memory operand 1 is
 // stored", PRM 4-68 -- see PLAN D7), and the M68040 ends the locked
-// sequence with a write of the second operand read (M68040UM 7.4.x p. 7-26).
+// sequence with a write of the second operand read (M68040UM 7.4.5 p. 7-26).
 // EX's CMP makes the flags from x.b - x.a.
 function automatic logic [31:0] mrg(input logic [31:0] old, input logic [31:0] v, input logic [1:0] sz);
 	return (sz == SZ_W) ? {old[31:16], v[15:0]} : v;

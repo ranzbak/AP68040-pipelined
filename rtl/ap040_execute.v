@@ -279,7 +279,7 @@ always @* begin
 			end else begin
 				w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = merge(x.a, x.b, x.size);   // x.dr = Dc
 				// the M68040 ends the locked sequence with a write of the value
-				// read (M68040UM 7.4.x p. 7-26; PRM 4-68 note)
+				// read (M68040UM 7.4.5 p. 7-26; PRM 4-68 note)
 				w.st_v = 1'b1; w.st_addr = x.daddr; w.st_data = x.b & szmask(x.size); w.st_size = x.size;
 				w.st_rb = 1'b1;
 			end
