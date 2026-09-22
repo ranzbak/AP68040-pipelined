@@ -54,12 +54,19 @@ module ap040_inst_fetch
 	input             f_gnt,        // the request is taken this clock
 	input             f_ack,        // the answer
 	input      [31:0] f_data,       // {word at addr, word at addr+2}
+	input             f_err,        // ... is an access error (M6): its words are poisoned
+	input             f_atc,        // ... from the MMU
 
 	output            q_v0,         // head word valid
 	output            q_v1,         // second word valid
 	output     [31:0] q_pc0,        // address of the head word
 	output     [15:0] q_w0,
 	output     [15:0] q_w1,
+	output            q_e0,         // the head word is poisoned (its fetch faulted)
+	output            q_e1,
+	output reg [31:0] pf_addr,      // the faulted fetch: address, two words, ATC
+	output reg        pf_long,
+	output reg        pf_atc,
 	// the code held here: every word queued or in flight lies in [q_lo, q_hi)
 	output     [31:0] q_lo,
 	output     [31:0] q_hi
@@ -73,10 +80,13 @@ reg [31:0] qpc;           // address of q[0]
 reg [31:0] fpc;           // next fetch address
 reg        infl;          // a fetch is outstanding
 reg        fdrop;         // ... and its answer is to be dropped (a redirect came after it)
+reg [31:0] f_fa;          // ... and its address
 reg  [1:0] infl_n;        // how many words it carries
 reg [31:0] issued;        // words handed to ID so far
 reg        running;
 reg        hold;          // no fetch this clock (after an SMC redirect)
+reg        qerr [0:QN-1]; // poisoned words (M6: a fault is raised only if the word is used)
+reg        pstop;         // a fetch faulted: no more fetches until a redirect
 
 // PROG_WORDS bounds the words handed to ID (as the milestone-4 IF counted
 // the words it presented), not the words fetched
@@ -85,6 +95,8 @@ assign q_v1  = (qcnt >= 3'd2) && (issued + 32'd1 < PROG_WORDS);
 assign q_pc0 = qpc;
 assign q_w0  = q[0];
 assign q_w1  = q[1];
+assign q_e0  = qerr[0];
+assign q_e1  = qerr[1];
 
 wire [31:0] fa        = redirect_valid ? redirect_pc : fpc;
 wire  [1:0] want      = (LONG_ANY != 0 || !fa[1]) ? 2'd2 : 2'd1;
@@ -97,6 +109,7 @@ assign q_hi = fpc;
 // a request goes out when there is room for the answer and no other fetch
 // is outstanding (or it answers now)
 wire        want_req  = (running || redirect_valid) && !hold && !(redirect_valid && redirect_hold) &&
+                        !(pstop && !redirect_valid) &&
                         (!infl || f_ack) && (after_c + pend + 3'd2 <= QN);
 assign f_req  = ce && want_req;
 assign f_addr = fa;
@@ -105,6 +118,7 @@ wire        can_issue = f_req && f_gnt;
 
 integer k;
 reg [15:0] nq [0:QN-1];
+reg        ne [0:QN-1];
 reg  [2:0] ncnt;
 
 always @(posedge clk) begin
@@ -118,18 +132,28 @@ always @(posedge clk) begin
 		issued  <= 32'd0;
 		running <= (FETCH_AT_RESET != 0);
 		hold    <= 1'b0;
-		for (k = 0; k < QN; k = k + 1) q[k] <= 16'h4E71;
+		pstop   <= 1'b0;
+		pf_addr <= 32'd0; pf_long <= 1'b0; pf_atc <= 1'b0;
+		for (k = 0; k < QN; k = k + 1) begin q[k] <= 16'h4E71; qerr[k] <= 1'b0; end
 	end else if (ce) begin
 		// pop what ID took, append what arrives (not after a redirect)
-		for (k = 0; k < QN; k = k + 1)
+		for (k = 0; k < QN; k = k + 1) begin
 			nq[k] = (k + consume < QN) ? q[k + consume] : 16'h4E71;
+			ne[k] = (k + consume < QN) ? qerr[k + consume] : 1'b0;
+		end
+		if (redirect_valid) for (k = 0; k < QN; k = k + 1) ne[k] = 1'b0;
 		ncnt = after_c;
 		if (use_ans) begin
-			nq[ncnt] = f_data[31:16];
-			if (infl_n == 2'd2) nq[ncnt + 1] = f_data[15:0];
+			nq[ncnt] = f_data[31:16]; ne[ncnt] = f_err;
+			if (infl_n == 2'd2) begin nq[ncnt + 1] = f_data[15:0]; ne[ncnt + 1] = f_err; end
 			ncnt = ncnt + {1'b0, infl_n};
 		end
-		for (k = 0; k < QN; k = k + 1) q[k] <= nq[k];
+		for (k = 0; k < QN; k = k + 1) begin q[k] <= nq[k]; qerr[k] <= ne[k]; end
+		// a faulted fetch: remember it, fetch no further until a redirect
+		if (use_ans && f_err) begin
+			pstop <= 1'b1; pf_addr <= f_fa; pf_long <= (infl_n == 2'd2); pf_atc <= f_atc;
+		end
+		if (redirect_valid) pstop <= 1'b0;
 		qcnt <= ncnt;
 		if (redirect_valid) begin
 			qpc     <= redirect_pc;
@@ -139,7 +163,7 @@ always @(posedge clk) begin
 		end
 		hold   <= redirect_valid && redirect_hold;
 		if (can_issue) begin
-			infl <= 1'b1; infl_n <= want; fdrop <= 1'b0;
+			infl <= 1'b1; infl_n <= want; fdrop <= 1'b0; f_fa <= fa;
 		end else if (got) begin
 			infl <= 1'b0; fdrop <= 1'b0;
 		end

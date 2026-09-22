@@ -1166,6 +1166,17 @@ always @(posedge clk) begin
 			endcase
 			// an exception starts: step 5 waits for everything older to
 			// commit, then latches SR and the supervisor SP
+			if (st.exc_go && ph != P_EXC && i.cls == CL_EXC && i.exc_vec == 8'd2) begin
+				// an instruction fetch fault (ID marked the instruction): FA =
+				// the faulted fetch, SSW RW = 1, SIZE of the fetch, TM = 6/2
+				x7[2]  <= i.exc_addr;
+				x7[3]  <= {ssw_f(i.imm[0], 1'b0, 1'b0, i.size, 1'b0, 1'b0, s_bit ? 3'd6 : 3'd2), 16'h0000};
+				x7[4]  <= 32'd0;
+				x7[5]  <= i.exc_addr;
+				x7[6]  <= i.exc_addr;
+				x7[7]  <= bus_wdata;
+				for (xk = 8; xk <= 14; xk = xk + 1) x7[xk] <= 32'd0;
+			end
 			if (aerr_go) begin
 				x7[2]  <= aer_m16 ? {rd_a_q[31:4], 4'd0} : rd_a_q;      // EA
 				x7[3]  <= {aer_ssw, 16'h0000};                           // SSW, WB3S

@@ -46,6 +46,11 @@ module ap040_decode
 	input      [31:0] q_pc0,
 	input      [15:0] q_w0,
 	input      [15:0] q_w1,
+	input             q_e0,         // poisoned words (their fetch faulted, M6)
+	input             q_e1,
+	input      [31:0] pf_addr,      // the faulted fetch
+	input             pf_long,
+	input             pf_atc,
 
 	output      [1:0] consume,    // words taken from the queue this clock
 
@@ -523,6 +528,7 @@ endfunction
 
 reg [10:0][15:0] wbuf;     // words gathered so far (word 0 = opcode)
 reg        [3:0] wcnt;     // how many
+reg       [10:0] werr;     // which are poisoned
 reg       [31:0] g_pc;     // address of word 0
 
 // the buffer as it will be with the incoming word appended
@@ -540,6 +546,15 @@ endfunction
 wire        [1:0] avail  = q_v0 ? (q_v1 ? 2'd2 : 2'd1) : 2'd0;
 wire        [3:0] vcnt   = wcnt + {2'd0, avail};
 wire [10:0][15:0] vbuf   = view(wbuf, wcnt, avail, q_w0, q_w1);
+function automatic logic [10:0] view_e(input logic [10:0] we, input logic [3:0] n, input logic [1:0] tk,
+                                       input logic e0, input logic e1);
+	logic [10:0] v;
+	v = we;
+	if (tk >= 2'd1 && n <= 4'd10) v[n] = e0;
+	if (tk == 2'd2 && n <= 4'd9)  v[n + 1] = e1;
+	return v;
+endfunction
+wire       [10:0] verr   = view_e(werr, wcnt, avail, q_e0, q_e1);
 wire       [31:0] vpc    = (wcnt == 4'd0) ? q_pc0 : g_pc;
 
 // total length of the instruction in the view, if known
@@ -954,7 +969,29 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 	return d;
 endfunction
 
-wire id_t d = decf(vbuf, vpc, sh, tot, ln.ea_bad);
+wire id_t d0 = decf(vbuf, vpc, sh, tot, ln.ea_bad);
+
+// A word the instruction needs came from a fetch that faulted (M6): the
+// instruction becomes an access error (vector 2, format $7, PC = its first
+// word) -- raised only now that it is reached, never for a prefetch past a
+// branch (M68040UM 8.2.1).  The words needed: the opcode, then as many as
+// the length decode asks for among those present.
+function automatic logic [10:0] upto(input logic [4:0] n);
+	return (n >= 5'd11) ? 11'h7FF : ((11'd1 << n) - 11'd1);
+endfunction
+wire [4:0] have_n = ln.more ? {1'b0, vcnt} : (({1'b0, vcnt} < tot) ? {1'b0, vcnt} : tot);
+wire       fbad   = (vcnt != 4'd0) && ((verr & upto(have_n)) != 11'd0);
+function automatic id_t ifault(input id_t x, input logic [31:0] pc, input logic [31:0] fa,
+                               input logic lng, input logic atc);
+	id_t f;
+	f = x;
+	f.cls = CL_EXC; f.exc_vec = 8'd2; f.exc_fmt = 4'd7; f.exc_next = 1'b0; f.exc_addr = fa;
+	f.size = lng ? SZ_L : SZ_W; f.imm = {31'd0, atc};
+	f.priv = 1'b0; f.serialize = 1'b0;
+	f.src.kind = EK_NONE; f.dst.kind = EK_NONE;
+	return f;
+endfunction
+wire id_t d = fbad ? ifault(d0, vpc, pf_addr, pf_long, pf_atc) : d0;
 
 // the code gathered here (self-modifying-code check in the core)
 assign g_lo = g_pc;
@@ -963,14 +1000,15 @@ assign g_v  = (wcnt != 4'd0);
 
 //--------------------------------------------------------------- emit
 
-wire emit = complete && !flush && !stall_in;
+wire done_i = complete || fbad;
+wire emit = done_i && !flush && !stall_in;
 
 // words taken: on emit, only this instruction's (the next one's first word
 // may be the second word offered); while gathering, all of them; nothing
 // while EA-calc is stalled
 wire [4:0] need = tot - {1'b0, wcnt};
 assign consume = (flush || stall_in) ? 2'd0 :
-                 complete ? need[1:0] : avail;
+                 fbad ? avail : complete ? need[1:0] : avail;
 
 // guess taken: Bcc/BRA/BSR redirect IF the clock they are emitted
 assign id_redirect_valid = emit && (d.cls == CL_BCC || d.cls == CL_BSR || d.cls == CL_DBCC);
@@ -982,20 +1020,24 @@ always @(posedge clk) begin
 		id_o     <= '0;
 		wbuf     <= '0;
 		wcnt     <= 4'd0;
+		werr     <= 11'd0;
 		g_pc     <= 32'd0;
 	end else if (ce) begin
 		if (flush) begin
 			id_valid <= 1'b0;
 			wcnt     <= 4'd0;
+			werr     <= 11'd0;
 		end else if (!stall_in) begin
-			if (complete) begin
+			if (done_i) begin
 				id_valid <= 1'b1;
 				id_o     <= d;
 				wcnt     <= 4'd0;
+				werr     <= 11'd0;
 			end else begin
 				id_valid <= 1'b0;
 				if (avail != 2'd0) begin
 					wbuf <= vbuf;
+					werr <= verr;
 					if (wcnt == 4'd0) g_pc <= q_pc0;
 					wcnt <= vcnt;
 				end

@@ -205,7 +205,9 @@ wire             d_wr_ready;
 
 // The L1 test substrate stays instantiated (the benches poke dut.u_l1.mem);
 // with BUS = 1 nothing reads it and synthesis removes it.
-wire        f_req, f_long, f_gnt, f_ack;
+wire        f_req, f_long, f_gnt, f_ack, f_err, f_atc;
+wire        q_e0, q_e1, pf_long, pf_atc;
+wire [31:0] pf_addr;
 wire [31:0] f_addr, f_data;
 wire        l1_rd_ack;
 wire [31:0] l1_rd_data;
@@ -245,8 +247,9 @@ generate if (BUS == 0) begin : g_l1
 	assign mem_req = 1'b0; assign mem_write = 1'b0; assign mem_instr = 1'b0; assign mem_size = 2'd0;
 	assign mem_addr = 32'd0; assign mem_wdata = 32'd0; assign mem_fc = 3'd0; assign bus_st_err = 1'b0;
 	assign d_rd_err = 1'b0; assign d_rd_atc = 1'b0;
+	assign f_err = 1'b0; assign f_atc = 1'b0;
 end else begin : g_bus
-	wire f_err_w, f_atc_w;
+
 	assign l1_addr_a = '0;
 	assign l1_en_a   = 1'b0;
 	ap040_pipe_bcu u_bcu
@@ -259,12 +262,12 @@ end else begin : g_bus
 		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
 		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(d_rd_err),
 		.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_fc(sr_now[13] ? 3'd6 : 3'd2),
-		.f_gnt(f_gnt), .f_ack(f_ack), .f_data(f_data), .f_err(f_err_w),
+		.f_gnt(f_gnt), .f_ack(f_ack), .f_data(f_data), .f_err(f_err),
 		.st_err(bus_st_err),
 		.mem_req(mem_req), .mem_write(mem_write), .mem_instr(mem_instr), .mem_size(mem_size),
 		.mem_addr(mem_addr), .mem_wdata(mem_wdata), .mem_fc(mem_fc),
 		.mem_ack(mem_ack), .mem_rdata(mem_rdata), .mem_flt(mem_flt), .mem_atc(mem_atc),
-		.rd_atc(d_rd_atc), .f_atc(f_atc_w)
+		.rd_atc(d_rd_atc), .f_atc(f_atc)
 	);
 end endgenerate
 
@@ -279,6 +282,8 @@ ap040_inst_fetch #(
 	.q_lo(if_q_lo), .q_hi(if_q_hi),
 	.consume(id_consume),
 	.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_gnt(f_gnt), .f_ack(f_ack), .f_data(f_data),
+	.f_err(f_err), .f_atc(f_atc),
+	.q_e0(q_e0), .q_e1(q_e1), .pf_addr(pf_addr), .pf_long(pf_long), .pf_atc(pf_atc),
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1)
 );
 
@@ -286,6 +291,7 @@ ap040_decode u_id
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ea_stall), .flush(flush_id),
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1),
+	.q_e0(q_e0), .q_e1(q_e1), .pf_addr(pf_addr), .pf_long(pf_long), .pf_atc(pf_atc),
 	.consume(id_consume),
 	.id_redirect_valid(id_redirect_valid), .id_redirect_pc(id_redirect_pc),
 	.id_valid(id_valid), .id_o(id_o), .g_lo(id_g_lo), .g_hi(id_g_hi), .g_v(id_g_v)
