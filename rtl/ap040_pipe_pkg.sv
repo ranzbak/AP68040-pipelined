@@ -235,6 +235,7 @@ typedef struct packed {
 	logic [31:0] st_addr;
 	logic [31:0] st_data;
 	logic [1:0]  st_size;
+	logic        st_rb;        // the store is a locked write-back (CAS/CAS2 mismatch, M68040UM 7.4.x p. 7-26)
 	logic        sp_v;         // write sp_val to physical stack pointer sp_r
 	logic [4:0]  sp_r;
 	logic [31:0] sp_val;
@@ -262,6 +263,7 @@ typedef struct packed {
 	logic        ccr_v; logic [4:0] ccr_val;
 	logic        sr_v;  logic [15:0] sr_val;
 	logic        st_v;  logic [31:0] st_addr; logic [31:0] st_data; logic [1:0] st_size;
+	logic        st_rb;        // locked write-back (trace benches: not a data write the reference makes)
 	logic        creg_v; logic [3:0] creg_sel; logic [31:0] creg_val;
 	logic        exc;   logic [31:0] exc_sp;
 } wb_t;

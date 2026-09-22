@@ -270,7 +270,9 @@ function automatic shape_t shape(input logic [15:0] op);
 			s.ok = ea_ok(s.dm, s.dr, 1'b1, 1'b0, 1'b0, 1'b1);
 		end
 		16'b0000_1??0_1111_1100: begin           // CAS2 (W/L): two extension words
-			s.form = F_CAS2; s.npre = 2'd2; s.ok = 1'b0;   // not yet (M3 tail)
+			s.form = F_CAS2; s.npre = 2'd2; s.alu = `AP040_ALU_CMP;
+			s.sz = op[9] ? SZ_L : SZ_W;
+			s.ok = op[10];                        // 10 word, 11 long (no byte form)
 		end
 		16'b0000_1??0_11??_????: begin           // CAS Dc,Du,<memory alterable>
 			s.form = F_CAS; s.npre = 2'd1; s.has_dst = 1'b1; s.alu = `AP040_ALU_CMP;
@@ -779,6 +781,16 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				d.cls = CL_SHIFT; d.wr_ccr = 1'b1; d.rmw = 1'b1;
 				d.src = op[5] ? ea_reg(EK_DREG, {2'b00, op[11:9]}) : ea_imm({28'd0, (op[11:9] == 3'd0), op[11:9]});
 				d.dst = ea_reg(EK_DREG, {2'b00, op[2:0]});
+			end
+			F_CAS2: begin                       // CAS2 Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
+				d.cls = CL_CAS2; d.wr_ccr = 1'b1; d.rmw = 1'b1;
+				d.ext2 = vbuf[2];
+				d.src = ea_reg(EK_MEM, {1'b0, x1[15], x1[14:12]});             // (Rn1)
+				d.src.base_en = 1'b1; d.src.mode = 3'd2;
+				d.dst = ea_reg(EK_MEM, {1'b0, vbuf[2][15], vbuf[2][14:12]});   // (Rn2)
+				d.dst.base_en = 1'b1; d.dst.mode = 3'd2;
+				d.reg_c = {2'b00, x1[8:6]};                                    // Du1
+				d.reg_d = {2'b00, vbuf[2][8:6]};                               // Du2
 			end
 			F_BF: begin                         // field at Dn or <ea>; ext: Dn, Do/offset, Dw/width
 				d.cls = CL_BF; d.wr_ccr = 1'b1;

@@ -131,13 +131,14 @@ wire [4:0] bank_now = sr_in[12] ? R_MSP : R_ISP;   // supervisor stack the SR se
 //--------------------------------------------------------------- operand reads
 function automatic logic [4:0] ra_a_f(input logic [3:0] p, input eac_t e, input logic [4:0] bank);
 	if (p == P_EXC || p == P_RTE) return bank;       // the supervisor stack pointer
+	if (e.i.cls == CL_CAS2) return {2'b00, e.i.ext[2:0]};    // Dc1 (the source is (Rn1))
 	if (e.i.cls == CL_MOVEC && !e.i.imm[4])         // Rc -> Rn: an SP selector reads the physical SP
 		return (e.i.imm[3:0] == CR_USP) ? R_USP : (e.i.imm[3:0] == CR_ISP) ? R_ISP : R_MSP;
 	return e.src_r;
 endfunction
 
 assign ra_a = ra_a_f(ph, eac_i, bank_now);
-assign ra_b = eac_i.dst_r;
+assign ra_b = (eac_i.i.cls == CL_CAS2) ? {2'b00, eac_i.i.ext2[2:0]} : eac_i.dst_r;   // CAS2: Dc2
 
 function automatic logic [31:0] fwd(input logic [4:0] r, input logic [31:0] rf,
                                     input logic w0v, input logic [4:0] w0r, input logic [31:0] w0d,
@@ -420,9 +421,57 @@ function automatic ex_t bf_uop(input ex_t x0, input logic sec, input eac_t e, in
 	return x;
 endfunction
 
-reg bf_step;               // the bitfield's second micro-op is next
-wire ex_t x_ord0 = is_bf ? bf_uop(x_ord1, bf_step, eac_i, bfr, bf_mem, bf_modify, bf_two, bf_n, bf_addr)
-                         : x_ord1;
+// CAS2 (PRM 4-66..4-68): compare (Rn1) with Dc1, then (Rn2) with Dc2; both
+// equal: Du1 -> (Rn1), Du2 -> (Rn2) (two micro-ops); else (Rn1) -> Dc1 (w0)
+// and (Rn2) -> Dc2 (u1; w0 wins when Dc1 = Dc2: "memory operand 1 is
+// stored", PRM 4-68 -- see PLAN D7), and the M68040 ends the locked
+// sequence with a write of the second operand read (M68040UM 7.4.x p. 7-26).
+// EX's CMP makes the flags from x.b - x.a.
+function automatic logic [31:0] mrg(input logic [31:0] old, input logic [31:0] v, input logic [1:0] sz);
+	return (sz == SZ_W) ? {old[31:16], v[15:0]} : v;
+endfunction
+
+function automatic ex_t cas2_uop(input ex_t x0, input logic sec, input eac_t e,
+                                 input logic [31:0] dc1, input logic [31:0] dc2,
+                                 input logic [31:0] du1, input logic [31:0] du2,
+                                 input logic [31:0] a1, input logic [31:0] m1,
+                                 input logic [31:0] a2, input logic [31:0] m2);
+	ex_t x;
+	logic [1:0] sz;
+	logic eq1, eq2;
+	sz  = e.i.size;
+	eq1 = (sz == SZ_W) ? (m1[15:0] == dc1[15:0]) : (m1 == dc1);
+	eq2 = (sz == SZ_W) ? (m2[15:0] == dc2[15:0]) : (m2 == dc2);
+	x = x0;
+	x.a = eq1 ? dc2 : dc1;
+	x.b = eq1 ? m2 : m1;
+	x.dk = DK_NONE; x.dr = R_NONE;
+	x.u0_v = 1'b0; x.u1_v = 1'b0;
+	x.st_v = 1'b1; x.st_size = sz; x.st_rb = 1'b0;
+	x.last = 1'b1;
+	if (eq1 && eq2) begin
+		x.st_addr = sec ? a2 : a1;
+		x.st_data = (sec ? du2 : du1) & szmask(sz);
+		x.last = sec;
+		if (sec) x.wr_ccr = 1'b0;
+	end else begin
+		x.dk = DK_REG; x.dr = {2'b00, e.i.ext[2:0]}; x.c = mrg(dc1, m1, sz);
+		x.u1_v = 1'b1; x.u1_r = {2'b00, e.i.ext2[2:0]}; x.u1_val = mrg(dc2, m2, sz);
+		x.st_addr = a2; x.st_data = m2 & szmask(sz); x.st_rb = 1'b1;
+	end
+	return x;
+endfunction
+
+wire cas2_two = (i.cls == CL_CAS2) &&
+                ((i.size == SZ_W) ? (s_val_c[15:0] == op_a[15:0]) : (s_val_c == op_a)) &&
+                ((i.size == SZ_W) ? (d_val_c[15:0] == op_b[15:0]) : (d_val_c == op_b));
+
+reg bf_step;               // the second micro-op (bitfield trailing byte, CAS2 Du2) is next
+wire ex_t x_ord0 = is_bf ? bf_uop(x_ord1, bf_step, eac_i, bfr, bf_mem, bf_modify, bf_two, bf_n, bf_addr) :
+                   (i.cls == CL_CAS2) ? cas2_uop(x_ord1, bf_step, eac_i, op_a, op_b, op_c, op_d,
+                                                 s_addr_c, s_val_c, d_addr_c, d_val_c) :
+                   x_ord1;
+wire two_uop = bf_two || cas2_two;
 function automatic ex_t with_cc(input ex_t x, input logic c);
 	ex_t y;
 	y = x; y.cc = c;
@@ -641,7 +690,7 @@ endfunction
 // reads never wait for older stores (store-to-load forwarding, above)
 wire stp_t st = stepf(ph, eac_valid, rst_pending, i, older_busy, 1'b1, rd_pend, rd_ack, cap,
                       s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, trap_n, trap_vec,
-                      indexed_mode, bf_two, bf_step, s_addr_c, s_val_c,
+                      indexed_mode, two_uop, bf_step, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes);
 
 // RTR to an odd PC: the CCR alone commits
@@ -806,7 +855,7 @@ always @(posedge clk) begin
 				x_vec  <= st.ev; x_fmt <= st.ef; x_pc <= st.epc; x_addr <= st.eaddr;
 				x_step <= 3'd5;
 			end
-			if (st.disp && st.dsel == 3'd0 && bf_two && !st.fin) bf_step <= 1'b1;
+			if (st.disp && st.dsel == 3'd0 && two_uop && !st.fin) bf_step <= 1'b1;
 			if (st.fin) begin
 				ph <= P_START; bf_step <= 1'b0;
 				done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;

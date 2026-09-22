@@ -168,7 +168,7 @@ function automatic logic w0_of(input id_t i);
 		CL_DBCC: return 1'b1;
 		CL_SCC, CL_MOVEFSR, CL_PACK, CL_UNPK: return i.dst.kind == EK_DREG;
 		CL_SHIFT, CL_BIT: return i.dst.kind == EK_DREG && !i.nowrite;
-		CL_MULDIV, CL_CAS: return 1'b1;
+		CL_MULDIV, CL_CAS, CL_CAS2: return 1'b1;
 		// BFEXTU/BFEXTS/BFFFO write Dn (w0_r moved below); CHG/CLR/SET/INS a field register
 		CL_BF: return (i.alu[2:0] == 3'd1 || i.alu[2:0] == 3'd3 || i.alu[2:0] == 3'd5) ||
 		              (i.dst.kind == EK_DREG && i.alu[2:0] != 3'd0);
@@ -197,6 +197,11 @@ function automatic eac_t mk(input id_t i, input eares_t s, input eares_t d,
 	o.w0_r   = rdb;
 	case (i.cls)
 		CL_BF: if (i.alu[2:0] == 3'd1 || i.alu[2:0] == 3'd3 || i.alu[2:0] == 3'd5) o.w0_r = rsb;
+		// CAS2: Dc1 (w0) and Dc2 (w1) are written when a compare fails
+		CL_CAS2: begin
+			o.w0_r = {2'b00, i.ext[2:0]};
+			o.w1_v = 1'b1; o.w1_r = {2'b00, i.ext2[2:0]};
+		end
 		// LINK An,#d: An <- SP-4 (u0), SP <- SP-4+d (u1, wins if An is A7)
 		CL_LINK: begin
 			o.u0_v = 1'b1; o.u0_r = rsb; o.u0_val = d.nv;

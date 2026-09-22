@@ -103,6 +103,27 @@ always @(posedge clk)
 			end
 	end
 
+// "rbcount <n>" + "rb <addr>" lines: exactly n locked write-backs (CAS/CAS2
+// mismatch, M68040UM p. 7-26), at those addresses in that order, each
+// rewriting the bytes memory holds
+integer n_rb = 0, want_rb = -1, rb_bad = 0, kb, n_rbl = 0;
+reg [31:0] rb_at [0:31];
+reg [2:0] rbn;
+always @(posedge clk)
+	if (nreset && dut.u_l1.wr_req && dut.exe_o.st_rb) begin
+		if (n_rb < n_rbl && rb_at[n_rb] != dut.u_l1.wr_addr) begin
+			rb_bad = rb_bad + 1;
+			$display("FAIL: locked write-back #%0d at %h, expected %h", n_rb, dut.u_l1.wr_addr, rb_at[n_rb]);
+		end
+		n_rb = n_rb + 1;
+		rbn = (dut.u_l1.wr_size == 2'd0) ? 1 : (dut.u_l1.wr_size == 2'd1) ? 2 : 4;
+		for (kb = 0; kb < rbn; kb = kb + 1)
+			if (mb(dut.u_l1.wr_addr + kb) !== dut.u_l1.wr_data[8 * (rbn - 1 - kb) +: 8]) begin
+				rb_bad = rb_bad + 1;
+				$display("FAIL: locked write-back at %h changes byte %0d", dut.u_l1.wr_addr, kb);
+			end
+	end
+
 // "inimage": no data access may fall outside the image.  The L1 model
 // aliases the high address bits (ea_all relies on it), so a wrong high
 // address (a bitfield offset shifted without its sign, say) would otherwise
@@ -147,6 +168,8 @@ initial begin
 				rc = $fscanf(fd, "%h", a);
 				noread[n_noread] = a; n_noread = n_noread + 1;
 			end else if (key == "inimage") inimage = 1;
+			else if (key == "rbcount") rc = $fscanf(fd, "%d", want_rb);
+			else if (key == "rb") begin rc = $fscanf(fd, "%h", a); rb_at[n_rbl] = a; n_rbl = n_rbl + 1; end
 			else rc = $fscanf(fd, "%h", v);
 		end
 	end
@@ -168,6 +191,8 @@ initial begin
 		else if (key == "halt") rc = $fscanf(fd, "%h", v);
 		else if (key == "noread") rc = $fscanf(fd, "%h", v);
 		else if (key == "inimage") ;
+		else if (key == "rbcount") rc = $fscanf(fd, "%d", v);
+		else if (key == "rb") rc = $fscanf(fd, "%h", v);
 		else if (key == "#") begin : skipline2
 			integer ch;
 			ch = 0;
@@ -193,7 +218,11 @@ initial begin
 		end
 	end
 	$fclose(fd);
-	errors = errors + reads_bad;
+	errors = errors + reads_bad + rb_bad;
+	if (want_rb >= 0 && n_rb != want_rb) begin
+		errors = errors + 1;
+		$display("FAIL: %0d locked write-backs, expected %0d", n_rb, want_rb);
+	end
 	if (errors == 0) $display("ALL TESTS PASSED (%0d checks, halt after %0d clocks)", nchk, cycles);
 	else $display("%0d CHECK(S) FAILED", errors);
 	$finish;
