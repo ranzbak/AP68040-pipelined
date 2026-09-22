@@ -22,7 +22,7 @@
 ; The two frame fields that format $0 does not have are recorded as zero.
 ;
 ; diff: --cycles 40000
-; expect-range: 7000 70F0
+; expect-range: 7000 7118
 ; expect-skip: d0 d1 d7 a0 a1 a2 a3 a4 a5 a6
 v_flin	equ	h_flin
 v_ill	equ	h_ill
@@ -157,6 +157,26 @@ c11e:
 	suba.l	a3,a3
 c12:	dc.w	$F000
 c12e:
+
+; 13: FMOVE.L (d16,A0),FPCR -- opclass 100, a control-register move: it has an
+;     effective address AND an extension word of its own, so the instruction is
+;     THREE words and the stacked next PC depends on getting that right
+	setup	13,$402C
+	lea	c13(pc),a4
+	lea	c13e(pc),a5
+	lea	c13e(pc),a1
+	lea	$10(a0),a3
+c13:	dc.w	$F228,$9000,$0010
+c13e:
+
+; 14: FMOVEM.X (d16,A0),FP0-FP2 -- opclass 110, three words as well
+	setup	14,$402C
+	lea	c14(pc),a4
+	lea	c14e(pc),a5
+	lea	c14e(pc),a1
+	lea	$20(a0),a3
+c14:	dc.w	$F228,$D0E0,$0020
+c14e:
 
 halt:
 	bra.s	halt

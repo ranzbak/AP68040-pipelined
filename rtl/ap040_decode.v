@@ -495,8 +495,11 @@ function automatic shape_t shape(input logic [15:0] op, input logic [15:0] x1, i
 				s.has_src = 1'b1; s.fpw = fp_imm_words(x1[12:10]);   // <ea>{fmt} -> FPn
 			end else if (x1[15:13] == 3'b011) begin
 				s.has_src = 1'b1; s.fpw = fp_imm_words(x1[12:10]);   // FPn -> <ea>{fmt}
-			end else if (x1[15:14] == 2'b11) begin
-				s.has_src = 1'b1;                                     // FMOVEM, control registers
+			end else if (x1[15]) begin
+				// opclass 100/101 are FMOVE(M) to and from the control
+				// registers and 110/111 are the FP register lists: all four
+				// have an effective address
+				s.has_src = 1'b1;
 			end
 			// x1[15:13] = 000 (FPm -> FPn), 001 (undefined opclass) and
 			// 010 with specifier 111 (FMOVECR) have no effective address
