@@ -763,6 +763,18 @@ wire        mm_ld   = i.imm[0];
 // write Dx once (the low word for .W) with the last one
 wire        mm_p    = i.imm[1];
 wire  [4:0] mp_reg  = mm_ld ? eac_i.dst_r : eac_i.src_r;
+// MOVE16 (PRM 4-125): the four source longwords are read into m16_buf
+// (reads only), then written to the destination line (stores only); both
+// lines aligned down to 16; a postincremented register gets +16 once (the
+// same register named twice: once -- WinUAE gencpu i_MOVE16, PRM silent).
+// The line is moved in address order (the burst's start-at-EA order is a
+// bus detail the M5 adapter can add).
+wire        mm_16   = i.imm[2];
+reg         m16_st;        // the store half
+reg  [31:0] m16_dst;
+reg  [31:0] m16_buf [0:3];
+reg   [1:0] mm_rk;         // the outstanding read's index (MOVE16)
+wire        mm_lde  = mm_16 ? !m16_st : mm_ld;     // loading now
 wire        mm_pre  = (i.dst.kind == EK_MEM) && (i.dst.mode == 3'd4);
 wire        mm_post = (i.src.kind == EK_MEM) && (i.src.mode == 3'd3);
 wire  [4:0] mm_base = mm_ld ? eac_i.src_r : eac_i.dst_r;
@@ -793,7 +805,8 @@ typedef struct packed {
 } mms_t;
 function automatic mms_t mm_step(input logic ld, input logic [15:0] mask, input logic empty,
                                  input logic pend, input logic cap, input logic have, input logic stall,
-                                 input logic rlast, input logic hlast, input logic one, input logic mp);
+                                 input logic rlast, input logic hlast, input logic one, input logic mp,
+                                 input logic nodisp);
 	mms_t r;
 	r = '0;
 	if (empty) begin
@@ -801,7 +814,7 @@ function automatic mms_t mm_step(input logic ld, input logic [15:0] mask, input 
 	end else if (ld) begin
 		if (have) begin
 			if (!stall) begin r.disp = 1'b1; r.from_buf = 1'b1; r.fin = hlast; end
-		end else if (cap && (!mp || rlast)) begin     // (MOVEP: only the last byte dispatches)
+		end else if (cap && (!mp || rlast) && !nodisp) begin   // (MOVEP: only the last byte; MOVE16: none)
 			if (!stall) begin r.disp = 1'b1; r.fin = rlast; end
 			else r.to_buf = 1'b1;
 		end
@@ -811,8 +824,8 @@ function automatic mms_t mm_step(input logic ld, input logic [15:0] mask, input 
 	end
 	return r;
 endfunction
-wire mms_t mms = mm_step(mm_ld, mm_mask, mm_empty, rd_pend, cap, mm_have, stall_in, mm_rlast, mm_hlast, mm_one,
-                         mm_p);
+wire mms_t mms = mm_step(mm_lde, mm_mask, mm_empty, rd_pend, cap, mm_have, stall_in, mm_rlast, mm_hlast, mm_one,
+                         mm_p, mm_16);
 
 function automatic ex_t mm_uop(input id_t i, input mms_t m, input logic ld, input logic [4:0] r,
                                input logic [31:0] v, input logic [31:0] addr, input logic last,
@@ -838,15 +851,28 @@ function automatic ex_t mm_uop(input id_t i, input mms_t m, input logic ld, inpu
 	if (last && upd && !m.empty) begin x.u1_v = 1'b1; x.u1_r = br; x.u1_val = bval; end
 	return x;
 endfunction
-wire  [4:0] mm_dreg = mm_ld ? (mms.from_buf ? mm_hreg : mm_rreg) : mm_sreg;
+wire  [4:0] mm_dreg = mm_lde ? (mms.from_buf ? mm_hreg : mm_rreg) : mm_sreg;
 // -(An) with the base in the list: the MC68020/30/40 store the initial
 // value decremented by the operand size (PRM 4-128; plan D8)
 // MOVEP load: the last byte completes Dx (.W: its low word; op_b = Dx)
 wire [31:0] mp_val  = (i.size == SZ_W) ? {op_b[31:16], mp_acc[7:0], rd_data[7:0]} : {mp_acc, rd_data[7:0]};
-wire [31:0] mm_dval = mm_ld ? (mms.from_buf ? mm_hdata : mm_p ? mp_val : rd_data) :
+wire [31:0] mm_dval = mm_16 ? m16_buf[mm_k[1:0]] :
+                      mm_ld ? (mms.from_buf ? mm_hdata : mm_p ? mp_val : rd_data) :
                       (mm_pre && mm_sreg == mm_base) ? op_c - mm_sz : op_c;
-wire ex_t   mm_x    = mm_uop(i, mms, mm_ld, mm_dreg, mm_dval, mm_addr, mms.fin, mm_pre || mm_post,
-                             mm_base, mm_addr, mm_post && mm_dreg == mm_base, mm_p, mm_k);
+function automatic ex_t m16_upd(input ex_t x0, input logic m16, input logic last, input eac_t e);
+	ex_t x;
+	x = x0;
+	if (m16 && last) begin
+		x.u0_v = e.i.imm[3]; x.u0_r = e.src_r; x.u0_val = e.src_ea + 32'd16;
+		x.u1_v = e.i.imm[4]; x.u1_r = e.dst_r;
+		x.u1_val = ((e.src_r == e.dst_r) ? e.src_ea : e.dst_ea) + 32'd16;
+	end
+	return x;
+endfunction
+wire ex_t   mm_x    = m16_upd(mm_uop(i, mms, mm_lde, mm_dreg, mm_dval, mm_addr, mms.fin,
+                                     (mm_pre || mm_post) && !mm_16,
+                                     mm_base, mm_addr, mm_post && mm_dreg == mm_base, mm_p, mm_k),
+                              mm_16, mms.fin, eac_i);
 
 function automatic stp_t mm_st(input mms_t m, input logic [31:0] a, input logic [1:0] sz);
 	stp_t t;
@@ -1028,18 +1054,27 @@ always @(posedge clk) begin
 			// MOVEM
 			if (st0.mm_go && ph != P_MOVEM) begin
 				ph       <= P_MOVEM;
-				mm_mask  <= i.ext;
-				mm_empty <= (i.ext == 16'd0);
-				mm_addr  <= mm_ld ? s_addr_c : d_addr_c;
+				mm_mask  <= mm_16 ? 16'h000F : i.ext;
+				mm_empty <= !mm_16 && (i.ext == 16'd0);
+				mm_addr  <= mm_16 ? (s_addr_c & ~32'd15) : mm_ld ? s_addr_c : d_addr_c;
 				mm_have  <= 1'b0;
+				m16_st   <= 1'b0;
+				// (Ax)+,(Ay)+ with Ax = Ay: EA-calc folded Ax's step into the
+				// destination; the line is the source's
+				m16_dst  <= ((i.src.mode == 3'd2 && i.dst.mode == 3'd2 && eac_i.src_r == eac_i.dst_r) ?
+				             s_addr_c : d_addr_c) & ~32'd15;
 			end
 			if (ph == P_MOVEM) begin
 				if (mms.issue) begin
-					mm_rreg  <= mm_sreg; mm_rlast <= mm_one;
+					mm_rreg  <= mm_sreg; mm_rlast <= mm_one; mm_rk <= mm_k[1:0];
 					mm_mask  <= mm_mask & ~(16'd1 << mm_k);
 					mm_addr  <= mm_addr + mm_sz;
 				end
-				if (!mm_ld && mms.disp) begin
+				if (mm_16 && !m16_st && cap) begin
+					m16_buf[mm_rk] <= rd_data;
+					if (mm_rlast) begin m16_st <= 1'b1; mm_mask <= 16'h000F; mm_addr <= m16_dst; end
+				end
+				if (!mm_lde && mms.disp) begin
 					mm_mask  <= mm_mask & ~(16'd1 << mm_k);
 					mm_addr  <= mm_pre ? mm_addr - mm_sz : mm_addr + mm_sz;
 				end

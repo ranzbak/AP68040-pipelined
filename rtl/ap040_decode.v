@@ -209,7 +209,7 @@ localparam [5:0]
 	F_BITD = 6'd38, F_BITS = 6'd39, F_CAS = 6'd40, F_CAS2 = 6'd41, F_CHK2 = 6'd42,
 	F_CHK = 6'd43, F_TAS = 6'd44, F_NBCD = 6'd45, F_MDW = 6'd46, F_MDL = 6'd47,
 	F_TRAPCC = 6'd48, F_BCD = 6'd49, F_PACK = 6'd50, F_UNPK = 6'd51, F_SHR = 6'd52,
-	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55, F_MOVEUSP = 6'd56, F_MOVEP = 6'd57;
+	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55, F_MOVEUSP = 6'd56, F_MOVEP = 6'd57, F_MOVE16 = 6'd58;
 
 // What an opcode word implies about the words that follow it.
 typedef struct packed {
@@ -409,6 +409,8 @@ function automatic shape_t shape(input logic [15:0] op);
 		16'b0100_1110_0100_????: begin s.ok = 1'b1; s.form = F_TRAP; end
 		16'b0100_1110_0111_101?: begin s.ok = 1'b1; s.form = F_MOVEC; s.npre = 2'd1; end
 		16'b0100_1110_0110_????: begin s.ok = 1'b1; s.form = F_MOVEUSP; end   // MOVE An,USP / USP,An
+		16'b1111_0110_0010_0???: begin s.ok = 1'b1; s.form = F_MOVE16; s.npre = 2'd1; s.sz = SZ_L; end  // (Ax)+,(Ay)+
+		16'b1111_0110_000?_????: begin s.ok = 1'b1; s.form = F_MOVE16; s.npre = 2'd2; s.sz = SZ_L; end  // abs.L forms
 		16'h4E71: begin s.ok = 1'b1; s.form = F_NOP; end
 		16'h4E73: begin s.ok = 1'b1; s.form = F_RTE; end
 		16'h4E75: begin s.ok = 1'b1; s.form = F_RTS; end
@@ -793,6 +795,25 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				d.cls = CL_SHIFT; d.wr_ccr = 1'b1; d.rmw = 1'b1;
 				d.src = op[5] ? ea_reg(EK_DREG, {2'b00, op[11:9]}) : ea_imm({28'd0, (op[11:9] == 3'd0), op[11:9]});
 				d.dst = ea_reg(EK_DREG, {2'b00, op[2:0]});
+			end
+			F_MOVE16: begin                     // run by the MOVEM sequencer: imm[2] = MOVE16
+				// imm[3]/imm[4]: the source / destination register is postincremented by 16
+				d.cls = CL_MOVEM; d.size = SZ_L;
+				if (op[5]) begin                  // MOVE16 (Ax)+,(Ay)+
+					d.imm = {27'd0, 1'b1, 1'b1, 1'b1, 2'b00};
+					d.src = ea_reg(EK_MEM, {2'b01, op[2:0]}); d.src.base_en = 1'b1; d.src.mode = 3'd2;
+					d.dst = ea_reg(EK_MEM, {2'b01, x1[14:12]}); d.dst.base_en = 1'b1; d.dst.mode = 3'd2;
+				end else begin
+					// opmode 00 (Ay)+ -> abs, 01 abs -> (Ay)+, 10 (Ay) -> abs, 11 abs -> (Ay)
+					d.imm = {27'd0, (op[4:3] == 2'b01), (op[4:3] == 2'b00), 1'b1, 2'b00};
+					if (op[3]) begin
+						d.src = ea_imm({x1, vbuf[2]}); d.src.kind = EK_MEM;
+						d.dst = ea_reg(EK_MEM, {2'b01, op[2:0]}); d.dst.base_en = 1'b1; d.dst.mode = 3'd2;
+					end else begin
+						d.src = ea_reg(EK_MEM, {2'b01, op[2:0]}); d.src.base_en = 1'b1; d.src.mode = 3'd2;
+						d.dst = ea_imm({x1, vbuf[2]}); d.dst.kind = EK_MEM;
+					end
+				end
 			end
 			F_MOVEP: begin                      // run by the MOVEM sequencer: imm[1] = MOVEP
 				d.cls = CL_MOVEM; d.imm = {30'd0, 1'b1, !op[7]};
