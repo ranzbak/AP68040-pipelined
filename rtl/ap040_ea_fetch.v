@@ -46,7 +46,10 @@ module ap040_ea_fetch
 	// operand 2 ends in the register: WinUAE's cpu_level >= 4 order, verified
 	// on hardware -- Paul's decision, PLAN D7); 1 = the 020/030 (operand 1,
 	// PRM 4-68)
-	parameter CAS2_DC_ORDER_020 = 0
+	parameter CAS2_DC_ORDER_020 = 0,
+	// 1: a full MC68040 (FPU): RTE rejects the LC/EC format $4 frame
+	// (format error), as the reference with AP040_HAS_FPU; 0: the LC040 pops it
+	parameter HAS_FPU = 0
 )
 (
 	input             clk,
@@ -653,7 +656,7 @@ function automatic ex_t reset_final(input id_t i, input logic [31:0] ssp, input 
 	return x;
 endfunction
 
-wire rte_fmt_ok = (r_fv[15:12] <= 4'd4) || (r_fv[15:12] == 4'd7);
+wire rte_fmt_ok = (r_fv[15:12] <= 4'd3) || (r_fv[15:12] == 4'd4 && HAS_FPU == 0) || (r_fv[15:12] == 4'd7);
 wire rte_goes   = (r_fv[15:12] != 4'd1) && !r_pc[0];   // the RTE final micro-op redirects
 
 //--------------------------------------------------------------- the step logic

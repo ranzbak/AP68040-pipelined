@@ -34,7 +34,9 @@ module ap040_pipe_core
 	// CAS2 Dc1 = Dc2 on a failed compare: 0 the 68040's order (operand 2), 1 the 020/030's
 	parameter         CAS2_DC_ORDER_020  = 0,
 	// BUS = 1: 0 synchronous stores (precise access errors, M6), 1 posted (fatal errors)
-	parameter         STORE_POST         = 0
+	parameter         STORE_POST         = 0,
+	// 1: RTE treats format $4 as a format error (a full 68040; the FPU is M10)
+	parameter         HAS_FPU            = 0
 )
 (
 	input  clk,
@@ -343,7 +345,7 @@ ap040_ea_calc u_eac
 
 
 
-ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020)) u_eaf
+ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HAS_FPU(HAS_FPU)) u_eaf
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ex_stall), .flush(flush),
 	.eac_valid(eac_valid), .eac_i(eac_o),

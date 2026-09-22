@@ -250,7 +250,8 @@ ap040_pipe_core #(
 	.PROG_WORDS(32'h7FFF_FFFF),
 	.L1_AW(2),
 	.RESET_FROM_VECTORS(1),
-	.BUS(1)
+	.BUS(1),
+	.HAS_FPU(AP040_HAS_FPU)
 ) core (
 	.clk(clk),
 	.nreset(nreset),
