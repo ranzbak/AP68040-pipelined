@@ -83,6 +83,13 @@ reg  [15:0] w;
 reg   [7:0] b;
 integer     k, n;
 
+`ifdef SYNTHESIS
+// A test substrate, never part of a synthesised design: with BUS = 1 nothing
+// drives it, and its variable-length byte loops do not synthesise.
+always @(posedge clock) begin
+	q_a <= 32'd0; rd_ack <= 1'b0; rd_data <= 32'd0;
+end
+`else
 always @(posedge clock) begin
 	if (en_a) q_a <= {mem[address_a], mem[address_a + 1'b1]};
 	if (!nreset) begin
@@ -109,5 +116,6 @@ always @(posedge clock) begin
 		end
 	end
 end
+`endif
 
 endmodule
