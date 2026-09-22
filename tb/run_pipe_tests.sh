@@ -94,9 +94,9 @@ else
 	echo "  (vasmm68k_mot not found: program benches skipped)"
 fi
 
-# the wrapper (plan M5): ap040_pipe_tg68k_compat with the reference's cache
-# and 16-bit adapter, lib/AP68040's program bench (three wait profiles) on
-# the reference's t_integer.s.  AP040_REF points at lib/AP68040.
+# the wrapper (plan M5): ap040_pipe_tg68k_compat with the reference's cache,
+# MMU (M7) and 16-bit adapter, lib/AP68040's program bench (three wait
+# profiles) on the reference's t_integer.s, t_bitfield_mmu.s and t_mmu.s.  AP040_REF points at lib/AP68040.
 AP040_REF=${AP040_REF:-$(cd ../../MinimigAGA_TC64/lib/AP68040 2>/dev/null && pwd)}
 if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v vasmm68k_mot > /dev/null; then
 	CSRC="$SRC $(ls $RTL/compat/*.v | tr '\n' ' ') $RTL/compat/primitives/dpram.v"
@@ -112,8 +112,17 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 		vvp "$WORK/tb_$u.vvp" > "$WORK/unit_$u.log" 2>&1 && grep -q "ALL TESTS PASSED" "$WORK/unit_$u.log" &&
 			echo "  pass  unit:$u" || { echo "  FAIL  unit:$u  (see $WORK/unit_$u.log)"; fail=1; }
 	done
-	for t in t_integer; do
-		( cd "$AP040_REF/tb/asm" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OLDPWD/$WORK/$t.bin" "$t.s" )
+	# t_mmu.s through mk_tmmu.py (the manual's WB1 for a faulted write, PLAN
+	# D13; no interrupts or STOP before M9)
+	python3 mk_tmmu.py "$AP040_REF/tb/asm/t_mmu.s" m7 > "$WORK/t_mmu_m7.s"
+	for t in t_integer t_bitfield_mmu t_mmu_m7 t_mmu_pipe; do
+		if [ "$t" = t_mmu_m7 ]; then
+			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "$WORK/$t.s"
+		elif [ "$t" = t_mmu_pipe ]; then
+			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "mmu_asm/$t.s"
+		else
+			( cd "$AP040_REF/tb/asm" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OLDPWD/$WORK/$t.bin" "$t.s" )
+		fi
 		python3 bin2hex.py "$WORK/$t.bin" "$WORK/$t.hex"
 		if timeout 1800 vvp "$WORK/tb_compat.vvp" +prog="$WORK/$t.hex" > "$WORK/compat_$t.log" 2>&1 &&
 		   grep -q "ALL TESTS PASSED" "$WORK/compat_$t.log"; then

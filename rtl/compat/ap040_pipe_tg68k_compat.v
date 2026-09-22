@@ -237,8 +237,7 @@ wire [31:0] pf_addr;
 wire  [2:0] pf_fcw;
 
 // The pipelined core (Minimig plan M5) in place of lib/AP68040's
-// ap040_core.  No MMU until M7: the core's requests reach the cache as they
-// are (physical = logical), the walker port is idle, PTEST/PFLUSH/CINV are
+// ap040_core.  The MMU sits between the core and the cache (M7); CINV is
 // not requested.  No FPU until M10, no interrupts until M9.
 wire        core_st_err;
 wire [31:0] c_dbg_pc, c_dbg_d0, c_dbg_d1, c_dbg_d2, c_dbg_a0, c_dbg_sp, c_dbg_usp, c_dbg_isp;
@@ -280,10 +279,40 @@ ap040_pipe_core #(
 	.cacr_q(cacr_out),
 	.vbr_q(vbr_out),
 	.dbg_a0(c_dbg_a0), .dbg_sp(c_dbg_sp), .dbg_usp(c_dbg_usp), .dbg_isp(c_dbg_isp),
-	.dbg_halted(c_dbg_halted)
+	.dbg_halted(c_dbg_halted),
+	.tc_q(w_tc), .urp_q(w_urp), .srp_q(w_srp),
+	.itt0_q(w_itt0), .itt1_q(w_itt1), .dtt0_q(w_dtt0), .dtt1_q(w_dtt1),
+	.pt_req(pt_req), .pt_write(pt_write), .pt_addr(pt_addr), .pt_fc(pt_fcw),
+	.pt_done(pt_done), .pt_mmusr(pt_mmusr),
+	.pf_req(pf_req), .pf_mode(pf_mode), .pf_addr(pf_addr), .pf_fc(pf_fcw), .pf_done(pf_done)
 );
 
-// the MMU's place: a straight connection
+// the MMU (M7): lifted from the reference as it is, wired as the reference
+// compat wires it -- the core's request port is its c_* side, the cache
+// its m_* side; PTEST/PFLUSH come from EA-fetch.  AP040_HAS_MMU = 0: a
+// straight connection (physical = logical), PTEST/PFLUSH answered at once.
+generate if (AP040_HAS_MMU != 0) begin : g_mmu
+ap040_mmu mmu (
+	.clk(clk),
+	.nreset(nreset),
+	.ce(ce_core),
+	.tc(w_tc), .urp(w_urp), .srp(w_srp),
+	.itt0(w_itt0), .itt1(w_itt1), .dtt0(w_dtt0), .dtt1(w_dtt1),
+	.c_req(mem_req), .c_write(mem_write), .c_instr(mem_instr), .c_size(mem_size),
+	.c_addr(mem_addr), .c_wdata(mem_wdata), .c_fc(mem_fc),
+	.walk_hold(post_busy),
+	.c_ack(mem_ack), .c_rdata(mem_rdata), .c_flt(mem_flt_mmu),
+	.pt_req(pt_req), .pt_write(pt_write), .pt_addr(pt_addr), .pt_fc(pt_fcw),
+	.pt_done(pt_done), .pt_mmusr(pt_mmusr),
+	.pf_req(pf_req), .pf_mode(pf_mode), .pf_addr(pf_addr), .pf_fc(pf_fcw), .pf_done(pf_done),
+	.m_req(mm_req), .m_write(mm_write), .m_instr(mm_instr), .m_size(mm_size),
+	.m_addr(mm_addr), .m_wdata(mm_wdata), .m_fc(mm_fc), .m_ack(mm_ack), .m_rdata(mm_rdata),
+	.walker_req(walker_req), .walker_we(walker_we), .walker_addr(walker_addr),
+	.walker_wdat(walker_wdat), .walker_ack(walker_ack), .walker_data(walker_data),
+	.walker_berr(walker_berr),
+	.phys_addr(mmu_addr_phys), .cache_inhibit(mmu_cache_inhibit), .m_nocache(mm_nocache)
+);
+end else begin : g_nommu
 assign mm_req    = mem_req;
 assign mm_write  = mem_write;
 assign mm_instr  = mem_instr;
@@ -301,11 +330,8 @@ assign walker_addr = 32'd0;
 assign walker_wdat = 32'd0;
 assign mmu_addr_phys     = mem_addr;
 assign mmu_cache_inhibit = 1'b0;
-assign w_tc = 32'd0; assign w_urp = 32'd0; assign w_srp = 32'd0;
-assign w_itt0 = 32'd0; assign w_itt1 = 32'd0; assign w_dtt0 = 32'd0; assign w_dtt1 = 32'd0;
-assign pt_req = 1'b0; assign pt_write = 1'b0; assign pt_addr = 32'd0; assign pt_fcw = 3'd0;
-assign pt_done = 1'b1; assign pt_mmusr = 32'd0;
-assign pf_req = 1'b0; assign pf_mode = 2'd0; assign pf_addr = 32'd0; assign pf_fcw = 3'd0; assign pf_done = 1'b1;
+assign pt_done = 1'b1; assign pt_mmusr = 32'd0; assign pf_done = 1'b1;
+end endgenerate
 assign cinv_req = 1'b0; assign cinv_ic = 1'b0; assign cinv_dc = 1'b0;
 
 assign nresetout      = 1'b1;       // RESET (M9)

@@ -92,12 +92,26 @@ module ap040_ea_fetch
 	input             rd_err,     // the read ended in an access error (M6)
 	// WB's store ended in an access error (M6, synchronous stores): EX's
 	// micro-op and this stage are flushed and vector 2 is taken
+	// PTEST / PFLUSH (M7): level requests to the MMU until done
+	output reg        pt_req,
+	output reg        pt_write,
+	output reg [31:0] pt_addr,
+	input             pt_done,
+	input      [31:0] pt_mmusr,
+	output reg        pf_req,
+	output reg  [1:0] pf_mode,
+	output reg [31:0] pf_addr,
+	input             pf_done,
+	input             bus_idle,    // the memory port has no transfer (the MMU is ours)
+	output            pmmu_busy,   // IF must not fetch
 	input             wb_fault,
 	input             wb_fatm,     // ... from the MMU (ATC)
+	input             wb_fma,      // ... on a split store's second page (SSW.MA)
 	input      [31:0] wb_st_a, input [1:0] wb_st_s, input [31:0] wb_st_d, input [2:0] wb_st_f,
 	input             wb_last,     // ... on the instruction's last micro-op (WB1 pending write)
 	input  stf_t      wb_stf,
 	input             rd_atc,     // ... from the MMU (else a physical bus error)
+	input             rd_ma,      // ... on a split read's second page (SSW.MA)
 	input      [31:0] bus_wdata,  // the memory port's last write data (the reference's stale WB3D)
 	// the older stores not yet in memory when a read sampled it: the one in
 	// WB now (it was in EX then) and the one in EX now (it was here then)
@@ -126,7 +140,8 @@ localparam [3:0] P_START = 4'd0,  // examine / wait for serialisation
                  P_RTE   = 4'd3,
                  P_RESET = 4'd4,
                  P_HALT  = 4'd5,
-                 P_MOVEM = 4'd6;  // MOVEM: one micro-op per register
+                 P_MOVEM = 4'd6,  // MOVEM: one micro-op per register
+                 P_PMMU  = 4'd7;  // PFLUSH / PTEST: the MMU request, then a refetch
 
 reg  [3:0] ph;
 reg        rd_pend;        // a read is outstanding
@@ -200,9 +215,11 @@ wire [31:0] op_b = (eac_i.u0_v && eac_i.u0_r == ra_b) ? eac_i.u0_val :
 // M68040UM / PRM BFxxx: offset = Do ? Dn (signed, 32 bits) : ext[10:6];
 // width = Dw ? Dn mod 32 : ext[4:0], 0 meaning 32.  Memory: the field
 // starts at bit (offset mod 8) of the byte at <ea> + (offset >> 3), and
-// spans 1-5 bytes.  Reads as the reference core (lib/AP68040 S_BF_MEM0):
-// a longword, plus the fifth byte for a 5-byte span; writes B / W / W+B /
-// L / L+B by span (S_BF_WR1/2).
+// spans 1-5 bytes.  Reads and writes touch only the bytes holding the
+// field: B / W / W+B / L / L+B by span (lib/AP68040 t_bitfield_mmu.s, the
+// OPENSTEP 4.2 WindowServer BFTST at the end of an 8K page: a longword read
+// of a one-byte field there faults on the next, invalid, page -- plan M7).
+// Writes as the reference core (S_BF_WR1/2).
 wire        is_bf   = (i.cls == CL_BF);
 wire        bf_mem  = is_bf && (i.dst.kind == EK_MEM);
 // Offset and width come from the register file (WB write-through), not
@@ -221,7 +238,7 @@ wire        bf_two  = bf_mem && bf_modify && (bf_n == 3'd3 || bf_n == 3'd5);
 
 //--------------------------------------------------------------- ordinary instructions
 wire addr_only    = (i.cls == CL_JMP || i.cls == CL_JSR || i.cls == CL_LEA || i.cls == CL_PEA);
-wire needs_ld_src = ((i.src.kind == EK_MEM) && !addr_only && i.cls != CL_MOVEM) || (bf_mem && bf_n == 3'd5);
+wire needs_ld_src = ((i.src.kind == EK_MEM) && !addr_only && i.cls != CL_MOVEM) || (bf_mem && (bf_n == 3'd3 || bf_n == 3'd5));
 // CHK2/CMP2 read the upper bound from <ea>+size into the "destination" load
 wire needs_ld_dst = ((i.dst.kind == EK_MEM) && i.rmw && i.cls != CL_MOVEM) || (i.cls == CL_CHK2) || bf_mem;
 wire need_smi = (i.src.kind == EK_MEM) && (i.src.mi != MI_NONE);
@@ -251,9 +268,10 @@ endfunction
 // a bitfield's longword at the field address, its fifth byte as the "source"
 wire rdreq_t nx = next_rd(need_smi, done_smi, need_dmi, done_dmi, needs_ld_src, done_sld, needs_ld_dst, done_dld,
                           eac_i.src_ea, eac_i.dst_ea,
-                          is_bf ? bf_addr + 32'd4 : s_addr_now, is_bf ? bf_addr : d_addr_now,
+                          is_bf ? bf_addr + ((bf_n == 3'd3) ? 32'd2 : 32'd4) : s_addr_now, is_bf ? bf_addr : d_addr_now,
                           is_bf ? SZ_B : i.size,
-                          (i.cls == CL_CHK2) ? i.size : is_bf ? SZ_L : i.size2);
+                          (i.cls == CL_CHK2) ? i.size : !is_bf ? i.size2 :
+                          (bf_n == 3'd1) ? SZ_B : (bf_n <= 3'd3) ? SZ_W : SZ_L);
 
 // Store-to-load forwarding.  The memory answers with what it held at the
 // clock edge ending the read's issue clock (a store committing on that edge
@@ -378,6 +396,10 @@ function automatic ex_t xord(input eac_t e, input logic [31:0] opa, input logic 
 			end else if (i.imm[3:0] == CR_USP || i.imm[3:0] == CR_ISP || i.imm[3:0] == CR_MSP) begin
 				x.dk = DK_REG;
 				x.dr = (i.imm[3:0] == CR_USP) ? R_USP : (i.imm[3:0] == CR_ISP) ? R_ISP : R_MSP;
+			end else begin
+				// TC/TTRs/URP/SRP/CACR/...: the next instruction is fetched again,
+				// under the new map (the reference's epf_flush on MOVEC)
+				x.redirect = 1'b1; x.target = i.next_pc;
 			end
 		end
 		default: ;
@@ -440,8 +462,18 @@ function automatic bfres_t bf_eval(input logic [2:0] op, input logic [63:0] win,
 	return r;
 endfunction
 
+// the bytes read, left aligned in the 64-bit window
+function automatic logic [63:0] bf_win(input logic [2:0] n, input logic [31:0] dv, input logic [7:0] sb);
+	case (n)
+		3'd1:    return {dv[7:0], 56'd0};
+		3'd2:    return {dv[15:0], 48'd0};
+		3'd3:    return {dv[15:0], sb, 40'd0};
+		3'd4:    return {dv, 32'd0};
+		default: return {dv, sb, 24'd0};
+	endcase
+endfunction
 wire bfres_t bfr = bf_eval(i.alu[2:0],
-                           bf_mem ? {d_val, s_val[7:0], 24'd0} : {rd_b, rd_b},   // (vhold: loads captured,
+                           bf_mem ? bf_win(bf_n, d_val, s_val[7:0]) : {rd_b, rd_b},   // (vhold: loads captured,
                            bf_mem ? {3'd0, bf_off[2:0]} : {1'b0, bf_off[4:0]},
                            bf_w, rd_a, bf_off, !bf_mem);   //  no EX hazard: the register file)
 
@@ -692,6 +724,8 @@ function automatic stp_t stepf(
 				s.epc = i.exc_next ? i.next_pc : i.pc; s.eaddr = i.exc_addr;
 			end else if (i.cls == CL_RTE) begin
 				// the sequence runs in P_RTE
+			end else if (i.cls == CL_PMMU) begin
+				// the sequence runs in P_PMMU
 			end else if (i.cls == CL_NOP && sync) begin
 				// NOP synchronises: it waits until every older store is in memory
 				// (M68040UM 7.7 bus synchronisation, p. 7-43)
@@ -797,7 +831,7 @@ wire stp_t st0 = stepf(ph, eac_valid, rst_pending, i, older_busy, !bf_rdblk, rd_
 // aligned), SSW {CP CU CT CM = 0, MA = 0, ATC, LK, RW = !LK, X = 0, SIZE,
 // TT, TM}, WB1S-WB3S = 0, WB3A = FA, WB3D = the port's last write data,
 // the rest 0.
-function automatic logic [15:0] ssw_f(input logic atc, input logic lk, input logic wr, input logic [1:0] sz,
+function automatic logic [15:0] ssw_f(input logic ma, input logic atc, input logic lk, input logic wr, input logic [1:0] sz,
                                       input logic m16, input logic moves, input logic [2:0] fc);
 	logic [1:0] tt, szf;
 	logic [2:0] tm;
@@ -806,12 +840,12 @@ function automatic logic [15:0] ssw_f(input logic atc, input logic lk, input log
 	else if (moves && fc[1]) tm = {fc[2], 2'b01};         // FC 2/6: data space (p. 8-28)
 	if (m16) tt = 2'b01;
 	szf = m16 ? 2'b11 : (sz == SZ_B) ? 2'b01 : (sz == SZ_W) ? 2'b10 : 2'b00;
-	return {4'b0000, 1'b0, atc, lk, !wr && !lk, 1'b0, szf, tt, tm};
+	return {4'b0000, ma, atc, lk, !wr && !lk, 1'b0, szf, tt, tm};
 endfunction
 wire        aer_lk   = (i.cls == CL_CAS) || (i.cls == CL_CAS2) ||
                        (i.cls == CL_ALU && i.alu == `AP040_ALU_TAS && i.dst.kind == EK_MEM);
 wire        aer_m16  = (i.cls == CL_MOVEM) && i.imm[2];
-wire [15:0] aer_ssw  = ssw_f(rd_atc, aer_lk, 1'b0, rd_sz_q, aer_m16, i.fcsel != 2'd0, rd_fc_q);
+wire [15:0] aer_ssw  = ssw_f(rd_ma, rd_atc, aer_lk, 1'b0, rd_sz_q, aer_m16, i.fcsel != 2'd0, rd_fc_q);
 // A store's access error (synchronous stores: the micro-op is still in
 // WB).  On the instruction's last micro-op everything else it did has
 // committed: the write is reported pending in WB1 and the stacked PC is past
@@ -820,7 +854,7 @@ wire [15:0] aer_ssw  = ssw_f(rd_atc, aer_lk, 1'b0, rd_sz_q, aer_m16, i.fcsel != 
 // an earlier micro-op (MOVEM, MOVE16, a bitfield's or CAS2's first store)
 // the instruction restarts, as the reference core does, WB1S = 0.  A fault
 // on an exception-frame store is a double fault.
-wire [15:0] wf_ssw  = ssw_f(wb_fatm, wb_stf.lk, 1'b1, wb_st_s, wb_stf.m16, wb_stf.moves, wb_st_f);
+wire [15:0] wf_ssw  = ssw_f(wb_fma, wb_fatm, wb_stf.lk, 1'b1, wb_st_s, wb_stf.m16, wb_stf.moves, wb_st_f);
 function automatic logic [7:0] wbs_f(input logic [15:0] ssw);
 	return {1'b1, ssw[6:0]};               // V, SIZE, TT, TM (Figure 8-8)
 endfunction
@@ -1014,7 +1048,39 @@ function automatic stp_t aerr_st(input stp_t t0, input logic go, input id_t i, i
 	end
 	return t;
 endfunction
-wire stp_t st = aerr_st(st1, aerr_go, i, rd_a_q);
+function automatic stp_t pm_st(input stp_t t0, input logic inph, input logic got, input logic stall);
+	stp_t t;
+	t = t0;
+	if (inph) begin
+		t = '0;
+		if (got && !stall) begin t.disp = 1'b1; t.dsel = 3'd4; t.fin = 1'b1; end   // (dsel 4: see dmux)
+	end
+	return t;
+endfunction
+wire stp_t st = aerr_st(pm_st(st1, ph == P_PMMU, pm_got, stall_in), aerr_go, i, rd_a_q);
+
+//--------------------------------------------------------------- PFLUSH / PTEST
+// M68040UM 3.7 (MMU instructions): privileged; they wait for everything
+// older (serialize), then for the memory port to be idle -- the reference
+// waits for the queue fetch to retire, the MMU has one port -- with IF held
+// off; the request is a level until done; PTEST's MMUSR is written by the
+// final micro-op, and both refetch the next instruction so nothing younger
+// was translated under the old map (the reference's epf_flush).
+reg        pm_sent;        // the request went out
+reg        pm_got;         // ... and was answered
+reg [31:0] pm_mmusr;
+assign pmmu_busy = (ph == P_PMMU);
+function automatic ex_t pmmu_uop(input id_t i, input logic [31:0] mmusr);
+	ex_t x;
+	x = base_uop(i);
+	x.dk = DK_NONE;
+	if (i.imm[3]) begin
+		x.cls = CL_MOVEC; x.creg_to = 1'b1; x.creg_sel = CR_MMUSR; x.a = mmusr;
+	end else x.cls = CL_NOP;
+	x.redirect = 1'b1; x.target = i.next_pc;
+	return x;
+endfunction
+wire ex_t pm_x = pmmu_uop(i, pm_mmusr);
 
 // RTR to an odd PC: the CCR alone commits
 function automatic ex_t ccr_only_uop(input ex_t x);
@@ -1048,7 +1114,7 @@ wire ex_t disp_x0 = dmux(st.dsel, x_ord,
                         exc_uop(i, x_k, x_sp, x_sr, x_pc, x_fmt, x_vec, x_addr, x7[(x_k < 4'd2) ? 4'd2 : x_k]),
                         exc_final(i, x_bank, x_sp, x_sr, x_target),
                         rte_final(i, bank_now, rd_a, r_fv, r_sr, r_pc),
-                        reset_final(i, x_sp, r_pc),
+                        (ph == P_PMMU) ? pm_x : reset_final(i, x_sp, r_pc),
                         ccr_only_uop(x_ord),
                         no_last(x_ord),
                         mm_x);
@@ -1114,6 +1180,8 @@ always @(posedge clk) begin
 		x_vec <= 8'd0; x_fmt <= 4'd0; x_pc <= 32'd0; x_addr <= 32'd0; x_step <= 3'd0; x_k <= 4'd0;
 		x_sr <= 16'd0; x_sp <= 32'd0; x_bank <= R_ISP; x_target <= 32'd0;
 		bf_step <= 1'b0;
+		pt_req <= 1'b0; pt_write <= 1'b0; pt_addr <= 32'd0; pf_req <= 1'b0; pf_mode <= 2'd0; pf_addr <= 32'd0;
+		pm_sent <= 1'b0; pm_got <= 1'b0; pm_mmusr <= 32'd0;
 		mm_mask <= 16'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0;
 		mm_have <= 1'b0; mm_hdata <= 32'd0; mm_hreg <= 5'd0; mm_hlast <= 1'b0;
 		mm_bv <= 1'b0; mm_bval <= 32'd0;
@@ -1178,7 +1246,9 @@ always @(posedge clk) begin
 					if (rst_pending) begin
 						ph <= P_RESET; r_step <= 3'd0;
 					end else if (eac_valid && !(i.serialize && older_busy)) begin
-						if (!st.exc_go && i.cls == CL_RTE) begin
+						if (!st.exc_go && i.cls == CL_PMMU) begin
+							ph <= P_PMMU; pm_sent <= 1'b0; pm_got <= 1'b0;
+						end else if (!st.exc_go && i.cls == CL_RTE) begin
 							ph <= P_RTE; r_step <= 3'd0;
 						end else if (!st.exc_go && !st.fin) ph <= P_OPS;
 					end
@@ -1218,6 +1288,15 @@ always @(posedge clk) begin
 						end
 					end
 				end
+				P_PMMU: begin
+					if (!pm_sent && bus_idle) begin
+						pm_sent <= 1'b1;
+						if (i.imm[3]) begin pt_req <= 1'b1; pt_write <= i.imm[2]; pt_addr <= rd_a; end
+						else begin pf_req <= 1'b1; pf_mode <= i.imm[1:0]; pf_addr <= rd_a; end
+					end
+					if (pt_req && pt_done) begin pt_req <= 1'b0; pm_got <= 1'b1; pm_mmusr <= pt_mmusr; end
+					if (pf_req && pf_done) begin pf_req <= 1'b0; pm_got <= 1'b1; end
+				end
 				P_RESET: begin
 					if (r_step == 3'd2 && st.disp) begin
 						rst_pending <= 1'b0; ph <= P_START; r_step <= 3'd0;
@@ -1231,7 +1310,7 @@ always @(posedge clk) begin
 				// an instruction fetch fault (ID marked the instruction): FA =
 				// the faulted fetch, SSW RW = 1, SIZE of the fetch, TM = 6/2
 				x7[2]  <= i.exc_addr;
-				x7[3]  <= {ssw_f(i.imm[0], 1'b0, 1'b0, i.size, 1'b0, 1'b0, s_bit ? 3'd6 : 3'd2), 16'h0000};
+				x7[3]  <= {ssw_f(1'b0, i.imm[0], 1'b0, 1'b0, i.size, 1'b0, 1'b0, s_bit ? 3'd6 : 3'd2), 16'h0000};
 				x7[4]  <= 32'd0;
 				x7[5]  <= i.exc_addr;
 				x7[6]  <= i.exc_addr;

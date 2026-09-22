@@ -216,7 +216,7 @@ localparam [5:0]
 	F_BITD = 6'd38, F_BITS = 6'd39, F_CAS = 6'd40, F_CAS2 = 6'd41, F_CHK2 = 6'd42,
 	F_CHK = 6'd43, F_TAS = 6'd44, F_NBCD = 6'd45, F_MDW = 6'd46, F_MDL = 6'd47,
 	F_TRAPCC = 6'd48, F_BCD = 6'd49, F_PACK = 6'd50, F_UNPK = 6'd51, F_SHR = 6'd52,
-	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55, F_MOVEUSP = 6'd56, F_MOVEP = 6'd57, F_MOVE16 = 6'd58, F_MOVES = 6'd59, F_CINV = 6'd60;
+	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55, F_MOVEUSP = 6'd56, F_MOVEP = 6'd57, F_MOVE16 = 6'd58, F_MOVES = 6'd59, F_CINV = 6'd60, F_PMMU = 6'd61;
 
 // What an opcode word implies about the words that follow it.
 typedef struct packed {
@@ -422,6 +422,11 @@ function automatic shape_t shape(input logic [15:0] op);
 		16'b0100_1110_0110_????: begin s.ok = 1'b1; s.form = F_MOVEUSP; end   // MOVE An,USP / USP,An
 		// CINV/CPUSH (scope 01 line, 10 page, 11 all): a privileged, serialising
 		// no-op until M8 connects them to the caches (t_integer.s needs CINVA)
+		// PFLUSHN (An) / PFLUSH (An) / PFLUSHAN / PFLUSHA; PTESTW (An) $F548, PTESTR (An)
+		// $F568 -- the rest of the $F5 quadrant is F-line (M68040UM 3.7, lib/AP68040)
+		16'b1111_0101_000?_????, 16'b1111_0101_0100_1???, 16'b1111_0101_0110_1???: begin
+			s.ok = 1'b1; s.form = F_PMMU;
+		end
 		16'b1111_0100_???0_1???, 16'b1111_0100_???1_0???, 16'b1111_0100_???1_1???: begin
 			s.ok = 1'b1; s.form = F_CINV;
 		end
@@ -929,6 +934,11 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				end
 			end
 			F_CINV: begin d.cls = CL_NOP; d.priv = 1'b1; d.serialize = 1'b1; end
+			F_PMMU: begin                       // imm: [3] PTEST, [2] PTESTW, [1:0] PFLUSH mode
+				d.cls = CL_PMMU; d.priv = 1'b1; d.serialize = 1'b1;
+				d.imm = {28'd0, op[6], !op[5], op[4:3]};
+				d.src = ea_reg(EK_AREG, {2'b01, op[2:0]});
+			end
 			F_MOVES: begin                      // a MOVE in the SFC/DFC space, no flags (PRM 6-24)
 				d.cls = CL_ALU; d.alu = `AP040_ALU_MOVE; d.priv = 1'b1; d.serialize = 1'b1;
 				if (x1[11]) begin                 // Rn -> <ea> [DFC]

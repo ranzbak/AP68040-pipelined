@@ -43,15 +43,18 @@ module ap040_inst_fetch
 
 	input             redirect_valid,
 	input      [31:0] redirect_pc,
+	input             redirect_s,   // (with redirect_valid) the S bit the new stream runs under (M7)
 	input             redirect_hold, // (with redirect_valid) take it, but fetch one clock later:
 	                                 // a store into the code is still on its way to memory
 
+	input             fetch_hold,   // no new fetch (a PTEST/PFLUSH owns the MMU, M7)
 	input       [1:0] consume,      // words ID takes from the head this clock
 
 	output            f_req,
 	output     [31:0] f_addr,
 	output            f_long,       // two words (else one)
 	input             f_gnt,        // the request is taken this clock
+	output            f_s,          // the request's S bit: its FC is 6 or 2
 	input             f_ack,        // the answer
 	input      [31:0] f_data,       // {word at addr, word at addr+2}
 	input             f_err,        // ... is an access error (M6): its words are poisoned
@@ -99,6 +102,13 @@ assign q_e0  = qerr[0];
 assign q_e1  = qerr[1];
 
 wire [31:0] fa        = redirect_valid ? redirect_pc : fpc;
+// The fetch function code follows the stream, not WB's SR: a redirect that
+// changes S (RTE, an exception, a MOVE to SR) brings the new S with it, and
+// the fetch it starts may go out before WB commits the SR (the RTE to user
+// in t_mmu.s "8K user-mode demand paging" fetched through the supervisor
+// root otherwise).  Every SR write redirects, so fs is never stale.
+reg         fs;
+assign f_s = redirect_valid ? redirect_s : fs;
 wire  [1:0] want      = (LONG_ANY != 0 || !fa[1]) ? 2'd2 : 2'd1;
 wire        got       = infl && f_ack;                      // an answer this clock
 wire        use_ans   = got && !fdrop && !redirect_valid;  // ... that goes into the queue
@@ -109,7 +119,7 @@ assign q_hi = fpc;
 // a request goes out when there is room for the answer and no other fetch
 // is outstanding (or it answers now)
 wire        want_req  = (running || redirect_valid) && !hold && !(redirect_valid && redirect_hold) &&
-                        !(pstop && !redirect_valid) &&
+                        !(pstop && !redirect_valid) && !fetch_hold &&
                         (!infl || f_ack) && (after_c + pend + 3'd2 <= QN);
 assign f_req  = ce && want_req;
 assign f_addr = fa;
@@ -133,6 +143,7 @@ always @(posedge clk) begin
 		running <= (FETCH_AT_RESET != 0);
 		hold    <= 1'b0;
 		pstop   <= 1'b0;
+		fs      <= 1'b1;
 		pf_addr <= 32'd0; pf_long <= 1'b0; pf_atc <= 1'b0;
 		for (k = 0; k < QN; k = k + 1) begin q[k] <= 16'h4E71; qerr[k] <= 1'b0; end
 	end else if (ce) begin
@@ -144,8 +155,10 @@ always @(posedge clk) begin
 		if (redirect_valid) for (k = 0; k < QN; k = k + 1) ne[k] = 1'b0;
 		ncnt = after_c;
 		if (use_ans) begin
-			nq[ncnt] = f_data[31:16]; ne[ncnt] = f_err;
-			if (infl_n == 2'd2) begin nq[ncnt + 1] = f_data[15:0]; ne[ncnt + 1] = f_err; end
+			// (a poisoned word reads as NOP: ID sizes the instruction from
+			// defined words, and the MMU's data on a fault is not defined)
+			nq[ncnt] = f_err ? 16'h4E71 : f_data[31:16]; ne[ncnt] = f_err;
+			if (infl_n == 2'd2) begin nq[ncnt + 1] = f_err ? 16'h4E71 : f_data[15:0]; ne[ncnt + 1] = f_err; end
 			ncnt = ncnt + {1'b0, infl_n};
 		end
 		for (k = 0; k < QN; k = k + 1) begin q[k] <= nq[k]; qerr[k] <= ne[k]; end
@@ -154,6 +167,7 @@ always @(posedge clk) begin
 			pstop <= 1'b1; pf_addr <= f_fa; pf_long <= (infl_n == 2'd2); pf_atc <= f_atc;
 		end
 		if (redirect_valid) pstop <= 1'b0;
+		if (redirect_valid) fs <= redirect_s;
 		qcnt <= ncnt;
 		if (redirect_valid) begin
 			qpc     <= redirect_pc;

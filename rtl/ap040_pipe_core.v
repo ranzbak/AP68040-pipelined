@@ -75,7 +75,21 @@ module ap040_pipe_core
 	output [31:0] dbg_sp,        // the A7 the SR selects
 	output [31:0] dbg_usp,
 	output [31:0] dbg_isp,
-	output        dbg_halted     // double fault
+	output        dbg_halted,    // double fault
+	// the MMU (M7): its registers, and the PTEST/PFLUSH sideband (the
+	// reference core's ports; tie pt_done/pf_done high without an MMU)
+	output [31:0] tc_q, urp_q, srp_q, itt0_q, itt1_q, dtt0_q, dtt1_q,
+	output        pt_req,
+	output        pt_write,
+	output [31:0] pt_addr,
+	output  [2:0] pt_fc,
+	input         pt_done,
+	input  [31:0] pt_mmusr,
+	output        pf_req,
+	output  [1:0] pf_mode,
+	output [31:0] pf_addr,
+	output  [2:0] pf_fc,
+	input         pf_done
 );
 
 //--------------------------------------------------------------- stage wires
@@ -100,6 +114,8 @@ wire        id_redirect_valid;
 wire [31:0] id_redirect_pc;
 wire        ex_redirect;
 wire [31:0] ex_redirect_pc;
+wire        ex_redirect_s;
+wire        f_s;
 wire        eac_redir_v, eaf_redir_v;
 wire [31:0] eac_redir_pc, eaf_redir_pc;
 // Redirects, oldest first: EX (not-taken branch, RTE, MOVE to SR, exception
@@ -120,6 +136,7 @@ wire [31:0] redirect_pc    = wb_smc ? exe_o.stf.npc :
 //--------------------------------------------------------------- commit (WB)
 // (BUS: a store waits in WB while the posted-store buffer is full)
 wire sb_full, sb_busy;
+wire pmmu_busy;             // a PTEST/PFLUSH owns the MMU (EA-fetch): IF holds off
 // A held micro-op keeps writing its registers, CCR/SR and control registers
 // (the same values each clock -- nothing younger can pass it), so the stages
 // in front see them through the register file's write-through as usual;
@@ -127,7 +144,7 @@ wire sb_full, sb_busy;
 // synchronous stores (BUS, STORE_POST = 0): WB holds until memory has
 // the store; an access error on it drops the micro-op (its register writes
 // stand) and EA-fetch takes vector 2 (M6)
-wire st_done, st_ferr, st_fatc;
+wire st_done, st_ferr, st_fatc, st_fma;
 wire wb_fault = exe_valid && exe_o.st_v && st_ferr;
 wire wb_hold  = exe_valid && exe_o.st_v && ((BUS != 0 && STORE_POST == 0) ? !st_done : sb_full);
 wire commit   = exe_valid;
@@ -139,7 +156,7 @@ reg [31:0] vbr;
 reg  [2:0] sfc, dfc;
 reg [31:0] cacr;
 // MMU registers: stored with the reference's write masks (lib/AP68040
-// ap040_core.v S_MOVEC2), no effect until M7
+// ap040_core.v S_MOVEC2); they drive the MMU outside (M7)
 reg [31:0] tc, itt0, itt1, dtt0, dtt1, mmusr, urp, srp;
 
 always @(posedge clk) begin
@@ -180,6 +197,9 @@ wire [15:0] sr_now = (commit && exe_o.sr_v)  ? exe_o.sr_val :
 
 assign dbg_ccr = sr[4:0];
 assign cacr_q  = cacr;
+assign tc_q = tc; assign urp_q = urp; assign srp_q = srp;
+assign itt0_q = itt0; assign itt1_q = itt1; assign dtt0_q = dtt0; assign dtt1_q = dtt1;
+assign pt_fc = dfc; assign pf_fc = dfc;     // PTEST/PFLUSH: DFC (M68040UM 3.7)
 assign vbr_q   = vbr;
 assign dbg_usp = usp_q;
 assign dbg_isp = isp_q;
@@ -188,7 +208,7 @@ assign dbg_halted = eaf_halted;
 assign dbg_sr  = sr;
 
 //--------------------------------------------------------------- register file
-wire        d_rd_err, d_rd_atc;   // the read's access error (bus mode)
+wire        d_rd_err, d_rd_atc, d_rd_ma;   // the read's access error (bus mode)
 wire  [2:0] d_rd_fc;    // data read function code (the MMU's c_fc in M7; benches read it)
 wire [4:0]  ra_sb, ra_si, ra_db, ra_di, ra_a, ra_b, ra_c, ra_d;
 wire [31:0] rd_sb, rd_si, rd_db, rd_di, rd_a, rd_b, rd_c, rd_d;
@@ -220,8 +240,8 @@ wire             d_wr_ready;
 // The L1 test substrate stays instantiated (the benches poke dut.u_l1.mem);
 // with BUS = 1 nothing reads it and synthesis removes it.
 wire        f_req, f_long, f_gnt, f_ack, f_err, f_atc;
-wire        q_e0, q_e1, pf_long, pf_atc;
-wire [31:0] pf_addr;
+wire        q_e0, q_e1, iff_long, iff_atc;   // IF's faulted fetch (M6)
+wire [31:0] iff_addr;
 wire [31:0] f_addr, f_data;
 wire        l1_rd_ack;
 wire [31:0] l1_rd_data;
@@ -261,10 +281,10 @@ generate if (BUS == 0) begin : g_l1
 	assign d_rd_ack  = l1_rd_ack;
 	assign d_rd_data = l1_rd_data;
 	assign sb_full = 1'b0; assign sb_busy = 1'b0;
-	assign st_done = 1'b0; assign st_ferr = 1'b0; assign st_fatc = 1'b0;
+	assign st_done = 1'b0; assign st_ferr = 1'b0; assign st_fatc = 1'b0; assign st_fma = 1'b0;
 	assign mem_req = 1'b0; assign mem_write = 1'b0; assign mem_instr = 1'b0; assign mem_size = 2'd0;
 	assign mem_addr = 32'd0; assign mem_wdata = 32'd0; assign mem_fc = 3'd0; assign bus_st_err = 1'b0;
-	assign d_rd_err = 1'b0; assign d_rd_atc = 1'b0;
+	assign d_rd_err = 1'b0; assign d_rd_atc = 1'b0; assign d_rd_ma = 1'b0;
 	assign f_err = 1'b0; assign f_atc = 1'b0;
 end else begin : g_bus
 
@@ -276,17 +296,18 @@ end else begin : g_bus
 		.st_v(STORE_POST ? (ce && retire && exe_o.st_v) : (exe_valid && exe_o.st_v)),
 		.st_addr(exe_o.st_addr), .st_size(exe_o.st_size),
 		.st_data(exe_o.st_data), .st_fc(exe_o.st_fc), .st_rb(exe_o.st_rb), .mem_rb(),
-		.sb_full(sb_full), .sb_busy(sb_busy), .st_done(st_done), .st_ferr(st_ferr), .st_fatc(st_fatc),
+		.sb_full(sb_full), .sb_busy(sb_busy), .st_done(st_done), .st_ferr(st_ferr), .st_fatc(st_fatc), .st_fma(st_fma),
 		.older_st(older_store || (exe_valid && exe_o.st_v)),   // (registered state only: timing)
 		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
 		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(d_rd_err),
-		.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_fc(sr_now[13] ? 3'd6 : 3'd2),
+		.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_fc(f_s ? 3'd6 : 3'd2),
 		.f_gnt(f_gnt), .f_ack(f_ack), .f_data(f_data), .f_err(f_err),
 		.st_err(bus_st_err),
 		.mem_req(mem_req), .mem_write(mem_write), .mem_instr(mem_instr), .mem_size(mem_size),
 		.mem_addr(mem_addr), .mem_wdata(mem_wdata), .mem_fc(mem_fc),
 		.mem_ack(mem_ack), .mem_rdata(mem_rdata), .mem_flt(mem_flt), .mem_atc(mem_atc),
-		.rd_atc(d_rd_atc), .f_atc(f_atc)
+		.rd_atc(d_rd_atc), .rd_ma(d_rd_ma), .f_atc(f_atc),
+		.tc_e(tc[15]), .tc_p(tc[14])
 	);
 end endgenerate
 
@@ -298,11 +319,12 @@ ap040_inst_fetch #(
 (
 	.clk(clk), .nreset(nreset), .ce(ce),
 	.redirect_valid(redirect_valid), .redirect_pc(redirect_pc), .redirect_hold(wb_smc && BUS == 0),
+	.redirect_s((ex_redirect && !wb_smc) ? ex_redirect_s : sr_now[13]), .f_s(f_s),
 	.q_lo(if_q_lo), .q_hi(if_q_hi),
-	.consume(id_consume),
+	.consume(id_consume), .fetch_hold(pmmu_busy),
 	.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_gnt(f_gnt), .f_ack(f_ack), .f_data(f_data),
 	.f_err(f_err), .f_atc(f_atc),
-	.q_e0(q_e0), .q_e1(q_e1), .pf_addr(pf_addr), .pf_long(pf_long), .pf_atc(pf_atc),
+	.q_e0(q_e0), .q_e1(q_e1), .pf_addr(iff_addr), .pf_long(iff_long), .pf_atc(iff_atc),
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1)
 );
 
@@ -310,7 +332,7 @@ ap040_decode u_id
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ea_stall), .flush(flush_id),
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1),
-	.q_e0(q_e0), .q_e1(q_e1), .pf_addr(pf_addr), .pf_long(pf_long), .pf_atc(pf_atc),
+	.q_e0(q_e0), .q_e1(q_e1), .pf_addr(iff_addr), .pf_long(iff_long), .pf_atc(iff_atc),
 	.consume(id_consume),
 	.id_redirect_valid(id_redirect_valid), .id_redirect_pc(id_redirect_pc),
 	.id_valid(id_valid), .id_o(id_o), .g_lo(id_g_lo), .g_hi(id_g_hi), .g_v(id_g_v)
@@ -368,8 +390,11 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HA
 	.ex_ccr_v(fw_ccr_v), .ex_ccr(fw_ccr),
 	.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
 	.rd_ack(d_rd_ack), .rd_data_raw(d_rd_data),
-	.rd_err(d_rd_err), .rd_atc(d_rd_atc), .bus_wdata(mem_wdata),
-	.wb_fault(ce && wb_fault), .wb_fatm(st_fatc),
+	.rd_err(d_rd_err), .rd_atc(d_rd_atc), .rd_ma(d_rd_ma), .bus_wdata(mem_wdata),
+	.pt_req(pt_req), .pt_write(pt_write), .pt_addr(pt_addr), .pt_done(pt_done), .pt_mmusr(pt_mmusr),
+	.pf_req(pf_req), .pf_mode(pf_mode), .pf_addr(pf_addr), .pf_done(pf_done),
+	.bus_idle(BUS == 0 || (!mem_req && !sb_busy)), .pmmu_busy(pmmu_busy),
+	.wb_fault(ce && wb_fault), .wb_fatm(st_fatc), .wb_fma(st_fma),
 	.wb_st_a(exe_o.st_addr), .wb_st_s(exe_o.st_size), .wb_st_d(exe_o.st_data), .wb_st_f(exe_o.st_fc),
 	.wb_last(exe_o.last), .wb_stf(exe_o.stf),
 	.wb_st_v(retire && exe_o.st_v), .wb_st_addr(exe_o.st_addr), .wb_st_size(exe_o.st_size), .wb_st_data(exe_o.st_data),
@@ -419,7 +444,7 @@ ap040_execute u_ex
 	.fw_w0_v(fw_w0_v), .fw_w0_r(fw_w0_r), .fw_w0_val(fw_w0_val),
 	.fw_ccr_v(fw_ccr_v), .fw_ccr(fw_ccr),
 	.fw_st_v(fw_st_v), .fw_st_addr(fw_st_addr), .fw_st_size(fw_st_size), .fw_st_data(fw_st_data),
-	.ex_redirect(ex_redirect), .ex_redirect_pc(ex_redirect_pc),
+	.ex_redirect(ex_redirect), .ex_redirect_pc(ex_redirect_pc), .ex_redirect_s(ex_redirect_s),
 	.exe_valid(exe_valid), .exe_o(exe_o)
 );
 

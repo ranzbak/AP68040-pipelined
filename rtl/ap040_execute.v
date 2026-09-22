@@ -49,6 +49,7 @@ module ap040_execute
 
 	output            ex_redirect,
 	output     [31:0] ex_redirect_pc,
+	output            ex_redirect_s,   // the S bit after this micro-op (IF's fetch FC)
 
 	output reg        exe_valid,
 	output wb_t       exe_o
@@ -395,6 +396,7 @@ assign fw_w0_val = w.w0_val;
 
 assign ex_redirect    = eaf_valid && redir && !stall_in;
 assign ex_redirect_pc = redir_pc;
+assign ex_redirect_s  = w.sr_v ? w.sr_val[13] : sr_in[13];
 
 
 always @(posedge clk) begin
