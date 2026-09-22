@@ -97,6 +97,16 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 	CSRC="$SRC $(ls $RTL/compat/*.v | tr '\n' ' ') $RTL/compat/primitives/dpram.v"
 	iverilog -g2012 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_compat.vvp" tb_ap040_pipe_compat.v $CSRC > "$WORK/tb_compat.clog" 2>&1 || {
 		echo "  COMPILE-ERROR compat bench"; grep -v "constant selects" "$WORK/tb_compat.clog" | head -5; exit 1; }
+	# lib/AP68040's reset bench on the wrapper, and its adapter unit benches
+	# on the lifted copies
+	iverilog -g2012 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_preset.vvp" tb_ap040_pipe_reset.v $CSRC > "$WORK/tb_preset.clog" 2>&1 &&
+	timeout 600 vvp "$WORK/tb_preset.vvp" > "$WORK/compat_reset.log" 2>&1 && grep -q "ALL TESTS PASSED" "$WORK/compat_reset.log" &&
+		echo "  pass  compat:reset" || { echo "  FAIL  compat:reset  (see $WORK/compat_reset.log)"; fail=1; }
+	for u in bus16_gap bus_timeout; do
+		iverilog -g2012 -I "$RTL/compat" -o "$WORK/tb_$u.vvp" tb_ap040_$u.v "$RTL/compat/ap040_bus16_adapter.v" "$RTL/compat/ap040_bus_timeout.v" > "$WORK/tb_$u.clog" 2>&1 &&
+		vvp "$WORK/tb_$u.vvp" > "$WORK/unit_$u.log" 2>&1 && grep -q "ALL TESTS PASSED" "$WORK/unit_$u.log" &&
+			echo "  pass  unit:$u" || { echo "  FAIL  unit:$u  (see $WORK/unit_$u.log)"; fail=1; }
+	done
 	for t in t_integer; do
 		( cd "$AP040_REF/tb/asm" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OLDPWD/$WORK/$t.bin" "$t.s" )
 		python3 bin2hex.py "$WORK/$t.bin" "$WORK/$t.hex"
