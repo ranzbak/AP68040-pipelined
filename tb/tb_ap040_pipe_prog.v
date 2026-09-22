@@ -273,6 +273,23 @@ always @(posedge clk)
 		end
 	end
 
+// "syncpc <addr>": when the instruction at <addr> retires, no store may be
+// on its way to memory any more (NOP synchronises, M68040UM 7.7) -- bus mode
+reg [31:0] sync_at [0:7];
+integer    n_sync = 0, sync_bad = 0, sync_hits = 0, ks;
+always @(posedge clk)
+	if (nreset && dbg_wb_valid)
+		for (ks = 0; ks < n_sync; ks = ks + 1)
+			if (dbg_wb_pc == sync_at[ks]) begin
+				sync_hits = sync_hits + 1;
+`ifdef BUS_MODE
+				if (dut.sb_busy) begin
+					sync_bad = sync_bad + 1;
+					$display("FAIL: %h retired with a store still posted", dbg_wb_pc);
+				end
+`endif
+			end
+
 // "inimage": no data access may fall outside the image.  The L1 model
 // aliases the high address bits (ea_all relies on it), so a wrong high
 // address (a bitfield offset shifted without its sign, say) would otherwise
@@ -324,6 +341,7 @@ initial begin
 			end else if (key == "inimage") inimage = 1;
 			else if (key == "readonce") begin rc = $fscanf(fd, "%h", a); ro_at[n_ro] = a; ro_n[n_ro] = 0; n_ro = n_ro + 1; end
 			else if (key == "rbcount") rc = $fscanf(fd, "%d", want_rb);
+			else if (key == "syncpc") begin rc = $fscanf(fd, "%h", a); sync_at[n_sync] = a; n_sync = n_sync + 1; end
 			else if (key == "fc") begin rc = $fscanf(fd, "%h %d", a, v); fc_at[n_fc] = a; fc_want[n_fc] = v[2:0]; n_fc = n_fc + 1; end
 			else if (key == "rb") begin rc = $fscanf(fd, "%h", a); rb_at[n_rbl] = a; n_rbl = n_rbl + 1; end
 			else rc = $fscanf(fd, "%h", v);
@@ -354,6 +372,7 @@ initial begin
 		else if (key == "inimage") ;
 		else if (key == "readonce") rc = $fscanf(fd, "%h", v);
 		else if (key == "rbcount") rc = $fscanf(fd, "%d", v);
+		else if (key == "syncpc") rc = $fscanf(fd, "%h", v);
 		else if (key == "fc") rc = $fscanf(fd, "%h %d", a, v);
 		else if (key == "rb") rc = $fscanf(fd, "%h", v);
 		else if (key == "#") begin : skipline2
@@ -381,7 +400,11 @@ initial begin
 		end
 	end
 	$fclose(fd);
-	errors = errors + reads_bad + rb_bad + fc_bad;
+	errors = errors + reads_bad + rb_bad + fc_bad + sync_bad;
+	if (n_sync > 0 && sync_hits == 0) begin
+		errors = errors + 1;
+		$display("FAIL: no 'syncpc' instruction retired");
+	end
 `ifdef BUS_MODE
 	errors = errors + gap_bad;
 `endif
