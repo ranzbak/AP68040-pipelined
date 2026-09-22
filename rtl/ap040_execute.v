@@ -101,7 +101,9 @@ wire  [4:0] alu_flags;
 // 32-bit one on the sign-extended word source (PRM ADDA 4-7 / CMPA 4-77).
 // Bit ops: the bit number is mod 32 for Dn, mod 8 for a memory byte.
 wire        an_dst = (x.dk == DK_REG) && (x.dr[4:3] != 2'b00);
+// (a byte into An: MOVES.B <ea>,An sign-extends, PRM 6-24)
 wire [31:0] alu_a  = (an_dst && x.size == SZ_W) ? sext16(x.a[15:0]) :
+                     (an_dst && x.size == SZ_B) ? sext8(x.a[7:0]) :
                      (x.cls == CL_BIT) ? ((x.size == SZ_B) ? {29'd0, x.a[2:0]} : {27'd0, x.a[4:0]}) :
                      x.a;
 wire  [1:0] alu_sz = an_dst ? SZ_L : x.size;
@@ -198,7 +200,7 @@ always @* begin
 	w.u0_v = x.u0_v; w.u0_r = x.u0_r; w.u0_val = x.u0_val;
 	w.u1_v = x.u1_v; w.u1_r = x.u1_r; w.u1_val = x.u1_val;
 	w.st_v = x.st_v; w.st_addr = x.st_addr; w.st_data = x.st_data; w.st_size = x.st_size;
-	w.st_rb = x.st_rb;
+	w.st_rb = x.st_rb; w.st_fc = x.st_fc;
 	w.sr_v = x.sr_v; w.sr_val = x.sr_val;
 	w.exc  = x.exc;  w.exc_sp = x.sp_val;
 	// a sequenced stack-pointer write goes out on the u0 port

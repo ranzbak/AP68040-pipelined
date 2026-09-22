@@ -209,7 +209,7 @@ localparam [5:0]
 	F_BITD = 6'd38, F_BITS = 6'd39, F_CAS = 6'd40, F_CAS2 = 6'd41, F_CHK2 = 6'd42,
 	F_CHK = 6'd43, F_TAS = 6'd44, F_NBCD = 6'd45, F_MDW = 6'd46, F_MDL = 6'd47,
 	F_TRAPCC = 6'd48, F_BCD = 6'd49, F_PACK = 6'd50, F_UNPK = 6'd51, F_SHR = 6'd52,
-	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55, F_MOVEUSP = 6'd56, F_MOVEP = 6'd57, F_MOVE16 = 6'd58;
+	F_SHM = 6'd53, F_BF = 6'd54, F_MOVEM = 6'd55, F_MOVEUSP = 6'd56, F_MOVEP = 6'd57, F_MOVE16 = 6'd58, F_MOVES = 6'd59;
 
 // What an opcode word implies about the words that follow it.
 typedef struct packed {
@@ -268,6 +268,10 @@ function automatic shape_t shape(input logic [15:0] op);
 			s.form = F_BITS; s.npre = 2'd1; s.has_dst = 1'b1;
 			s.sz = (s.dm == 3'd0) ? SZ_L : SZ_B; s.alu = `AP040_ALU_BSET;
 			s.ok = ea_ok(s.dm, s.dr, 1'b1, 1'b0, 1'b0, 1'b1);
+		end
+		16'b0000_1110_0???_????, 16'b0000_1110_10??_????: begin   // MOVES <memory alterable> (before CAS)
+			s.form = F_MOVES; s.npre = 2'd1; s.sz = op[7:6]; s.has_dst = 1'b1;
+			s.ok = ea_ok(s.dm, s.dr, 1'b0, 1'b1, 1'b0, 1'b1);
 		end
 		16'b0000_1??0_1111_1100: begin           // CAS2 (W/L): two extension words
 			s.form = F_CAS2; s.npre = 2'd2; s.alu = `AP040_ALU_CMP;
@@ -900,6 +904,17 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				// cputest MOVEC2; EA-fetch checks priv before CL_EXC)
 				if (d.imm[3:0] == CR_BAD) begin
 					d.cls = CL_EXC; d.exc_vec = 8'd4;
+				end
+			end
+			F_MOVES: begin                      // a MOVE in the SFC/DFC space, no flags (PRM 6-24)
+				d.cls = CL_ALU; d.alu = `AP040_ALU_MOVE; d.priv = 1'b1; d.serialize = 1'b1;
+				if (x1[11]) begin                 // Rn -> <ea> [DFC]
+					d.src = ea_reg(x1[15] ? EK_AREG : EK_DREG, {1'b0, x1[15], x1[14:12]});
+					d.fcsel = 2'd2;
+				end else begin                    // <ea> [SFC] -> Rn (An: sign-extended)
+					d.src = d.dst;
+					d.dst = ea_reg(x1[15] ? EK_AREG : EK_DREG, {1'b0, x1[15], x1[14:12]});
+					d.fcsel = 2'd1;
 				end
 			end
 			F_MOVEUSP: begin                    // as MOVEC USP (PRM MOVE USP 6-21: privileged)

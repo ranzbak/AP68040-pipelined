@@ -128,6 +128,7 @@ typedef struct packed {
 	logic        serialize;    // waits in EAF for EX/WB to drain
 	logic [7:0]  exc_vec;      // CL_EXC: vector number
 	logic        exc_next;     // CL_EXC: stacked PC is next_pc (TRAP) not pc
+	logic [1:0]  fcsel;        // data function code: 0 the SR's (S ? 5 : 1), 1 SFC, 2 DFC (MOVES)
 	logic [3:0]  exc_fmt;      // CL_EXC: frame format ($0, $2)
 	logic [31:0] exc_addr;     // CL_EXC format $2: the address field
 	logic [31:0] btarget;      // CL_BCC/BSR/DBCC: branch target
@@ -240,6 +241,7 @@ typedef struct packed {
 	logic [31:0] st_data;
 	logic [1:0]  st_size;
 	logic        st_rb;        // the store is a locked write-back (CAS/CAS2 mismatch, M68040UM 7.4.5 p. 7-26)
+	logic [2:0]  st_fc;        // the store's function code
 	logic        sp_v;         // write sp_val to physical stack pointer sp_r
 	logic [4:0]  sp_r;
 	logic [31:0] sp_val;
@@ -268,6 +270,7 @@ typedef struct packed {
 	logic        sr_v;  logic [15:0] sr_val;
 	logic        st_v;  logic [31:0] st_addr; logic [31:0] st_data; logic [1:0] st_size;
 	logic        st_rb;        // locked write-back (trace benches: not a data write the reference makes)
+	logic [2:0]  st_fc;        // function code (MOVES: DFC; else supervisor/user data)
 	logic        creg_v; logic [3:0] creg_sel; logic [31:0] creg_val;
 	logic        exc;   logic [31:0] exc_sp;
 } wb_t;

@@ -49,6 +49,7 @@ module ap040_ea_fetch
 
 	input      [15:0] sr_in,      // architectural SR (WB write-through)
 	input      [31:0] vbr_in,
+	input       [2:0] sfc_in, dfc_in,   // MOVES
 	input             older_busy, // EX or WB holds an instruction
 	input             older_store,// EX holds a store that has not reached memory
 	input             reset_seq,  // run the reset vector fetch first
@@ -70,6 +71,7 @@ module ap040_ea_fetch
 	output            rd_req,
 	output     [31:0] rd_addr,
 	output      [1:0] rd_size,
+	output      [2:0] rd_fc,      // the read's function code (MOVES: SFC)
 	input             rd_ack,
 	input      [31:0] rd_data_raw,
 	// the older stores not yet in memory when a read sampled it: the one in
@@ -313,6 +315,8 @@ function automatic ex_t xord(input eac_t e, input logic [31:0] opa, input logic 
 	endcase
 	x.u0_v = e.u0_v; x.u0_r = e.u0_r; x.u0_val = e.u0_val;
 	x.u1_v = e.u1_v; x.u1_r = e.u1_r; x.u1_val = e.u1_val;
+	// MOVES An,(An)+ / -(An): the 68040 stores the updated An (PRM 6-25 note)
+	if (i.fcsel == 2'd2 && e.u1_v && e.u1_r == e.src_r) x.a = e.u1_val;
 	case (i.cls)
 		// JMP/JSR/RTS were redirected before EX (EA-calc, or this stage)
 		CL_JMP, CL_JSR: begin x.target = sa; x.redirect = 1'b0; end
@@ -911,7 +915,7 @@ function automatic ex_t dmux(input logic [2:0] sel, input ex_t o, input ex_t f, 
 	endcase
 endfunction
 
-wire ex_t disp_x = dmux(st.dsel, x_ord,
+wire ex_t disp_x0 = dmux(st.dsel, x_ord,
                         exc_uop(i, x_step, x_sp, x_sr, x_pc, x_fmt, x_vec, x_addr),
                         exc_final(i, x_bank, x_sp, x_sr, x_target),
                         rte_final(i, bank_now, rd_a, r_fv, r_sr, r_pc),
@@ -919,9 +923,23 @@ wire ex_t disp_x = dmux(st.dsel, x_ord,
                         ccr_only_uop(x_ord),
                         no_last(x_ord),
                         mm_x);
+// every store's function code: the frame stores and ordinary stores are
+// data in the current mode (the frame: supervisor), MOVES: DFC
+function automatic ex_t with_fc(input ex_t x, input logic [2:0] fc);
+	ex_t y;
+	y = x; y.st_fc = fc;
+	return y;
+endfunction
+wire ex_t disp_x = with_fc(disp_x0, (st.dsel == 3'd1) ? 3'd5 : (st.dsel == 3'd0 && i.fcsel == 2'd2) ? dfc_in : fc_data);
 
 // the early read goes out when this stage leaves the port free and is
 // taking the next instruction (its current one finishes, or it is empty)
+// function codes: supervisor/user data (5/1), MOVES: SFC for its read
+// (plan M4; the lifted MMU's c_fc in M7)
+wire [2:0] fc_data = s_bit ? 3'd5 : 3'd1;
+// (exception entry's vector read and RTE's pops: supervisor data)
+assign rd_fc     = (st.issue && (ph == P_START || ph == P_OPS) && i.fcsel == 2'd1) ? sfc_in :
+                   (ph == P_EXC || ph == P_RTE || ph == P_RESET) ? 3'd5 : fc_data;
 wire   use_early = early_v && early.v && !st.issue && (!rd_pend || rd_ack) &&
                    (st.fin || !eac_valid) && !rst_pending;
 assign rd_req    = (st.issue || use_early) && !flush;

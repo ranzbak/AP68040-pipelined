@@ -136,6 +136,31 @@ always @(posedge clk)
 			    ro_at[kr] < dut.u_l1.rd_addr + ((dut.u_l1.rd_size == 2'd0) ? 1 : (dut.u_l1.rd_size == 2'd1) ? 2 : 4))
 				ro_n[kr] = ro_n[kr] + 1;
 
+// "fc <addr> <fc>": every data read and write touching that byte uses that
+// function code (MOVES: SFC/DFC; the rest: 5 supervisor / 1 user data)
+reg [31:0] fc_at [0:15];
+reg  [2:0] fc_want [0:15];
+integer    n_fc = 0, fc_bad = 0, fc_hits = 0, kf;
+always @(posedge clk)
+	if (nreset) for (kf = 0; kf < n_fc; kf = kf + 1) begin
+		if (dut.u_l1.rd_req && fc_at[kf] >= dut.u_l1.rd_addr &&
+		    fc_at[kf] < dut.u_l1.rd_addr + ((dut.u_l1.rd_size == 2'd0) ? 1 : (dut.u_l1.rd_size == 2'd1) ? 2 : 4)) begin
+			fc_hits = fc_hits + 1;
+			if (dut.d_rd_fc !== fc_want[kf]) begin
+				fc_bad = fc_bad + 1;
+				$display("FAIL: read of %h with FC %0d, expected %0d", dut.u_l1.rd_addr, dut.d_rd_fc, fc_want[kf]);
+			end
+		end
+		if (dut.u_l1.wr_req && fc_at[kf] >= dut.u_l1.wr_addr &&
+		    fc_at[kf] < dut.u_l1.wr_addr + ((dut.u_l1.wr_size == 2'd0) ? 1 : (dut.u_l1.wr_size == 2'd1) ? 2 : 4)) begin
+			fc_hits = fc_hits + 1;
+			if (dut.exe_o.st_fc !== fc_want[kf]) begin
+				fc_bad = fc_bad + 1;
+				$display("FAIL: write of %h with FC %0d, expected %0d", dut.u_l1.wr_addr, dut.exe_o.st_fc, fc_want[kf]);
+			end
+		end
+	end
+
 // "inimage": no data access may fall outside the image.  The L1 model
 // aliases the high address bits (ea_all relies on it), so a wrong high
 // address (a bitfield offset shifted without its sign, say) would otherwise
@@ -182,6 +207,7 @@ initial begin
 			end else if (key == "inimage") inimage = 1;
 			else if (key == "readonce") begin rc = $fscanf(fd, "%h", a); ro_at[n_ro] = a; ro_n[n_ro] = 0; n_ro = n_ro + 1; end
 			else if (key == "rbcount") rc = $fscanf(fd, "%d", want_rb);
+			else if (key == "fc") begin rc = $fscanf(fd, "%h %d", a, v); fc_at[n_fc] = a; fc_want[n_fc] = v[2:0]; n_fc = n_fc + 1; end
 			else if (key == "rb") begin rc = $fscanf(fd, "%h", a); rb_at[n_rbl] = a; n_rbl = n_rbl + 1; end
 			else rc = $fscanf(fd, "%h", v);
 		end
@@ -206,6 +232,7 @@ initial begin
 		else if (key == "inimage") ;
 		else if (key == "readonce") rc = $fscanf(fd, "%h", v);
 		else if (key == "rbcount") rc = $fscanf(fd, "%d", v);
+		else if (key == "fc") rc = $fscanf(fd, "%h %d", a, v);
 		else if (key == "rb") rc = $fscanf(fd, "%h", v);
 		else if (key == "#") begin : skipline2
 			integer ch;
@@ -232,7 +259,11 @@ initial begin
 		end
 	end
 	$fclose(fd);
-	errors = errors + reads_bad + rb_bad;
+	errors = errors + reads_bad + rb_bad + fc_bad;
+	if (n_fc > 0 && fc_hits == 0) begin
+		errors = errors + 1;
+		$display("FAIL: no access touched any 'fc' byte");
+	end
 	for (kr = 0; kr < n_ro; kr = kr + 1)
 		if (ro_n[kr] != 1) begin
 			errors = errors + 1;

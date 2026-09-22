@@ -125,6 +125,7 @@ assign dbg_ccr = sr[4:0];
 assign dbg_sr  = sr;
 
 //--------------------------------------------------------------- register file
+wire  [2:0] d_rd_fc;    // data read function code (the MMU's c_fc in M7; benches read it)
 wire [4:0]  ra_sb, ra_si, ra_db, ra_di, ra_a, ra_b, ra_c, ra_d;
 wire [31:0] rd_sb, rd_si, rd_db, rd_di, rd_a, rd_b, rd_c, rd_d;
 wire [31:0] usp_q, isp_q, msp_q;
@@ -237,7 +238,7 @@ ap040_ea_fetch u_eaf
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ex_stall), .flush(flush),
 	.eac_valid(eac_valid), .eac_i(eac_o),
-	.sr_in(sr_now), .vbr_in(vbr),
+	.sr_in(sr_now), .vbr_in(vbr), .sfc_in(sfc), .dfc_in(dfc),
 	.older_busy(older_busy), .older_store(older_store),
 	.reset_seq(RESET_FROM_VECTORS != 0),
 	.early_v(early_v), .early(early_rd),
@@ -247,7 +248,7 @@ ap040_ea_fetch u_eaf
 	.ex_u0_val(eaf_o.sp_v ? eaf_o.sp_val : eaf_o.u0_val),
 	.ex_u1_v(eaf_valid && eaf_o.u1_v), .ex_u1_r(eaf_o.u1_r), .ex_u1_val(eaf_o.u1_val),
 	.ex_ccr_v(fw_ccr_v), .ex_ccr(fw_ccr),
-	.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size),
+	.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
 	.rd_ack(d_rd_ack), .rd_data_raw(d_rd_data),
 	.wb_st_v(commit && exe_o.st_v), .wb_st_addr(exe_o.st_addr), .wb_st_size(exe_o.st_size), .wb_st_data(exe_o.st_data),
 	.ex_st_v(fw_st_v), .ex_st_addr(fw_st_addr), .ex_st_size(fw_st_size), .ex_st_data(fw_st_data),
