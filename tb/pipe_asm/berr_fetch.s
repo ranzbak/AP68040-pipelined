@@ -5,7 +5,7 @@
 ; FA = EA = the fetch address; the RTE restarts and the fetch succeeds.
 ; A fault on a prefetch past a taken branch is never raised.  Frames go to
 ; the log; the .exp is the bus-mode one, checked by hand.
-; expect-berr: 600 f 612 f 630 f
+; expect-berr: 600 f 612 f 630 f 650 f 654 f
 v_berr	equ	h_berr
 v_adr	equ	unexp
 v_ill	equ	unexp
@@ -27,7 +27,10 @@ back:
 	move.l	d6,($7204).l
 	jmp	$62c		; a taken branch whose fall-through fetch ($630) faults: not raised
 back2:
-	move.l	a6,($7208).l	; log end: 2 frames
+	jmp	$64e		; two faulting fetches in a row: FA is the first one the instruction needs
+back3:
+	move.l	d5,($720c).l
+	move.l	a6,($7208).l	; log end: 3 frames
 halt:
 	bra.s	halt
 
@@ -49,8 +52,12 @@ unexp:
 	move.l	#$12345678,d6	; opcode at $60e, immediate at $610-$613
 	jmp	back
 	org	$62c
-	bra.s	*+$10		; to $63c; $62e-$63b fall through (prefetched, never run)
+	nop
+	bra.s	*+$0e		; (at $62e) to $63c; $630-$63b fall through (prefetched, never run)
 	nop
 	nop
 	org	$63c
 	jmp	back2
+	org	$64e
+	move.l	#$9ABCDEF0,d5	; opcode at $64e, immediate at $650 (faults), then $654 (faults)
+	jmp	back3
