@@ -160,7 +160,10 @@ module ap040_ea_fetch
 	// redirect from this stage: RTS (its return address is loaded here) and
 	// a JMP/JSR whose target needed a memory-indirect pointer
 	output            eaf_redir_v,
-	output     [31:0] eaf_redir_pc
+	output     [31:0] eaf_redir_pc,
+	// (REDIR_REG) the clock BEFORE the held redirect goes out: IF must not
+	// start one more fetch down the old stream in it
+	output            eaf_redir_soon
 );
 
 wire id_t i = eac_i.i;
@@ -1370,6 +1373,14 @@ always @(posedge clk) begin
 	end
 end
 
+// The gap clock costs one fetch if IF is left alone: it would issue one more
+// request down the OLD stream before the redirect arrives.  Architecturally
+// that is fine -- a 68040 prefetches far past an RTS and the answer is
+// dropped -- but it changes the core's memory footprint, and tb_ap040_pipe_
+// reset's memory model catches it.  So IF is held for that one clock.  The
+// acknowledge does reach IF through this, but only as one term of the fetch
+// REQUEST, not as the clock enable of the whole queue.
+assign eaf_redir_soon = (REDIR_REG != 0) && redir_now && !rdz_v;
 assign eaf_redir_v  = (REDIR_REG != 0) ? rdz_v  : redir_now;
 assign eaf_redir_pc = (REDIR_REG != 0) ? rdz_pc : redir_pc_now;
 

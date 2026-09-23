@@ -139,6 +139,7 @@ wire [31:0] ex_redirect_pc;
 wire        ex_redirect_s;
 wire        f_s;
 wire        eac_redir_v, eaf_redir_v;
+wire        eaf_redir_soon;   // (REDIR_REG) hold IF for the gap clock
 wire [31:0] eac_redir_pc, eaf_redir_pc;
 // Redirects, oldest first: EX (not-taken branch, RTE, MOVE to SR, exception
 // entry), EA-fetch (RTS, memory-indirect JMP/JSR), EA-calc (JMP/JSR), ID
@@ -412,7 +413,7 @@ ap040_inst_fetch #(
 	.redirect_valid(redirect_valid), .redirect_pc(redirect_pc), .redirect_hold(wb_smc && BUS == 0),
 	.redirect_s((ex_redirect && !wb_smc) ? ex_redirect_s : sr_now[13]), .f_s(f_s),
 	.q_lo(if_q_lo), .q_hi(if_q_hi),
-	.consume(id_consume), .fetch_hold(pmmu_busy),
+	.consume(id_consume), .fetch_hold(pmmu_busy || eaf_redir_soon),
 	.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_gnt(f_gnt), .f_ack(f_ack), .f_data(f_data),
 	.f_err(f_err), .f_atc(f_atc),
 	.q_e0(q_e0), .q_e1(q_e1), .pf_addr(iff_addr), .pf_long(iff_long), .pf_atc(iff_atc),
@@ -499,7 +500,7 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HA
 	.stopped(eaf_stopped), .rsto(eaf_rsto),
 	.cinv_req(cinv_req), .cinv_ic(cinv_ic), .cinv_dc(cinv_dc),
 	.cinv_done((CINV != 0) ? cinv_done : 1'b1),
-	.eaf_redir_v(eaf_redir_v), .eaf_redir_pc(eaf_redir_pc)
+	.eaf_redir_v(eaf_redir_v), .eaf_redir_pc(eaf_redir_pc), .eaf_redir_soon(eaf_redir_soon)
 );
 
 // Self-modifying code (t_integer.s "store into the fetch queue", PLAN D10):
