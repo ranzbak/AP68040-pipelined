@@ -1047,6 +1047,12 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				// A coprocessor id that is not 1 never reaches here: it is not
 				// an F_FP shape and keeps the format $0 default above.
 				d.cls = CL_EXC; d.exc_vec = 8'd11; d.exc_fmt = 4'd4; d.exc_next = 1'b1;
+				// FSAVE and FRESTORE are privileged, and the privilege violation
+				// comes FIRST: in user mode they take vector 8 and never reach the
+				// F-line at all (M68040UM 8.2.5; WinUAE does the same, PLAN.md D18).
+				// EA-fetch checks i.priv before it looks at CL_EXC, so this is all
+				// it takes.
+				d.priv = (op[8:6] == 3'b100) || (op[8:6] == 3'b101);
 				if (op[8:6] == 3'b000) begin
 					if (x1[15:13] == 3'b001) begin
 						d.exc_fmt = 4'd0; d.exc_next = 1'b0;         // reserved opclass

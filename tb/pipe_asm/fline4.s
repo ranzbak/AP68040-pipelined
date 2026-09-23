@@ -22,13 +22,13 @@
 ; The two frame fields that format $0 does not have are recorded as zero.
 ;
 ; diff: --cycles 40000
-; expect-range: 7000 7118
+; expect-range: 7000 712C
 ; expect-skip: d0 d1 d7 a0 a1 a2 a3 a4 a5 a6
 v_flin	equ	h_flin
 v_ill	equ	h_ill
 v_adr	equ	unexp
 v_alin	equ	unexp
-v_prv	equ	unexp
+v_prv	equ	h_flin		; case 15: in user mode the privilege violation comes first
 v_fmt	equ	unexp
 v_trp0	equ	unexp
 	include	"vectors.inc"
@@ -178,6 +178,20 @@ c13e:
 c14:	dc.w	$F228,$D0E0,$0020
 c14e:
 
+; 15: FSAVE (A0) in USER mode.  FSAVE and FRESTORE are privileged and the
+;     privilege violation comes FIRST (D18): vector 8, format $0, the
+;     instruction's own PC, and no F-line frame at all.
+	setup	15,$0020
+	lea	c15(pc),a4
+	lea	c15(pc),a5
+	lea	c15e(pc),a1
+	suba.l	a3,a3
+	movea.l	#$6000,a2
+	move	a2,usp
+	move.w	#$0000,sr		; drop to user mode
+c15:	dc.w	$F310
+c15e:
+
 halt:
 	bra.s	halt
 
@@ -212,6 +226,7 @@ hf_short:
 	clr.l	(a6)+
 hf_fix:
 	move.l	a1,2(a2)		; resume past the instruction
+	move.w	#$2700,(a2)		; ... in supervisor mode (case 15 faults in user mode)
 	rte
 
 unexp:
