@@ -17,8 +17,10 @@
 //                                                                          //
 // TIED OFF, and each one is a recorded gap, not an oversight:              //
 //   bsun_*               FBcc on an unordered compare is not decoded yet.  //
-//   fsave_ack/frestore_* FSAVE/FRESTORE still take M10.0's format $4       //
-//                        frame; the unit's state frame is not consumed.    //
+//   fsave_ack            only the NULL and IDLE frames are sequenced, so   //
+//                        no state frame is ever EXTRACTED and nothing       //
+//                        acknowledges one (M10.5's recorded gap).          //
+//   frestore_unimp       ... and none is installed either.                 //
 //   pend_capture         the FSAVE frame of a DEFERRED exception: M10.3    //
 //                        delivers the exception itself, but the e1 state    //
 //                        frame it would leave waits for FSAVE.             //
@@ -42,11 +44,11 @@ ap040_fpu u_fpu
 
 	.fm_sel(fp_fm_sel), .fm_we(fp_fm_we), .fm_wdata(fp_fm_wdata), .fm_rdata(fp_fm_rdata),
 
-	.fpu_used(), .fstate_unimp(),
+	.fpu_used(fp_used), .fstate_unimp(),
 	.fstate_cmd1(), .fstate_cmd3(),
 	.fstate_stag(), .fstate_dtag(), .fstate_flags(),
 	.fstate_fpt(), .fstate_et(),
-	.fsave_ack(1'b0), .frestore_idle(1'b0), .frestore_unimp(1'b0),
+	.fsave_ack(1'b0), .frestore_idle(fp_fridle), .frestore_unimp(1'b0),
 	.pend_capture(1'b0), .cur_vec(), .frestore_e1_pend(),
 	.fstate_grs(), .fstate_wbte15(), .fstate_busy(),
 	.fstate_wbt(), .fstate_fpiar_c(),
@@ -55,5 +57,5 @@ ap040_fpu u_fpu
 	.frestore_stag(3'd0), .frestore_dtag(3'd0), .frestore_flags(3'd0),
 	.frestore_fpt(96'd0), .frestore_et(96'd0),
 	.frestore_grs(3'd0), .frestore_wbte15(1'b0),
-	.fp_reset(1'b0)
+	.fp_reset(fp_frst)
 );

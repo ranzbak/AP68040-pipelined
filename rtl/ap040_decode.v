@@ -1164,6 +1164,22 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				    (op[8:6] == 3'b101 && !frest_ok)) begin
 					d.exc_vec = 8'd11; d.exc_fmt = 4'd0; d.exc_next = 1'b0;
 				end
+				// ---------------------------------------- plan M10.5
+				// FSAVE and FRESTORE with an FPU: the state frames.  Only the
+				// one-longword NULL and IDLE frames are sequenced here (the
+				// $4130 and $4160 payloads are M10.5's recorded gap), so the
+				// (An)+ / -(An) step is four and the ordinary decoded byte
+				// count still carries it.  The privilege check above is older
+				// than this and stays; a malformed EA has already been turned
+				// into the plain F-line by the block above it.
+				if (HAS_FPU != 0 && d.cls == CL_EXC && d.exc_fmt == 4'd4 &&
+				    ((op[8:6] == 3'b100 && fsave_ok) || (op[8:6] == 3'b101 && frest_ok)) &&
+				    d.src.kind == EK_MEM && d.src.mi == MI_NONE) begin
+					d.cls      = CL_FPU;
+					d.size     = SZ_L;
+					d.imm[6:0] = 7'd4;
+					if (op[8:6] == 3'b100) d.dst = d.src;   // FSAVE writes
+				end
 				// ---------------------------------------- plan M10.1(a)
 				// With an FPU a WELL-FORMED cpid-1 instruction of the subset
 				// this core executes becomes CL_FPU instead of the exception.
@@ -1348,12 +1364,16 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					// the instruction leaves and integer work runs on.  M11
 					// can trade it for a flush-aware abort if it is worth it.
 					d.serialize = 1'b1;
-					if (!((d.ext[15:13] == 3'b010) ||
-					      (d.ext[15] && !d.ext[13]))) begin
-						// the EA is the SOURCE for opclass 010 and for a move
-						// INTO the unit -- the control registers (100) and the
-						// FP register list (110); everywhere else it is the
-						// destination, or there is none, and src is cleared
+					if (!((op[8:6] == 3'b000 && d.ext[15:13] == 3'b010) ||
+					      (op[8:6] == 3'b000 && d.ext[15] && !d.ext[13]) ||
+					      (op[8:6] == 3'b101))) begin
+						// the EA is the SOURCE for opclass 010, for a move INTO
+						// the unit -- the control registers (100) and the FP
+						// register list (110) -- and for FRESTORE, which reads
+						// the frame; everywhere else it is the destination, or
+						// there is none, and src is cleared.  (FSAVE/FRESTORE
+						// carry no FP extension word, so `ext` must not be read
+						// for them: hence the op[8:6] qualification.)
 						d.src = '0; d.src.reg_n = R_NONE; d.src.idx_reg = R_NONE;
 					end
 				end else if (d.exc_fmt != 4'd4 || d.src.kind != EK_MEM) begin

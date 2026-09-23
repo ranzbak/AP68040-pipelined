@@ -256,6 +256,7 @@ wire [31:0] fp_cr_wdata, fp_cr_rdata;
 wire        fp_fm_we;
 wire  [2:0] fp_fm_sel;
 wire [95:0] fp_fm_wdata, fp_fm_rdata;
+wire        fp_used, fp_frst, fp_fridle;
 wire  [2:0] fp_op_class, fp_src_fmt, fp_src_r, fp_dst_r;
 wire  [6:0] fp_opmode;
 wire [95:0] fp_din, fp_dout;
@@ -316,6 +317,7 @@ ap040_pipe_core #(
 	.fp_ia_we(fp_ia_we), .fp_ia_wdata(fp_ia_wdata),
 	.fp_cr_sel(fp_cr_sel), .fp_cr_we(fp_cr_we), .fp_cr_wdata(fp_cr_wdata), .fp_cr_rdata(fp_cr_rdata),
 	.fp_fm_sel(fp_fm_sel), .fp_fm_we(fp_fm_we), .fp_fm_wdata(fp_fm_wdata), .fp_fm_rdata(fp_fm_rdata),
+	.fp_used(fp_used), .fp_frst(fp_frst), .fp_fridle(fp_fridle),
 	.fp_done(fp_done), .fp_accepted(fp_accepted), .fp_unimp(fp_unimp), .fp_unsupp(fp_unsupp),
 	.fp_exc_req(fp_exc_req), .fp_exc_vec(fp_exc_vec),
 	.fp_dout(fp_dout)
@@ -334,6 +336,7 @@ end else begin : g_nofpu
 	assign fp_cr_rdata = 32'd0;
 	assign fp_exc_req = 1'b0, fp_exc_vec = 8'd0;
 	assign fp_fm_rdata = 96'd0;
+	assign fp_used = 1'b0;
 end endgenerate
 
 // the MMU (M7): lifted from the reference as it is, wired as the reference

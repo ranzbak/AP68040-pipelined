@@ -1,0 +1,27 @@
+halt 00000452
+# plan M10.5, the NULL and IDLE state frames.
+# 1: FSAVE before any floating-point instruction -- the NULL frame.  This is
+# the longword Kickstart's probe at $F80DA4 reads to decide whether there is
+# an FPU at all.
+m32 00005100 00000000
+# 2: after one FMOVE the unit has been used, so the IDLE frame
+m32 00005104 41000000
+# 3: FRESTORE of the NULL frame RESET the unit -- proved by FSAVE writing
+# NULL again, which it cannot do unless fp_reset reached the unit
+m32 00005108 00000000
+# 4: ... and FRESTORE of the IDLE frame marks it used again
+m32 0000510c 41000000
+a1 00005110
+# 5: FSAVE -(A7) steps A7 down by four and FRESTORE (A7)+ puts it back
+d3 00001f00
+d4 00001efc
+d5 00001f00
+# 6: one format error, vector 14 with format $0 and the instruction's own PC,
+# for a $41300000 frame this core does not sequence.  A0 is left where it was:
+# the (An)+ update rides a dispatch that never happened, which is this core's
+# restart model and is recorded in PLAN.md M10.5 rather than claimed as the
+# 68040's (the manual does not say, and the frame size is variable anyway)
+m32 00007000 00000001
+m32 00007004 00000000
+m32 00007008 00000000
+a0 00005008

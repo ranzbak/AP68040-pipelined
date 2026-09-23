@@ -156,6 +156,12 @@ module ap040_ea_fetch
 	output            fp_fm_we,
 	output     [95:0] fp_fm_wdata,
 	input      [95:0] fp_fm_rdata,
+	// (M10.5) FSAVE / FRESTORE, the NULL and IDLE frames: `fp_used` says which
+	// of the two FSAVE writes, and the two pulses are what FRESTORE of each
+	// one does to the unit.
+	input             fp_used,
+	output            fp_frst,          // FRESTORE of a NULL frame: reset the FPU
+	output            fp_fridle,        // ... of an IDLE frame
 	input             fp_done,
 	input             fp_accepted,
 	input             fp_unimp,
@@ -283,6 +289,11 @@ reg        fp_mw;
 reg  [2:0] fp_mwsel;       // the register the armed write belongs to: the
                            // selector has moved on by the time it goes out
 reg [95:0] fp_mwd;
+// (M10.5) the two FRESTORE pulses, and the format error a frame this core
+// cannot restore takes (vector 14, as the reference's default arm does)
+reg        fp_rstp;
+reg        fp_idlp;
+reg        fp_fmte;
 reg        fp_cw;          // a control-register write goes out this clock
 reg  [1:0] fp_csel;        // ... to this register: captured with the data, so
                            //     the beat index may advance on the same edge
@@ -1296,7 +1307,13 @@ assign fp_ia_wdata = (HAS_FPU != 0) ? i.pc : 32'd0;
 // (M10.2) opclass 100/101: the effective address is the SOURCE when the
 // control registers are the destination (ext[13] = 0) and the destination
 // when they are the source (ext[13] = 1), so it joins the same two wires.
-wire        fp_cr      = (HAS_FPU != 0) && (i.ext[15:14] == 2'b10);
+// (M10.5) FSAVE and FRESTORE carry NO floating-point extension word, so the
+// class wires below must not read `ext` for them: every one is qualified on
+// the opcode's own field.
+wire        fp_gen     = (i.opcode[8:6] == 3'b000);
+wire        fp_sv      = (HAS_FPU != 0) && (i.opcode[8:6] == 3'b100);   // FSAVE
+wire        fp_rs      = (HAS_FPU != 0) && (i.opcode[8:6] == 3'b101);   // FRESTORE
+wire        fp_cr      = (HAS_FPU != 0) && fp_gen && (i.ext[15:14] == 2'b10);
 wire        fp_cr_st   = fp_cr && i.ext[13];        // FPcr -> <ea>
 wire  [2:0] fp_crmask  = (i.ext[12:10] == 3'd0) ? 3'b001 : i.ext[12:10];  // empty = FPIAR
 wire  [1:0] fp_crn     = {1'b0, fp_crmask[2]} + {1'b0, fp_crmask[1]} + {1'b0, fp_crmask[0]};
@@ -1322,7 +1339,7 @@ assign fp_cr_wdata = fp_cwd;
 //   `fp_rev`  a store whose mask convention disagrees with its address
 //             direction writes each register's three longwords in reverse.
 // A load always maps mask bit 7 to FP0, whatever the mode field says.
-wire        fp_mvm   = (HAS_FPU != 0) && (i.ext[15:14] == 2'b11);
+wire        fp_mvm   = (HAS_FPU != 0) && fp_gen && (i.ext[15:14] == 2'b11);
 wire        fp_mvst  = fp_mvm && i.ext[13];
 wire        fp_mvpd  = fp_mvst && (i.dst.upd == UPD_PRE);
 wire        fp_lsb   = fp_mvpd;
@@ -1345,6 +1362,11 @@ endfunction
 wire  [2:0] fp_mvb  = mv_bit(fp_list, fp_lsb);
 wire  [2:0] fp_mvr  = (!fp_mvst || i.ext[12]) ? (3'd7 - fp_mvb) : fp_mvb;
 assign fp_fm_sel   = fp_mw ? fp_mwsel : fp_fsel;
+assign fp_frst     = fp_rstp;
+assign fp_fridle   = fp_idlp;
+// FSAVE writes ONE longword: the IDLE frame when the unit has been used, the
+// NULL frame when it has not (lib/AP68040 S_FSAVE1's `fpu_used ? ... : ...`).
+wire [31:0] fp_svw = fp_used ? 32'h4100_0000 : 32'h0000_0000;
 assign fp_fm_we    = fp_mw;
 assign fp_fm_wdata = fp_mwd;
 // the longword of the selected register this beat carries, reversed when the
@@ -1352,11 +1374,11 @@ assign fp_fm_wdata = fp_mwd;
 wire [31:0] fp_mvwv = ((fp_rev ? (2'd2 - fp_k) : fp_k) == 2'd0) ? fp_fm_rdata[95:64] :
                       ((fp_rev ? (2'd2 - fp_k) : fp_k) == 2'd1) ? fp_fm_rdata[63:32]
                                                                 : fp_fm_rdata[31:0];
-wire        fp_mem_src = ((i.ext[15:13] == 3'b010) && (i.src.kind == EK_MEM)) ||
+wire        fp_mem_src = (fp_gen && (i.ext[15:13] == 3'b010) && (i.src.kind == EK_MEM)) ||
                          (fp_cr && !i.ext[13] && (i.src.kind == EK_MEM)) ||
-                         (fp_mvm && !i.ext[13]);
-wire        fp_mem_dst = ((i.ext[15:13] == 3'b011) && (i.dst.kind == EK_MEM)) ||
-                         (fp_cr_st && (i.dst.kind == EK_MEM)) || fp_mvst;
+                         (fp_mvm && !i.ext[13]) || fp_rs;
+wire        fp_mem_dst = (fp_gen && (i.ext[15:13] == 3'b011) && (i.dst.kind == EK_MEM)) ||
+                         (fp_cr_st && (i.dst.kind == EK_MEM)) || fp_mvst || fp_sv;
 assign fp_din      = fp_mem_src             ? fp_buf :
                      (i.src.kind == EK_IMM) ? i.fpimm :
                      (i.size == SZ_B) ? {op_a[7:0],  88'd0} :
@@ -1369,10 +1391,11 @@ wire [31:0] fp_rv  = fp_cr             ? fp_cr_rdata :
 // the operand's length in bytes, and the beats it takes on the bus
 wire  [4:0] fp_nb    = i.imm[4:0];
 wire  [1:0] fp_beats = (fp_nb <= 5'd4) ? 2'd1 : (fp_nb == 5'd8) ? 2'd2 : 2'd3;
-wire  [1:0] fp_bsz   = fp_mvm ? SZ_L : (fp_nb == 5'd1) ? SZ_B : (fp_nb == 5'd2) ? SZ_W : SZ_L;
-wire [31:0] fp_baddr = fp_mvm       ? fp_addr :
+wire  [1:0] fp_bsz   = (fp_mvm || fp_sv || fp_rs) ? SZ_L : (fp_nb == 5'd1) ? SZ_B : (fp_nb == 5'd2) ? SZ_W : SZ_L;
+wire [31:0] fp_baddr = (fp_mvm || fp_sv || fp_rs) ? fp_addr :
                        (fp_nb <= 5'd2) ? fp_addr : (fp_addr + {28'd0, fp_k, 2'b00});
-wire [31:0] fp_bdata = fp_mvm          ? fp_mvwv :
+wire [31:0] fp_bdata = fp_sv           ? fp_svw :
+                       fp_mvm          ? fp_mvwv :
                        fp_cr           ? fp_cr_rdata :
                        (fp_nb == 5'd1) ? {24'd0, fp_buf[95:88]} :
                        (fp_nb == 5'd2) ? {16'd0, fp_buf[95:80]} :
@@ -1381,10 +1404,10 @@ wire [31:0] fp_bdata = fp_mvm          ? fp_mvwv :
 wire        fp_blast = (fp_k == fp_beats - 2'd1);
 // opclass 011 stores the FPU's answer, so it waits for `done`; everything
 // else leaves the unit running and is released at `accepted`
-wire        fp_need_res = (i.ext[15:13] == 3'b011);
+wire        fp_need_res = fp_gen && (i.ext[15:13] == 3'b011);
 // (M10.2) a control-register move sends the unit no command, so what stands
 // in for the interlock is `every selected register has been transferred`
-wire        fp_ok  = (fp_cr || fp_mvm) ? fp_crd
+wire        fp_ok  = (fp_cr || fp_mvm || fp_sv || fp_rs) ? fp_crd
                                        : (fp_live && (fp_dn || (fp_acc && !fp_need_res)));
 function automatic ex_t fpu_uop(input ex_t x0, input logic [31:0] rv);
 	ex_t y;
@@ -1416,7 +1439,8 @@ function automatic ex_t fp_st_uop(input ex_t x0, input logic beat, input logic [
 	return y;
 endfunction
 wire ex_t fp_w = (fp_stt == FS_WR) ? fp_st_uop(x_ord,
-                                              fp_mvm ? !(fp_crd && fp_k == 2'd3) : (fp_k != fp_beats),
+                                              (fp_mvm || fp_sv) ? !(fp_crd && fp_k == 2'd3)
+                                                                : (fp_k != fp_beats),
                                               fp_baddr, fp_bdata, fp_bsz)
                                    : fp_x;
 // The unimplemented-instruction and unsupported-data-type faults, with the
@@ -1432,7 +1456,8 @@ function automatic stp_t fp_st(input stp_t t0, input logic inph, input logic sta
                                input logic wr_go, input logic wr_fin,
                                input logic got, input logic mem_dst,
                                input logic pend, input logic [7:0] pvec, input logic [31:0] ipc,
-                               input logic aexc, input logic [7:0] avec, input logic st_dst);
+                               input logic aexc, input logic [7:0] avec, input logic st_dst,
+                               input logic fmte);
 	stp_t t;
 	t = t0;
 	if (inph) begin
@@ -1461,6 +1486,12 @@ function automatic stp_t fp_st(input stp_t t0, input logic inph, input logic sta
 		// dispatch micro-op that never goes out.
 		else if (live && aexc && !mem_dst && !st_dst) begin
 			t.exc_go = 1'b1; t.ev = avec; t.ef = 4'd0; t.epc = npc; t.eaddr = 32'd0;
+		end
+		// (M10.5) FRESTORE of a frame this core cannot restore: the format
+		// error, vector 14 with format $0 and the instruction's own PC, which
+		// is the reference's default arm (ap040_core.v S_FREST2)
+		else if (fmte) begin
+			t.exc_go = 1'b1; t.ev = 8'd14; t.ef = 4'd0; t.epc = ipc; t.eaddr = 32'd0;
 		end
 		else if (live && (unimp || unsupp)) begin
 			// Both faults are reported AFTER the operand has been fetched, so
@@ -1553,13 +1584,14 @@ wire irq_go = irq_take && eac_v_use && !rst_pending && !older_busy &&
 wire stp_t st = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in),
                                      (HAS_FPU != 0) && (ph == P_FPU), stall_in, fp_live, fp_unimp, fp_unsupp,
                                      i.next_pc, fp_ea_v ? fp_addr : i.pc, fp_ea_v ? fp_addr : 32'd0,
-                                     (fp_stt == FS_RD) && !rd_pend && !((fp_cr || fp_mvm) && fp_crd) && !fp_mw,
+                                     (fp_stt == FS_RD) && !rd_pend && !((fp_cr || fp_mvm || fp_rs) && fp_crd) && !fp_mw,
                                      fp_baddr, fp_bsz,
                                      (fp_stt == FS_WR),
-                                     fp_mvm ? (fp_crd && fp_k == 2'd3) : (fp_k == fp_beats),
+                                     (fp_mvm || fp_sv) ? (fp_crd && fp_k == 2'd3) : (fp_k == fp_beats),
                                      fp_ok, fp_mem_dst,
                                      (HAS_FPU != 0) && fp_pend, fp_pvec, i.pc,
-                                     (HAS_FPU != 0) && fp_ae, fp_avec, fp_need_res),
+                                     (HAS_FPU != 0) && fp_ae, fp_avec, fp_need_res,
+                                     (HAS_FPU != 0) && fp_fmte),
                                irq_go, irq_take_lvl, irq_take_pc), aerr_go, i, rd_a_q);
 
 //--------------------------------------------------------------- PFLUSH / PTEST
@@ -1731,6 +1763,7 @@ always @(posedge clk) begin
 		fp_cw <= 1'b0; fp_csel <= 2'd0; fp_cwd <= 32'd0; fp_crd <= 1'b0;
 		fp_ae <= 1'b0; fp_avec <= 8'd0; fp_pend <= 1'b0; fp_pvec <= 8'd0;
 		fp_list <= 8'd0; fp_fsel <= 3'd0; fp_mw <= 1'b0; fp_mwd <= 96'd0; fp_mwsel <= 3'd0;
+		fp_rstp <= 1'b0; fp_idlp <= 1'b0; fp_fmte <= 1'b0;
 		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
 		irq_take <= 1'b0; irq_take_lvl <= 3'd0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
@@ -1828,6 +1861,7 @@ always @(posedge clk) begin
 								// and a store into Dn or An is finished before it
 								// starts -- cr_rdata reads combinationally.
 								fp_crd <= fp_cr_st && !fp_mem_dst;
+								fp_fmte <= 1'b0;
 								fp_mw <= 1'b0;
 								// (M10.4) FMOVEM walks a register list, twelve bytes
 								// each: the list is consumed as it goes and the first
@@ -1839,6 +1873,9 @@ always @(posedge clk) begin
 								// instruction, so nothing of it starts: no command,
 								// no operand beats, no register list
 								if (fp_pend) ;
+								// (M10.5) FSAVE writes one longword, FRESTORE reads one
+								else if (fp_sv) fp_stt <= FS_WR;
+								else if (fp_rs) fp_stt <= FS_RD;
 								else if (fp_mvm) fp_stt <= fp_mvst ? FS_WR : FS_RD;
 								else if (fp_cr) begin
 									if (fp_mem_src)      fp_stt <= FS_RD;
@@ -1925,7 +1962,8 @@ always @(posedge clk) begin
 					if (fp_pend && st.exc_go) fp_pend <= 1'b0;
 					// the memory operand, LEFT aligned: one byte, one word, or
 					// one, two or three longwords
-					if (!fp_cr && !fp_mvm && fp_stt == FS_RD && cap && rd_tag == T_SLD) begin
+					if (!fp_cr && !fp_mvm && !fp_sv && !fp_rs &&
+					    fp_stt == FS_RD && cap && rd_tag == T_SLD) begin
 						case (fp_nb)
 							5'd1: fp_buf[95:88] <= rd_data[7:0];
 							5'd2: fp_buf[95:80] <= rd_data[15:0];
@@ -1944,6 +1982,22 @@ always @(posedge clk) begin
 						// register it was armed for, so the beat index may move on
 						// the same edge.
 						fp_cw <= 1'b0;
+						// (M10.5) FSAVE: one store beat, then the trailing update
+						// micro-op; FRESTORE: one read, then the frame decides.
+						fp_rstp <= 1'b0; fp_idlp <= 1'b0;
+						if (fp_sv && fp_stt == FS_WR && st.disp && !fp_crd) begin
+							fp_crd <= 1'b1; fp_k <= 2'd3;
+						end
+						if (fp_rs && fp_stt == FS_RD && cap && rd_tag == T_SLD && !fp_crd) begin
+							fp_crd <= 1'b1;
+							// version byte 0 is the NULL frame, $41000000 the IDLE
+							// frame; the $4130 / $4160 payloads are not sequenced
+							// here, so they take the format error rather than being
+							// accepted with a state this core cannot install.
+							if (rd_data[31:24] == 8'd0)          fp_rstp <= 1'b1;
+							else if (rd_data == 32'h4100_0000)   fp_idlp <= 1'b1;
+							else                                 fp_fmte <= 1'b1;
+						end
 						// (M10.4) FMOVEM: three longwords per register, the list
 						// consumed as it goes.  A load assembles the register in
 						// fp_buf and writes it to the unit's raw port; a store
@@ -2004,8 +2058,8 @@ always @(posedge clk) begin
 							end
 						end
 					// the answer is in and the destination is memory: store it
-					if (!fp_mvm && fp_stt == FS_REQ && fp_ok && fp_mem_dst) begin fp_stt <= FS_WR; fp_k <= 2'd0; end
-					if (!fp_mvm && fp_stt == FS_WR && st.disp) fp_k <= fp_k + 2'd1;
+					if (!fp_mvm && !fp_sv && !fp_rs && fp_stt == FS_REQ && fp_ok && fp_mem_dst) begin fp_stt <= FS_WR; fp_k <= 2'd0; end
+					if (!fp_mvm && !fp_sv && !fp_rs && fp_stt == FS_WR && st.disp) fp_k <= fp_k + 2'd1;
 				end
 				P_PMMU: begin
 					if (!pm_sent && bus_idle) begin
@@ -2102,7 +2156,7 @@ always @(posedge clk) begin
 			// (M10.2) a control-register move releases nothing: it sent no
 			// command, so `done` will never come and a background flag set
 			// here would deadlock the next FP instruction at P_START.
-			if (HAS_FPU != 0 && ph == P_FPU && st.disp && st.fin) fp_bg <= !fp_cr && !fp_mvm && !(fp_dn || fp_done);
+			if (HAS_FPU != 0 && ph == P_FPU && st.disp && st.fin) fp_bg <= !fp_cr && !fp_mvm && !fp_sv && !fp_rs && !(fp_dn || fp_done);
 			else if (HAS_FPU != 0 && fp_bg && fp_done)            fp_bg <= 1'b0;
 			// (M10.3) a RELEASED operation's enabled exception: the instruction
 			// has left, so it cannot be reported against it.  It becomes
@@ -2113,7 +2167,7 @@ always @(posedge clk) begin
 			// exception that arrives in the very clock of the release, when
 			// fp_bg is not set yet.
 			if (HAS_FPU != 0 && fp_exc_req &&
-			    (fp_bg || (ph == P_FPU && st.disp && st.fin && !fp_cr && !fp_mvm && !fp_ae))) begin
+			    (fp_bg || (ph == P_FPU && st.disp && st.fin && !fp_cr && !fp_mvm && !fp_sv && !fp_rs && !fp_ae))) begin
 				fp_bg   <= 1'b0;
 				fp_pend <= 1'b1;
 				fp_pvec <= fp_exc_vec;
