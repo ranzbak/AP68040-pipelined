@@ -111,7 +111,24 @@ module ap040_pipe_core
 	output        cinv_req,
 	output        cinv_ic,
 	output        cinv_dc,
-	input         cinv_done
+	input         cinv_done,
+	// the FPU (plan M10.1): instantiated OUTSIDE the core, as the MMU is.
+	// Pulse request / pulse done; `accepted` releases the instruction and
+	// lets the operation finish in the background.  With HAS_FPU = 0 nothing
+	// decodes to CL_FPU, fp_req is never raised and the whole group folds
+	// away; the wrapper ties the inputs off.
+	output        fp_req,
+	output  [2:0] fp_op_class,
+	output  [6:0] fp_opmode,
+	output  [2:0] fp_src_fmt,
+	output  [2:0] fp_src_r,
+	output  [2:0] fp_dst_r,
+	output [95:0] fp_din,
+	input         fp_done,
+	input         fp_accepted,
+	input         fp_unimp,
+	input         fp_unsupp,
+	input  [95:0] fp_dout
 );
 
 //--------------------------------------------------------------- stage wires
@@ -488,6 +505,10 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HA
 	.pt_req(pt_req), .pt_write(pt_write), .pt_addr(pt_addr), .pt_done(pt_done), .pt_mmusr(pt_mmusr),
 	.pf_req(pf_req), .pf_mode(pf_mode), .pf_addr(pf_addr), .pf_done(pf_done),
 	.bus_idle(BUS == 0 || (!mem_req && !sb_busy)), .pmmu_busy(pmmu_busy),
+	.fp_req(fp_req), .fp_op_class(fp_op_class), .fp_opmode(fp_opmode),
+	.fp_src_fmt(fp_src_fmt), .fp_src_r(fp_src_r), .fp_dst_r(fp_dst_r), .fp_din(fp_din),
+	.fp_done(fp_done), .fp_accepted(fp_accepted), .fp_unimp(fp_unimp), .fp_unsupp(fp_unsupp),
+	.fp_dout(fp_dout),
 	.wb_fault(ce && wb_fault), .wb_fatm(st_fatc), .wb_fma(st_fma),
 	.wb_st_a(exe_o.st_addr), .wb_st_s(exe_o.st_size), .wb_st_d(exe_o.st_data), .wb_st_f(exe_o.st_fc),
 	.wb_last(exe_o.last), .wb_stf(exe_o.stf),

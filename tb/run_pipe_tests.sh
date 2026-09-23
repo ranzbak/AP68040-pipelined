@@ -51,6 +51,8 @@ if command -v vasmm68k_mot > /dev/null; then
 	for s in pipe_asm/*.s; do
 		n=$(basename "$s" .s)
 		[ -f "pipe_asm/$n.exp" ] || continue
+		# the FPU programs need HAS_FPU = 1 and the stub unit: their own leg below
+		case "$n" in fpu*) continue ;; esac
 		# bus errors exist only on the memory port: such programs run in the bus legs only
 		if grep -q "expect-berr" "$s"; then
 			( cd pipe_asm && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "../$WORK/$n.bin" "$n.s" ) && python3 bin2hex.py "$WORK/$n.bin" "$WORK/$n.hex"
@@ -76,6 +78,7 @@ if command -v vasmm68k_mot > /dev/null; then
 	for s in pipe_asm/*.s; do
 		n=$(basename "$s" .s)
 		[ -f "pipe_asm/$n.exp" ] || continue
+		case "$n" in fpu*) continue ;; esac
 		[ -f "$WORK/$n.hex" ] || continue
 		cyc=$(sed -n 's/^; diff:.*--cycles \([0-9]*\).*/\1/p' "$s" | head -1)
 		cyc=$(( ${cyc:-20000} * 8 ))
@@ -90,6 +93,54 @@ if command -v vasmm68k_mot > /dev/null; then
 		done
 	done
 	fi
+
+	# plan M10.1: the core built with HAS_FPU = 1, with tb_fpu_stub.v -- a
+	# fixed-latency stand-in for ap040_fpu -- on its fp_* port group, so the
+	# req/accepted/done interlock is testable before the real unit goes in.
+	# The pipe_asm/fpu*.s programs run only here; with HAS_FPU = 0 every one
+	# of their opcodes is M10.0's F-line exception instead (fline4.s).
+	iverilog -g2012 -DFPU_STUB -I "$RTL" -o "$WORK/tb_pipe_fpu.vvp" tb_ap040_pipe_prog.v tb_fpu_stub.v $SRC > "$WORK/tb_pipe_fpu.clog" 2>&1 || {
+		echo "  COMPILE-ERROR fpu prog bench"; grep -v "constant selects" "$WORK/tb_pipe_fpu.clog" | head -5; exit 1; }
+	iverilog -g2012 -DFPU_STUB -DBUS_MODE -I "$RTL" -o "$WORK/tb_fpu_bus.vvp" tb_ap040_pipe_prog.v tb_fpu_stub.v $SRC > "$WORK/tb_fpu_bus.clog" 2>&1 || {
+		echo "  COMPILE-ERROR fpu bus bench"; grep -v "constant selects" "$WORK/tb_fpu_bus.clog" | head -5; exit 1; }
+	for s in pipe_asm/fpu*.s; do
+		[ -f "$s" ] || continue
+		n=$(basename "$s" .s)
+		[ -f "pipe_asm/$n.exp" ] || continue
+		( cd pipe_asm && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "../$WORK/$n.bin" "$n.s" ) || { echo "  FAIL  fpu:$n (assembler)"; fail=1; continue; }
+		python3 bin2hex.py "$WORK/$n.bin" "$WORK/$n.hex"
+		cyc=$(sed -n 's/^; diff:.*--cycles \([0-9]*\).*/\1/p' "$s" | head -1)
+		if timeout 600 vvp "$WORK/tb_pipe_fpu.vvp" +prog="$WORK/$n.hex" +expect="pipe_asm/$n.exp" +cycles=${cyc:-20000} > "$WORK/fpu_$n.log" 2>&1 &&
+		   grep -q "ALL TESTS PASSED" "$WORK/fpu_$n.log"; then
+			echo "  pass  fpu:$n"
+		else
+			echo "  FAIL  fpu:$n  (see $WORK/fpu_$n.log)"
+			fail=1
+		fi
+		if [ -z "${PIPE_NO_BUS:-}" ]; then
+			for p in 0 1 2; do
+				if timeout 900 vvp "$WORK/tb_fpu_bus.vvp" +prog="$WORK/$n.hex" +expect="pipe_asm/$n.exp" +prof=$p +cycles=$(( ${cyc:-20000} * 8 )) > "$WORK/fpubus_${n}_$p.log" 2>&1 &&
+				   grep -q "ALL TESTS PASSED" "$WORK/fpubus_${n}_$p.log"; then
+					echo "  pass  fpubus$p:$n"
+				else
+					echo "  FAIL  fpubus$p:$n  (see $WORK/fpubus_${n}_$p.log)"
+					fail=1
+				fi
+			done
+		fi
+	done
+	# the background-release bench (plan M10.1(c)): the one property a program
+	# cannot see, because it is invisible to the architecture
+	for t in fpu_bg; do
+		iverilog -g2012 -I "$RTL" -o "$WORK/tb_pipe_$t.vvp" "tb_ap040_pipe_$t.v" tb_fpu_stub.v $SRC > "$WORK/tb_pipe_$t.clog" 2>&1 || {
+			echo "  COMPILE-ERROR $t"; grep -v "sorry: constant selects" "$WORK/tb_pipe_$t.clog" | head -5; exit 1; }
+		if timeout 600 vvp "$WORK/tb_pipe_$t.vvp" > "$WORK/pipe_$t.log" 2>&1 && grep -q "ALL TESTS PASSED" "$WORK/pipe_$t.log"; then
+			echo "  pass  $t"
+		else
+			echo "  FAIL  $t  (see $WORK/pipe_$t.log)"
+			fail=1
+		fi
+	done
 else
 	echo "  (vasmm68k_mot not found: program benches skipped)"
 fi

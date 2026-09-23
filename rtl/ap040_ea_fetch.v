@@ -123,6 +123,26 @@ module ap040_ea_fetch
 	input             pf_done,
 	input             bus_idle,    // the memory port has no transfer (the MMU is ours)
 	output            pmmu_busy,   // IF must not fetch
+	// the FPU (plan M10.1): a pulse-request / pulse-done unit instantiated
+	// OUTSIDE the core, as the MMU is.  The command port is bit fields of the
+	// instruction's first extension word; `accepted` rises once classification
+	// is past -- the point after which only completion or an enabled
+	// arithmetic exception can follow -- so the instruction is released there
+	// and the operation finishes in the background while integer instructions
+	// run on.  Only CL_FPU drives any of this, and CL_FPU exists only with
+	// HAS_FPU = 1.
+	output reg        fp_req,
+	output      [2:0] fp_op_class,
+	output      [6:0] fp_opmode,
+	output      [2:0] fp_src_fmt,
+	output      [2:0] fp_src_r,
+	output      [2:0] fp_dst_r,
+	output     [95:0] fp_din,
+	input             fp_done,
+	input             fp_accepted,
+	input             fp_unimp,
+	input             fp_unsupp,
+	input      [95:0] fp_dout,
 	// cache maintenance (M8): CINV / CPUSH drive the wrapper's cache port
 	output reg        cinv_req,
 	output reg        cinv_ic,
@@ -179,7 +199,8 @@ localparam [3:0] P_START = 4'd0,  // examine / wait for serialisation
                  P_PMMU  = 4'd7,  // PFLUSH / PTEST: the MMU request, then a refetch
                  P_STOP  = 4'd8,  // STOP: the SR is written; waiting for an interrupt
                  P_RSTO  = 4'd9,  // RESET: RSTO asserted
-                 P_CINV  = 4'd10; // CINV / CPUSH: the cache request, then a refetch
+                 P_CINV  = 4'd10, // CINV / CPUSH: the cache request, then a refetch
+                 P_FPU   = 4'd11; // a floating-point instruction: the FPU request (M10.1)
 
 reg  [3:0] ph;
 // REDIR_REG (plan M11.1): the one-clock redirect slot, and the "gap clock"
@@ -196,6 +217,17 @@ reg        done_smi, done_dmi, done_sld, done_dld;
 reg [31:0] s_addr, d_addr; // after memory indirect
 reg [31:0] s_val, d_val;   // loaded operands
 reg        rst_pending;    // reset sequence still to run
+
+// ---------------------------------------------------------------- the FPU
+// (plan M10.1(c): the req / accepted / done interlock.)  fp_sent is set the
+// clock AFTER the request goes out, so a `done` or `unimp` still standing
+// from the previous operation cannot be read as this one's answer.
+reg        fp_sent;
+reg        fp_acc;         // accepted seen: classification is past
+reg        fp_dn;          // done seen
+reg [95:0] fp_res;         // ... and its result
+reg        fp_bg;          // a RELEASED operation is still running
+wire       fp_live = fp_sent && !fp_req;
 
 // exception parameters (latched when an exception sequence starts)
 reg  [7:0] x_vec;
@@ -809,7 +841,7 @@ function automatic stp_t stepf(
 	input logic [31:0] s_addr_c, input logic [31:0] s_val_c, input logic [31:0] d_val_c,
 	input logic [2:0] x_step, input logic [31:0] vbr, input logic [7:0] x_vec, input logic [31:0] x_target,
 	input logic [2:0] r_step, input logic [31:0] sp_now, input logic fmt_ok, input logic rte_goes,
-	input logic rx7, input logic rs_done);
+	input logic rx7, input logic rs_done, input logic has_fpu);
 	stp_t s;
 	s = '0;
 	case (ph)
@@ -834,6 +866,9 @@ function automatic stp_t stepf(
 				// the sequence runs in P_PMMU
 			end else if (i.cls == CL_CINV) begin
 				// the sequence runs in P_CINV
+			end else if (has_fpu && i.cls == CL_FPU) begin
+				// the FPU request runs in P_FPU (M10.1(c)).  With HAS_FPU = 0
+				// this arm folds away: CL_FPU is never decoded.
 			end else if (i.cls == CL_STOP) begin
 				// the SR micro-op, then the stopped state (P_STOP)
 				if (!stall) begin s.disp = 1'b1; s.dsel = 3'd0; end
@@ -946,7 +981,7 @@ wire stp_t st0 = stepf(ph, eac_v_use, rst_pending, i, older_busy, !bf_rdblk, rd_
                       s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, trap_n, trap_vec,
                       indexed_mode, two_uop, bf_step, sync_busy, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes,
-                      r_fv[15:12] == 4'd7, rs_cnt == 10'd0);
+                      r_fv[15:12] == 4'd7, rs_cnt == 10'd0, HAS_FPU != 0);
 
 //--------------------------------------------------------------- access errors
 // A data read that ends in an access error (M68040UM 8.2.1, p. 8-6): the
@@ -1173,6 +1208,58 @@ endfunction
 wire stp_t st1 = (ph != P_MOVEM) ? st0 :
                  mm_16 ? m16_st_f(mm_st(mms, mm_addr, i.size), m16_sd, m16_sf) :
                  mm_st(mms, mm_addr, mm_p ? SZ_B : i.size);
+//--------------------------------------------------------------- the FPU
+// The command port is bit fields of the first extension word (M10.1(a)), so
+// id_t needs no new field: `ext` already carries it for MOVEC's selector.
+// Opclass 011 (FMOVE FPn,<ea>) names its floating-point register in the
+// DESTINATION field, and ap040_fpu reads it on src_r (lib/AP68040
+// ap040_core.v:3898), so that one form maps ext[9:7] there.
+assign fp_op_class = i.ext[15:13];
+assign fp_opmode   = i.ext[6:0];
+assign fp_src_fmt  = i.ext[12:10];
+assign fp_src_r    = (i.ext[15:13] == 3'b011) ? i.ext[9:7] : i.ext[12:10];
+assign fp_dst_r    = i.ext[9:7];
+// the integer source operand, LEFT aligned as the unit's din window wants
+assign fp_din      = (i.size == SZ_B) ? {op_a[7:0],  88'd0} :
+                     (i.size == SZ_W) ? {op_a[15:0], 80'd0} : {op_a[31:0], 64'd0};
+// ... and the result, taken from the left of the dout window by size
+wire [31:0] fp_rv  = (i.size == SZ_B) ? {24'd0, fp_res[95:88]} :
+                     (i.size == SZ_W) ? {16'd0, fp_res[95:80]} : fp_res[95:64];
+// opclass 011 stores the FPU's answer, so it waits for `done`; everything
+// else leaves the unit running and is released at `accepted`
+wire        fp_need_res = (i.ext[15:13] == 3'b011);
+wire        fp_ok  = fp_live && (fp_dn || (fp_acc && !fp_need_res));
+function automatic ex_t fpu_uop(input ex_t x0, input logic [31:0] rv);
+	ex_t y;
+	y = x0; y.c = rv;
+	return y;
+endfunction
+wire ex_t fp_x = fpu_uop(x_ord, fp_rv);
+// The unimplemented-instruction and unsupported-data-type faults, with the
+// frames lib/AP68040's go_fp_unimp / go_fp_unsupp use -- both validated on
+// the v24 cputest corpus (PLAN.md D19):
+//   unimp  vector 11, format $2, the NEXT instruction's PC, and the operand
+//          EA, or the faulting instruction's own PC when it has none;
+//   unsupp vector 55, format $3, the next PC, and the EA or zero.
+function automatic stp_t fp_st(input stp_t t0, input logic inph, input logic got, input logic stall,
+                               input logic live, input logic unimp, input logic unsupp,
+                               input logic [31:0] npc, input logic [31:0] ea_u, input logic [31:0] ea_s);
+	stp_t t;
+	t = t0;
+	if (inph) begin
+		t = '0;
+		if (live && unimp) begin
+			t.exc_go = 1'b1; t.ev = 8'd11; t.ef = 4'd2; t.epc = npc; t.eaddr = ea_u;
+		end else if (live && unsupp) begin
+			t.exc_go = 1'b1; t.ev = 8'd55; t.ef = 4'd3; t.epc = npc; t.eaddr = ea_s;
+		end else if (got && !stall) begin
+			t.disp = 1'b1; t.dsel = 3'd4; t.fin = 1'b1;
+		end
+	end
+	return t;
+endfunction
+wire [31:0] fp_ea = (i.src.kind == EK_MEM) ? s_addr_c : 32'd0;
+
 function automatic stp_t aerr_st(input stp_t t0, input logic go, input id_t i, input logic [31:0] fa);
 	stp_t t;
 	t = t0;
@@ -1231,7 +1318,9 @@ reg  [2:0] irq_take_lvl;
 wire [31:0] irq_take_pc = (ph == P_STOP) ? i.next_pc : i.pc;
 wire irq_go = irq_take && eac_v_use && !rst_pending && !older_busy &&
               ((ph == P_START) || (ph == P_STOP));
-wire stp_t st = aerr_st(irq_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in),
+wire stp_t st = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in),
+                                     ph == P_FPU, fp_ok, stall_in, fp_live, fp_unimp, fp_unsupp,
+                                     i.next_pc, (i.src.kind == EK_MEM) ? s_addr_c : i.pc, fp_ea),
                                irq_go, irq_take_lvl, irq_take_pc), aerr_go, i, rd_a_q);
 
 //--------------------------------------------------------------- PFLUSH / PTEST
@@ -1266,6 +1355,7 @@ function automatic ex_t pmmu_uop(input id_t i, input logic [31:0] mmusr);
 endfunction
 wire ex_t pm_x = pmmu_uop(i, pm_mmusr);
 
+
 // RTR to an odd PC: the CCR alone commits
 function automatic ex_t ccr_only_uop(input ex_t x);
 	ex_t y;
@@ -1298,6 +1388,7 @@ wire ex_t disp_x0 = dmux(st.dsel, x_ord,
                         exc_uop(i, x_k, x_sp, x_sr, x_pc, x_fmt, x_vec, x_addr, x7[(x_k < 4'd2) ? 4'd2 : x_k]),
                         exc_final(i, x_bank, x_sp, x_sr, x_target, x_irq, x_lvl),
                         rte_final(i, bank_now, rd_a, r_fv, r_sr, r_pc),
+                        (ph == P_FPU) ? fp_x :
                         (ph == P_PMMU || ph == P_CINV) ? pm_x : reset_final(i, x_sp, r_pc),
                         ccr_only_uop(x_ord),
                         no_last(x_ord),
@@ -1396,6 +1487,7 @@ always @(posedge clk) begin
 		pt_req <= 1'b0; pt_write <= 1'b0; pt_addr <= 32'd0; pf_req <= 1'b0; pf_mode <= 2'd0; pf_addr <= 32'd0;
 		pm_sent <= 1'b0; pm_got <= 1'b0; pm_mmusr <= 32'd0;
 		cinv_req <= 1'b0; cinv_ic <= 1'b0; cinv_dc <= 1'b0;
+		fp_req <= 1'b0; fp_sent <= 1'b0; fp_acc <= 1'b0; fp_dn <= 1'b0; fp_res <= 96'd0; fp_bg <= 1'b0;
 		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
 		irq_take <= 1'b0; irq_take_lvl <= 3'd0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
@@ -1442,6 +1534,7 @@ always @(posedge clk) begin
 			if (rd_pend && !rd_ack) rd_drop <= 1'b1;
 		end else if (flush) begin
 			ph <= P_START; bf_step <= 1'b0; mm_have <= 1'b0; mm_empty <= 1'b0; mm_tail <= 1'b0;
+			fp_req <= 1'b0;
 			done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
 			if (rd_pend && !rd_ack) rd_drop <= 1'b1;
 		end else begin
@@ -1473,6 +1566,15 @@ always @(posedge clk) begin
 							ph <= P_CINV; pm_sent <= 1'b0; pm_got <= 1'b0;
 						end else if (!st.exc_go && i.cls == CL_PMMU) begin
 							ph <= P_PMMU; pm_sent <= 1'b0; pm_got <= 1'b0;
+						end else if (!st.exc_go && HAS_FPU != 0 && i.cls == CL_FPU) begin
+							// (M10.1(c)) one FP instruction at a time: a second
+							// one waits here while a released operation is still
+							// running, which is also what keeps FBcc/FScc from
+							// reading a live `fpcc`.
+							if (!fp_bg) begin
+								ph <= P_FPU; fp_req <= 1'b1;
+								fp_sent <= 1'b0; fp_acc <= 1'b0; fp_dn <= 1'b0;
+							end
 						end else if (!st.exc_go && i.cls == CL_RTE) begin
 							ph <= P_RTE; r_step <= 3'd0;
 						end else if (!st.exc_go && !st.fin) ph <= P_OPS;
@@ -1531,6 +1633,17 @@ always @(posedge clk) begin
 					end
 					if (cinv_req && cinv_done) begin
 						cinv_req <= 1'b0; pm_got <= 1'b1;
+					end
+				end
+				P_FPU: begin
+					// the request is a one-clock pulse; fp_sent goes up the
+					// clock after it, so a `done` or `unimp` still standing
+					// from the previous operation is never read as this one's
+					fp_req <= 1'b0;
+					if (fp_req) fp_sent <= 1'b1;
+					if (fp_live) begin
+						if (fp_accepted) fp_acc <= 1'b1;
+						if (fp_done) begin fp_dn <= 1'b1; fp_res <= fp_dout; end
 					end
 				end
 				P_PMMU: begin
@@ -1623,6 +1736,10 @@ always @(posedge clk) begin
 				if (mms.fin) begin mm_empty <= 1'b0; mm_tail <= 1'b0; end
 				if (mms.tail) mm_tail <= 1'b1;
 			end
+			// (M10.1(c)) the released operation: `fp_bg` holds the next FP
+			// instruction back until the unit answers, and nothing else does.
+			if (ph == P_FPU && st.disp && st.fin) fp_bg <= !(fp_dn || fp_done);
+			else if (fp_bg && fp_done)            fp_bg <= 1'b0;
 			if (aerr_dbl || wf_dbl) ph <= P_HALT;
 			if (ph != P_RTE && eac_v_use && cm_hit && (st.fin || st.exc_go || st0.mm_go)) cm_v <= 1'b0;
 			if (st.fin) begin

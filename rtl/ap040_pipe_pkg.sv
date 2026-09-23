@@ -109,7 +109,15 @@ typedef enum logic [5:0] {
 	CL_PMMU    = 6'd38,  // PFLUSH / PTEST (EA-fetch runs them against the MMU, M7)
 	CL_STOP    = 6'd39,  // STOP #imm (SR, then the stopped state until an interrupt)
 	CL_RSTO    = 6'd40,  // the RESET instruction (RSTO for 512 clocks)
-	CL_CINV    = 6'd41   // CINV / CPUSH (EA-fetch drives the cache's maintenance port, M8)
+	CL_CINV    = 6'd41,  // CINV / CPUSH (EA-fetch drives the cache's maintenance port, M8)
+	// A floating-point instruction the FPU executes (plan M10.1(a)).  Produced
+	// only with HAS_FPU = 1; with HAS_FPU = 0 every cpid-1 encoding is M10.0's
+	// F-line exception and this value never occurs, so the shipping LC040
+	// build pays nothing for it.  The FPU's whole command port is bit fields
+	// of the first extension word, which id_t already carries in `ext`:
+	//   op_class = ext[15:13], opmode = ext[6:0], src_fmt = ext[12:10],
+	//   source FPm = ext[12:10] (opclass 000), destination FPn = ext[9:7].
+	CL_FPU     = 6'd42
 } cls_t;
 
 typedef struct packed {

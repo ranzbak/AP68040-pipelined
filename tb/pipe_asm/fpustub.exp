@@ -1,0 +1,31 @@
+halt 0000048e
+# plan M10.1(a)+(c).  Hand written: no reference core can produce this file --
+# lib/AP68040 with an FPU runs real floating point, and with HAS_FPU = 0 every
+# one of these opcodes is an F-line exception.  The values are the stub unit's
+# defined 32-bit integer semantics (tb/tb_fpu_stub.v), and the two exception
+# cases are DELTAS against the frames lib/AP68040's go_fp_unimp/go_fp_unsupp
+# build, so a correct core writes zeros and no absolute address appears here.
+#
+# 1: a register operand in and out again
+m32 00007000 00000005
+# 2: the background operation's result (12, not the stale 5) and the four
+#    integer instructions that ran behind it
+m32 00007004 0000000c
+m32 00007008 00000004
+# 3: two FP instructions back to back -- 5 + 7 + 7 + 7.  $BADBAD00 here means
+#    the core requested the unit while it was still busy.
+m32 0000700c 0000001a
+# 4: the word and byte formats, both directions
+m32 00007010 00005678
+m32 00007014 00000078
+# 5: unimp -> vector 11, format $2, next PC, faulted PC in the address field
+m32 00007018 00000000
+m32 0000701c 00000000
+m32 00007020 00000000
+# 6: unsupp -> vector 55, format $3, next PC, a zero address field
+m32 00007024 00000000
+m32 00007028 00000000
+m32 0000702c 00000000
+# the faulting FMOVE.L FP2,D4 of case 6 must not have written D4
+d4 00000078
+a6 00007030

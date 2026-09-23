@@ -264,6 +264,16 @@ always @* begin
 		CL_MOVEM: begin                   // EA-fetch built it: a load's register, or a store (x.st_*)
 			if (x.dk == DK_REG) begin w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = x.c; end
 		end
+		// (M10.1) a floating-point instruction: EA-fetch ran the unit and put
+		// its result, already right-aligned by size, in x.c.  Nothing here
+		// touches the CCR -- the FP condition codes live in the FPSR.
+		CL_FPU: begin
+			if (x.dk == DK_REG) begin
+				w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = merge(x.b, x.c, x.size);
+			end else if (x.dk == DK_MEM) begin
+				w.st_v = 1'b1; w.st_addr = x.daddr; w.st_data = x.c; w.st_size = x.size;
+			end
+		end
 		CL_CAS2: begin                    // EA-fetch decided it; flags from x.b - x.a
 			if (x.wr_ccr) begin w.ccr_v = 1'b1; w.ccr_val = alu_flags; end
 			if (x.dk == DK_REG) begin w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = x.c; end

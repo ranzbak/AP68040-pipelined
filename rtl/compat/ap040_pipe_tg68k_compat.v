@@ -293,7 +293,13 @@ ap040_pipe_core #(
 	.pt_done(pt_done), .pt_mmusr(pt_mmusr),
 	.pf_req(pf_req), .pf_mode(pf_mode), .pf_addr(pf_addr), .pf_fc(pf_fcw), .pf_done(pf_done),
 	.ipl(ipl), .nmi_ack_toggle(nmi_ack_toggle), .nresetout(nresetout), .dbg_stopped(),
-	.cinv_req(cinv_req), .cinv_ic(cinv_ic), .cinv_dc(cinv_dc), .cinv_done(cinv_done)
+	.cinv_req(cinv_req), .cinv_ic(cinv_ic), .cinv_dc(cinv_dc), .cinv_done(cinv_done),
+	// the FPU port group (plan M10.1): no unit is instantiated here yet --
+	// M10.1 step (b) wires ap040_fpu in.  With AP040_HAS_FPU = 0, which is
+	// what the Minimig build uses, nothing ever decodes to CL_FPU and fp_req
+	// stays low, so tying the answers off is exact and not merely safe.
+	.fp_req(), .fp_op_class(), .fp_opmode(), .fp_src_fmt(), .fp_src_r(), .fp_dst_r(), .fp_din(),
+	.fp_done(1'b0), .fp_accepted(1'b0), .fp_unimp(1'b0), .fp_unsupp(1'b0), .fp_dout(96'd0)
 );
 
 // the MMU (M7): lifted from the reference as it is, wired as the reference

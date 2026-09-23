@@ -14,6 +14,9 @@ v_chk	equ	unexp
 	ifnd	v_trapv
 v_trapv	equ	unexp
 	endif
+	ifnd	v_fpun
+v_fpun	equ	unexp		; 55 FP unsupported data type (plan M10.1)
+	endif
 	org	0
 	dc.l	$1F00
 	dc.l	start
@@ -35,6 +38,10 @@ v_trapv	equ	unexp
 	dc.l	unexp		; 15-31
 	endr
 	dc.l	v_trp0		; 32 TRAP #0
-	rept	223
-	dc.l	unexp
+	rept	22
+	dc.l	unexp		; 33-54
+	endr
+	dc.l	v_fpun		; 55 FP unsupported data type
+	rept	200
+	dc.l	unexp		; 56-255
 	endr

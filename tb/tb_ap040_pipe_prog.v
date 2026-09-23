@@ -53,10 +53,34 @@ reg         m_ack = 1'b0;
 reg         m_flt = 1'b0;         // (bus mode) the answer is an access error
 reg  [31:0] m_rdata = 32'd0;
 
+// (plan M10.1) the FPU port group: with -DFPU_STUB the core is built with
+// HAS_FPU = 1 and tb_fpu_stub.v answers it, so the req/accepted/done
+// interlock can be exercised by a program before the real unit goes in.
+wire        fp_req, fp_done, fp_accepted, fp_unimp, fp_unsupp, fp_dbl;
+wire  [2:0] fp_op_class, fp_src_fmt, fp_src_r, fp_dst_r;
+wire  [6:0] fp_opmode;
+wire [95:0] fp_din, fp_dout;
+`ifdef FPU_STUB
+tb_fpu_stub u_fpu
+(
+	.clk(clk), .nreset(nreset), .ce(ce),
+	.req(fp_req), .op_class(fp_op_class), .opmode(fp_opmode),
+	.src_fmt(fp_src_fmt), .src_r(fp_src_r), .dst_r(fp_dst_r), .din(fp_din),
+	.done(fp_done), .accepted(fp_accepted), .unimp(fp_unimp), .unsupp(fp_unsupp),
+	.dout(fp_dout), .dbl_req(fp_dbl)
+);
+`else
+assign fp_done = 1'b0, fp_accepted = 1'b0, fp_unimp = 1'b0, fp_unsupp = 1'b0;
+assign fp_dout = 96'd0, fp_dbl = 1'b0;
+`endif
+
 ap040_pipe_core #(
 	.PC_RESET(PC_RESET), .PROG_WORDS(32'h7FFF_FFFF), .L1_AW(L1_AW), .RESET_FROM_VECTORS(1)
 `ifdef BUS_MODE
 	, .BUS(1)
+`endif
+`ifdef FPU_STUB
+	, .HAS_FPU(1)
 `endif
 ) dut (
 	.clk(clk), .nreset(nreset), .ce(ce),
@@ -68,7 +92,11 @@ ap040_pipe_core #(
 	.dbg_ex_valid(), .dbg_ex_pc(), .dbg_wb_valid(dbg_wb_valid), .dbg_wb_pc(dbg_wb_pc),
 	.dbg_d0(dbg_d0), .dbg_d1(dbg_d1), .dbg_d2(dbg_d2), .dbg_d3(dbg_d3),
 	.dbg_d4(dbg_d4), .dbg_d5(dbg_d5), .dbg_d6(dbg_d6), .dbg_d7(dbg_d7),
-	.dbg_ccr(dbg_ccr), .dbg_sr(dbg_sr)
+	.dbg_ccr(dbg_ccr), .dbg_sr(dbg_sr),
+	.fp_req(fp_req), .fp_op_class(fp_op_class), .fp_opmode(fp_opmode),
+	.fp_src_fmt(fp_src_fmt), .fp_src_r(fp_src_r), .fp_dst_r(fp_dst_r), .fp_din(fp_din),
+	.fp_done(fp_done), .fp_accepted(fp_accepted), .fp_unimp(fp_unimp), .fp_unsupp(fp_unsupp),
+	.fp_dout(fp_dout)
 );
 
 // "berr" lines (bus mode only)

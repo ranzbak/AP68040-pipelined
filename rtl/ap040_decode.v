@@ -726,10 +726,12 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 	logic [1:0]  s2;
 	int ks, kd; elen_t e;
 	logic fsave_ok, frest_ok;   // the coprocessor-id-1 state instructions' legal EA modes
+	logic fp_ireg;              // (M10.1) an FP format that fits in a data register
 	tot = tot_w;
 	op = vbuf[0];
 	x1 = vbuf[1];
 	d = '0;
+	fp_ireg = 1'b0;
 	s2set = 1'b0; s2 = SZ_L;
 	d.reg_c = R_NONE;
 	d.reg_d = R_NONE;
@@ -1116,13 +1118,67 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				    (op[8:6] == 3'b101 && !frest_ok)) begin
 					d.exc_vec = 8'd11; d.exc_fmt = 4'd0; d.exc_next = 1'b0;
 				end
+				// ---------------------------------------- plan M10.1(a)
+				// With an FPU a WELL-FORMED cpid-1 instruction of the subset
+				// this core executes becomes CL_FPU instead of the exception.
+				// `exc_fmt == 4` is exactly "well formed" here: D18's rows 2-4
+				// have already pushed every malformed encoding down to format
+				// $0 or vector 4, so this reads the one bit that already says
+				// the encoding is a real floating-point instruction.
+				//
+				// M10.1 step 1 takes the REGISTER-operand forms only -- the
+				// ones that need no bus access -- because the 96-bit memory
+				// operand path is step (b).  Everything else keeps the format
+				// $4 frame it has today, which is right for the LC040 build
+				// that ships and incomplete for a build with an FPU; no
+				// HAS_FPU = 1 image exists yet and (b) closes it.
+				//   opclass 000  FPm -> FPn         (no EA at all)
+				//   opclass 010  Dn  -> FPn  {B,W,L,S}
+				//   opclass 011  FPn -> Dn   {B,W,L,S}
+				// An extended, packed or double operand in a data register is
+				// an illegal EA on a 68040 and stays the F-line.
+				if (HAS_FPU != 0 && d.cls == CL_EXC && d.exc_fmt == 4'd4 &&
+				    op[8:6] == 3'b000) begin
+					// a source/destination format that fits in a data register
+					fp_ireg = (x1[12:10] == 3'b000) || (x1[12:10] == 3'b001) ||
+					          (x1[12:10] == 3'b100) || (x1[12:10] == 3'b110);
+					if (x1[15:13] == 3'b000) begin
+						d.cls = CL_FPU; d.size = SZ_L;
+					end else if (x1[15:13] == 3'b010 && fp_ireg && d.src.kind == EK_DREG) begin
+						d.cls = CL_FPU;
+						d.size = (x1[12:10] == 3'b100) ? SZ_W : (x1[12:10] == 3'b110) ? SZ_B : SZ_L;
+					end else if (x1[15:13] == 3'b011 && fp_ireg && d.src.kind == EK_DREG) begin
+						// opclass 011's EA is the DESTINATION: the core waits
+						// for `done` and writes the FPU's result into it
+						d.cls = CL_FPU;
+						d.size = (x1[12:10] == 3'b100) ? SZ_W : (x1[12:10] == 3'b110) ? SZ_B : SZ_L;
+						d.dst  = d.src;
+					end
+				end
 				// The source EA is kept ONLY for a format $4 frame, which
-				// stacks it: EA-calc computes the address, EA-fetch takes it
-				// from there and no operand is ever read.  D18: the field is 0
+				// stacks it (EA-calc computes the address, EA-fetch takes it
+				// from there and no operand is ever read; D18: the field is 0
 				// whenever there is no memory operand -- a register, FMOVECR,
-				// FBcc, FTRAPcc, and an immediate source (NOT the address of
-				// the immediate data).
-				if (d.exc_fmt != 4'd4 || d.src.kind != EK_MEM) begin
+				// FBcc, FTRAPcc, and an immediate source, NOT the address of
+				// the immediate data), or for a CL_FPU instruction whose
+				// source operand it is.
+				if (d.cls == CL_FPU) begin
+					// An FP instruction SERIALISES: it waits in EA-fetch until
+					// everything older has committed before the request goes
+					// out.  The reason is not throughput but safety -- once the
+					// unit has the command it has changed architectural state,
+					// and a redirect by an older instruction (a taken branch
+					// resolved in EX, a MOVE-to-SR, an exception) would flush
+					// this stage and leave that state behind.  With nothing
+					// older in EX or WB there is no such redirect.  It costs
+					// the drain, not the background release: after `accepted`
+					// the instruction leaves and integer work runs on.  M11
+					// can trade it for a flush-aware abort if it is worth it.
+					d.serialize = 1'b1;
+					if (d.ext[15:13] != 3'b010) begin
+						d.src = '0; d.src.reg_n = R_NONE; d.src.idx_reg = R_NONE;
+					end
+				end else if (d.exc_fmt != 4'd4 || d.src.kind != EK_MEM) begin
 					d.src = '0; d.src.reg_n = R_NONE; d.src.idx_reg = R_NONE;
 				end
 			end
