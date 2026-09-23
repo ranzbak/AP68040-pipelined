@@ -256,7 +256,8 @@ wire [31:0] fp_cr_wdata, fp_cr_rdata;
 wire        fp_fm_we;
 wire  [2:0] fp_fm_sel;
 wire [95:0] fp_fm_wdata, fp_fm_rdata;
-wire        fp_used, fp_frst, fp_fridle;
+wire        fp_used, fp_frst, fp_fridle, fp_bsun_en, fp_bsun_req;
+wire  [3:0] fp_fpcc;
 wire        fp_st_unimp, fp_st_wbte15, fp_fsave_ack, fp_fr_unimp, fp_fr_wbte15;
 wire [15:0] fp_st_cmd1, fp_st_cmd3, fp_fr_cmd1, fp_fr_cmd3;
 wire  [2:0] fp_st_stag, fp_st_dtag, fp_st_flags, fp_st_grs;
@@ -322,6 +323,7 @@ ap040_pipe_core #(
 	.fp_ia_we(fp_ia_we), .fp_ia_wdata(fp_ia_wdata),
 	.fp_cr_sel(fp_cr_sel), .fp_cr_we(fp_cr_we), .fp_cr_wdata(fp_cr_wdata), .fp_cr_rdata(fp_cr_rdata),
 	.fp_fm_sel(fp_fm_sel), .fp_fm_we(fp_fm_we), .fp_fm_wdata(fp_fm_wdata), .fp_fm_rdata(fp_fm_rdata),
+	.fp_fpcc(fp_fpcc), .fp_bsun_en(fp_bsun_en), .fp_bsun_req(fp_bsun_req),
 	.fp_used(fp_used), .fp_frst(fp_frst), .fp_fridle(fp_fridle),
 	.fp_st_unimp(fp_st_unimp), .fp_st_cmd1(fp_st_cmd1), .fp_st_cmd3(fp_st_cmd3),
 	.fp_st_stag(fp_st_stag), .fp_st_dtag(fp_st_dtag), .fp_st_flags(fp_st_flags),
@@ -351,6 +353,7 @@ end else begin : g_nofpu
 	assign fp_exc_req = 1'b0, fp_exc_vec = 8'd0;
 	assign fp_fm_rdata = 96'd0;
 	assign fp_used = 1'b0;
+assign fp_fpcc = 4'd0, fp_bsun_en = 1'b0;
 	assign fp_st_unimp = 1'b0, fp_st_wbte15 = 1'b0;
 	assign fp_st_cmd1 = 16'd0, fp_st_cmd3 = 16'd0;
 	assign fp_st_stag = 3'd0, fp_st_dtag = 3'd0, fp_st_flags = 3'd0, fp_st_grs = 3'd0;

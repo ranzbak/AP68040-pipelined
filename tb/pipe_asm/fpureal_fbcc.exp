@@ -1,0 +1,24 @@
+halt 0000502
+# plan M10.8, the floating-point conditional predicates.
+# 1, 2: every branch went the way the predicate table says, on 5 vs 3
+m32 00007004 00000000
+# 3: FScc writes a byte of all ones or all zeros, into a data register and
+# into memory, and nothing outside that byte
+d0 000000ff
+d1 00000000
+m8 00005100 ff
+m8 00005101 00
+a1 00005102
+# 4: FDBcc counted Dn.w down while the condition was FALSE and stopped when
+# it passed -1: four passes through the body, the counter left at $FFFF
+d2 0000ffff
+d3 00000004
+# 5: a SIGNALLING predicate that met an unordered result recorded BSUN in
+# FPSR with the trap DISABLED -- the status bit, and no trap
+d4 00008000
+# 6: ... and took vector 48 with the trap enabled, exactly once, with the
+# frame the rule says: format $0 and the instruction's own PC (both deltas
+# zero)
+m32 00007000 00000001
+m32 00007008 00000000
+m32 0000700c 00000000

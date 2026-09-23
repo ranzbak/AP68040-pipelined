@@ -1186,6 +1186,46 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				    (op[8:6] == 3'b101 && !frest_ok)) begin
 					d.exc_vec = 8'd11; d.exc_fmt = 4'd0; d.exc_next = 1'b0;
 				end
+				// ---------------------------------------- plan M10.8
+				// FBcc / FScc / FDBcc / FTRAPcc: the floating-point conditional
+				// predicates.  The condition is evaluated in EA-fetch from the
+				// unit's `fpcc`, which is why these decode to CL_FPU like
+				// everything else that has to wait for a released operation --
+				// reading `fpcc` while one is in flight is the DATA hazard
+				// M10.1(c) named, and the serialise + fp_bg wait is what makes
+				// it safe.  The displacement rides `imm`, which no FP class
+				// with a branch also uses for a step.
+				if (HAS_FPU != 0 && d.cls == CL_EXC && d.exc_fmt == 4'd4) begin
+					if (op[8:6] == 3'b010) begin                  // FBcc.W
+						d.cls = CL_FPU;
+						d.imm = {{16{vbuf[1][15]}}, vbuf[1]};
+					end else if (op[8:6] == 3'b011) begin         // FBcc.L
+						d.cls = CL_FPU;
+						d.imm = {vbuf[1], vbuf[2]};
+					end else if (op[8:6] == 3'b001) begin
+						if (op[5:3] == 3'b001) begin              // FDBcc Dn,disp
+							d.cls = CL_FPU;
+							d.imm = {{16{vbuf[2][15]}}, vbuf[2]};
+							d.src = ea_reg(EK_DREG, {2'b00, op[2:0]});
+						end else if (op[5:0] == 6'b111_010 ||
+						             op[5:0] == 6'b111_011 ||
+						             op[5:0] == 6'b111_100) begin // FTRAPcc
+							d.cls = CL_FPU;
+						end else if (d.src.kind == EK_DREG ||
+						             (d.src.kind == EK_MEM && d.src.mi == MI_NONE &&
+						              !(sh.sm == 3'd7 && sh.sr[1]))) begin
+							// FScc <ea>: a data-alterable byte destination
+							d.cls  = CL_FPU;
+							d.size = SZ_B;
+							d.dst  = d.src;
+						end else begin
+							// an immediate or PC-relative FScc destination is
+							// the ordinary F-line (lib/AP68040 S_FSCC0)
+							d.exc_fmt = 4'd0; d.exc_next = 1'b0;
+						end
+					end
+					if (d.cls == CL_FPU) d.serialize = 1'b1;
+				end
 				// ---------------------------------------- plan M10.5
 				// FSAVE and FRESTORE with an FPU: the state frames.  Only the
 				// one-longword NULL and IDLE frames are sequenced here (the
@@ -1428,7 +1468,8 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					d.serialize = 1'b1;
 					if (!((op[8:6] == 3'b000 && d.ext[15:13] == 3'b010) ||
 					      (op[8:6] == 3'b000 && d.ext[15] && !d.ext[13]) ||
-					      (op[8:6] == 3'b101))) begin
+					      (op[8:6] == 3'b101) ||
+					      (op[8:6] == 3'b001))) begin
 						// the EA is the SOURCE for opclass 010, for a move INTO
 						// the unit -- the control registers (100) and the FP
 						// register list (110) -- and for FRESTORE, which reads

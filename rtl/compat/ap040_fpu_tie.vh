@@ -16,7 +16,6 @@
 // fp_ce.                                                                   //
 //                                                                          //
 // TIED OFF, and each one is a recorded gap, not an oversight:              //
-//   bsun_*               FBcc on an unordered compare is not decoded yet.  //
 //   frestore_busy /      the $4160 BUSY frame, which needs the deferred    //
 //   fstate_busy          exception path `pend_capture` is tied off for, so  //
 //                        the unit can never be holding one (M10.7).        //
@@ -34,10 +33,10 @@ ap040_fpu u_fpu
 	.done(fp_done), .accepted(fp_accepted),
 	.unimp(fp_unimp), .unsupp(fp_unsupp),
 	.exc_req(fp_exc_req), .exc_vec(fp_exc_vec), .dout(fp_dout),
-	.fpcc(),
+	.fpcc(fp_fpcc),
 
 	.cr_sel(fp_cr_sel), .cr_we(fp_cr_we), .cr_wdata(fp_cr_wdata), .cr_rdata(fp_cr_rdata),
-	.bsun_req(1'b0), .bsun_enable(),
+	.bsun_req(fp_bsun_req), .bsun_enable(fp_bsun_en),
 
 	.ia_we(fp_ia_we), .ia_wdata(fp_ia_wdata),
 
