@@ -50,6 +50,16 @@ module ap040_ea_fetch
 	// 1: a full MC68040 (FPU): RTE rejects the LC/EC format $4 frame
 	// (format error), as the reference with AP040_HAS_FPU; 0: the LC040 pops it
 	parameter HAS_FPU = 0,
+	// 1 (plan M11.1): this stage's redirect -- RTS/RTD/RTR, a memory-indirect
+	// JMP/JSR, a Bcc/DBcc that ID guessed wrong -- is REGISTERED here instead
+	// of going straight out to IF, ID and EA-calc.  It costs one clock on each
+	// of those, and it takes the memory acknowledge off a path that fans out
+	// to the whole prefetch queue: the wrapper registers the acknowledge on the
+	// clk_114 edge immediately before the core's clk_38 edge, so everything it
+	// reaches has ONE clk_114 period (cpu.xdc, and PLAN.md M11.1 for why this
+	// is the only family the design still fails).  With it the acknowledge
+	// reaches one local register instead.  0 = as before.
+	parameter REDIR_REG = 0,
 	// 1 (bus builds): a MOVEM -(An) store sends its An update on a trailing
 	// micro-op of its own, so a fault on the last store (CM, a restart)
 	// leaves An as it was -- a faulted store's micro-op keeps its register
@@ -169,6 +179,13 @@ localparam [3:0] P_START = 4'd0,  // examine / wait for serialisation
                  P_CINV  = 4'd10; // CINV / CPUSH: the cache request, then a refetch
 
 reg  [3:0] ph;
+// REDIR_REG (plan M11.1): the one-clock redirect slot, and the "gap clock"
+// in which this stage must do nothing.  eac_v_use is what every decision
+// here looks at; eaf_stall keeps the REAL eac_valid, so EA-calc holds.
+reg         rdz_v;
+reg  [31:0] rdz_pc;
+wire        redir_gap = (REDIR_REG != 0) && rdz_v;
+wire        eac_v_use = eac_valid && !redir_gap;
 reg        rd_pend;        // a read is outstanding
 reg        rd_drop;        // ... and belongs to a flushed instruction
 reg  [2:0] rd_tag;         // which read it is
@@ -922,7 +939,7 @@ endfunction
 // reads never wait for older stores (store-to-load forwarding, above)
 // a bitfield's read address uses the register file: no read while EX writes one of its registers
 wire bf_rdblk = is_bf && ex_haz;
-wire stp_t st0 = stepf(ph, eac_valid, rst_pending, i, older_busy, !bf_rdblk, rd_pend, rd_ack, cap,
+wire stp_t st0 = stepf(ph, eac_v_use, rst_pending, i, older_busy, !bf_rdblk, rd_pend, rd_ack, cap,
                       s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, trap_n, trap_vec,
                       indexed_mode, two_uop, bf_step, sync_busy, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes,
@@ -968,7 +985,7 @@ endfunction
 wire        wf_dbl  = wb_fault && (wb_stf.exc || ph == P_EXC || ph == P_RTE || ph == P_RESET);
 wire        wf_last = wb_last && !wb_stf.cm;      // MOVEM: CM and a restart, never WB1
 wire        wf_go   = wb_fault && !wf_dbl;
-wire        aerr_go  = cap_err && eac_valid && (ph == P_START || ph == P_OPS || ph == P_MOVEM);
+wire        aerr_go  = cap_err && eac_v_use && (ph == P_START || ph == P_OPS || ph == P_MOVEM);
 wire        aerr_dbl = cap_err && (ph == P_EXC || ph == P_RTE || ph == P_RESET);
 
 //--------------------------------------------------------------- MOVEM
@@ -1209,7 +1226,7 @@ endfunction
 reg        irq_take;
 reg  [2:0] irq_take_lvl;
 wire [31:0] irq_take_pc = (ph == P_STOP) ? i.next_pc : i.pc;
-wire irq_go = irq_take && eac_valid && !rst_pending && !older_busy &&
+wire irq_go = irq_take && eac_v_use && !rst_pending && !older_busy &&
               ((ph == P_START) || (ph == P_STOP));
 wire stp_t st = aerr_st(irq_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in),
                                irq_go, irq_take_lvl, irq_take_pc), aerr_go, i, rd_a_q);
@@ -1310,14 +1327,14 @@ wire [2:0] fc_data = s_bit ? 3'd5 : 3'd1;
 assign rd_fc     = (st.issue && (ph == P_START || ph == P_OPS) && i.fcsel == 2'd1) ? sfc_in :
                    (ph == P_EXC || ph == P_RTE || ph == P_RESET) ? 3'd5 : fc_data;
 wire   use_early = early_v && early.v && !st.issue && (!rd_pend || rd_ack) &&
-                   (st.fin || !eac_valid) && !rst_pending;
+                   (st.fin || !eac_v_use) && !rst_pending;
 assign rd_req    = (st.issue || use_early) && !flush && !irq_take;   // (registered: out of stepf)
 assign rd_addr   = st.issue ? st.ia  : early.a;
 assign rd_size   = st.issue ? st.isz : early.sz;
 wire [2:0] rd_t  = st.issue ? st.it  : early.t;
 assign eaf_stall = eac_valid && !st.fin;
 // (MOVEM blocks EA-calc for its whole stay: its register writes are not in eac_t)
-assign eaf_blk   = eac_valid && (i.serialize || (ph != P_START && ph != P_OPS) || i.cls == CL_MOVEM);
+assign eaf_blk   = eac_v_use && (i.serialize || (ph != P_START && ph != P_OPS) || i.cls == CL_MOVEM);
 assign halted    = (ph == P_HALT);
 
 // Bcc/DBcc were guessed taken by ID; a not-taken one is corrected here,
@@ -1329,13 +1346,32 @@ assign halted    = (ph == P_HALT);
 wire [15:0] dbc_dec = rd_b[15:0] - 16'd1;
 wire       br_taken = (i.cls == CL_BCC) ? br_cc : (!br_cc && dbc_dec != 16'hFFFF);
 
-assign eaf_redir_v  = st.disp && st.dsel == 3'd0 && !flush &&
-                      (i.cls == CL_RTS || i.cls == CL_RTD || i.cls == CL_RTR ||
-                       ((i.cls == CL_JMP || i.cls == CL_JSR) && !eac_i.redirected) ||
-                       ((i.cls == CL_BCC || i.cls == CL_DBCC) && !br_taken));
-assign eaf_redir_pc = (i.cls == CL_RTS || i.cls == CL_RTD) ? s_val_c :
-                      (i.cls == CL_RTR) ? d_val_c :
-                      (i.cls == CL_BCC || i.cls == CL_DBCC) ? i.next_pc : s_addr_c;
+wire        redir_now  = st.disp && st.dsel == 3'd0 && !flush &&
+                        (i.cls == CL_RTS || i.cls == CL_RTD || i.cls == CL_RTR ||
+                         ((i.cls == CL_JMP || i.cls == CL_JSR) && !eac_i.redirected) ||
+                         ((i.cls == CL_BCC || i.cls == CL_DBCC) && !br_taken));
+wire [31:0] redir_pc_now = (i.cls == CL_RTS || i.cls == CL_RTD) ? s_val_c :
+                           (i.cls == CL_RTR) ? d_val_c :
+                           (i.cls == CL_BCC || i.cls == CL_DBCC) ? i.next_pc : s_addr_c;
+
+// REDIR_REG (plan M11.1): hold the redirect one clock.  `rdz_v` is the GAP
+// clock: this stage does nothing in it (eac_v_use below is low, so stepf sees
+// no instruction and eaf_stall therefore holds EA-calc), the redirect goes out
+// from the register, and flush_eac kills the instruction EA-calc took in the
+// meantime -- which never reaches here.  An older redirect (EX or WB) wins and
+// clears the slot.
+always @(posedge clk) begin
+	if (!nreset) begin
+		rdz_v <= 1'b0; rdz_pc <= 32'd0;
+	end else if (ce) begin
+		if (flush)            rdz_v <= 1'b0;
+		else if (!rdz_v && redir_now) begin rdz_v <= 1'b1; rdz_pc <= redir_pc_now; end
+		else                  rdz_v <= 1'b0;
+	end
+end
+
+assign eaf_redir_v  = (REDIR_REG != 0) ? rdz_v  : redir_now;
+assign eaf_redir_pc = (REDIR_REG != 0) ? rdz_pc : redir_pc_now;
 
 //--------------------------------------------------------------- registers
 always @(posedge clk) begin
@@ -1417,7 +1453,7 @@ always @(posedge clk) begin
 				P_START: begin
 					if (rst_pending) begin
 						ph <= P_RESET; r_step <= 3'd0;
-					end else if (eac_valid && !(i.serialize && older_busy) && !irq_take) begin
+					end else if (eac_v_use && !(i.serialize && older_busy) && !irq_take) begin
 						if (!st.exc_go && i.cls == CL_STOP) begin
 							if (st.disp) ph <= P_STOP;
 						end else if (!st.exc_go && i.cls == CL_RSTO) begin
@@ -1577,7 +1613,7 @@ always @(posedge clk) begin
 				if (mms.tail) mm_tail <= 1'b1;
 			end
 			if (aerr_dbl || wf_dbl) ph <= P_HALT;
-			if (ph != P_RTE && eac_valid && cm_hit && (st.fin || st.exc_go || st0.mm_go)) cm_v <= 1'b0;
+			if (ph != P_RTE && eac_v_use && cm_hit && (st.fin || st.exc_go || st0.mm_go)) cm_v <= 1'b0;
 			if (st.fin) begin
 				ph <= P_START; bf_step <= 1'b0;
 				done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;

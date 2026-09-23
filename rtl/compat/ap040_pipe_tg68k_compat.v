@@ -23,6 +23,11 @@ module ap040_pipe_tg68k_compat
 #(
 	parameter AP040_HAS_MMU      = 1,
 	parameter AP040_HAS_FPU      = 1,
+	// plan M11.1: register EA-fetch's redirect.  Default 0 = as built for the
+	// gate image; 1 costs one clock on RTS/RTD/RTR, a memory-indirect JMP/JSR
+	// and a wrongly guessed Bcc/DBcc, and takes the memory acknowledge off the
+	// path that fans out into IF's prefetch queue.
+	parameter AP040_REDIR_REG    = 0,
 	parameter AP040_ENABLE_CACHE = 1,
 	parameter AP040_FAST_SIM     = 0,
 	// X3.3 A2b-1: stores to cacheable pages are acknowledged early and
@@ -250,7 +255,7 @@ ap040_pipe_core #(
 	.L1_AW(2),
 	.RESET_FROM_VECTORS(1),
 	.BUS(1),
-	.HAS_FPU(AP040_HAS_FPU),
+	.HAS_FPU(AP040_HAS_FPU), .REDIR_REG(AP040_REDIR_REG),
 	.IRQ(1),
 	.CINV(1)
 ) core (

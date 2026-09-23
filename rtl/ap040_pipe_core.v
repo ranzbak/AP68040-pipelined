@@ -37,6 +37,10 @@ module ap040_pipe_core
 	parameter         STORE_POST         = 0,
 	// 1: RTE treats format $4 as a format error (a full 68040; the FPU is M10)
 	parameter         HAS_FPU            = 0,
+	// plan M11.1: register EA-fetch's redirect (one clock on RTS/RTD/RTR, a
+	// memory-indirect JMP/JSR and a wrongly guessed Bcc/DBcc, in exchange for
+	// taking the memory acknowledge off the path into IF's prefetch queue)
+	parameter         REDIR_REG          = 0,
 	// 1: the interrupt inputs are live (the wrapper); 0: tied off (the L1
 	// benches leave ipl unconnected)
 	parameter         IRQ                = 0,
@@ -460,7 +464,7 @@ ap040_ea_calc u_eac
 
 
 
-ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HAS_FPU(HAS_FPU),
+ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HAS_FPU(HAS_FPU), .REDIR_REG(REDIR_REG),
                  .MM_TAIL(BUS ? 1 : 0)) u_eaf
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ex_stall), .flush(flush),
