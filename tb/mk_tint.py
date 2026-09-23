@@ -50,6 +50,19 @@ KEEP = {
     # (plan M9.T) exc_m9s plus the TRACE section: T1 on every instruction, T0
     # on changes of flow and the synchronisation list, and the traced STOP.
     # The "M bit throwaway" section joins this set when M9.T's last step lands.
+    # (plan M9.T step 3) ... and the M bit section, which needs the format $1
+    # throwaway frame and the master/interrupt stack switch.  NOT in the suite
+    # yet: with the throwaway built it runs its own three checks (42, 43, 44)
+    # and then stops at test 94, which needs a rule nothing has built -- an
+    # interrupt recognised WHILE another exception is being processed is
+    # stacked and vectored to before the original handler's first
+    # instruction.  irq_asm/t_mbit_pipe.s is the regression test until then.
+    "exc_m9t2": {"TRAP #0", "illegal / BKPT", "A/F-line", "CHK", "divide by zero", "TRAPV / TRAPcc",
+               "trace", "M bit throwaway",
+               "MOVEC matrix", "MOVE USP", "MOVES", "user mode round trip", "format error",
+               "address error", "physical bus error",
+               "immediate group: destination must be data alterable",
+               "interrupts", "level-sensitive IPL: the NetBSD ports shape"},
     "exc_m9t": {"TRAP #0", "illegal / BKPT", "A/F-line", "CHK", "divide by zero", "TRAPV / TRAPcc",
                "trace",
                "MOVEC matrix", "MOVE USP", "MOVES", "user mode round trip", "format error",
@@ -57,11 +70,21 @@ KEEP = {
                "immediate group: destination must be data alterable",
                "interrupts", "level-sensitive IPL: the NetBSD ports shape"},
 }[ms]
-DROP_BLOCKS = {"exc_m9t": [r"^\s*; FRESTORE must reject", r"^\s*; A full MC68040 does not recognize"], "m2": [r"^\s*; tas$"], "m3": [], "m4": [], "exc_m4": [], "exc_m6": [r"^\s*; FRESTORE must reject", r"^\s*; A full MC68040 does not recognize"], "exc_m9s": [r"^\s*; FRESTORE must reject", r"^\s*; A full MC68040 does not recognize"]}[ms]   # (FRESTORE and the format-$4 test depend on the FPU: M10)   # blocks (to the next blank line) inside kept sections
+DROP_BLOCKS = {"exc_m9t2": [r"^\s*; FRESTORE must reject", r"^\s*; A full MC68040 does not recognize"], "exc_m9t": [r"^\s*; FRESTORE must reject", r"^\s*; A full MC68040 does not recognize"], "m2": [r"^\s*; tas$"], "m3": [], "m4": [], "exc_m4": [], "exc_m6": [r"^\s*; FRESTORE must reject", r"^\s*; A full MC68040 does not recognize"], "exc_m9s": [r"^\s*; FRESTORE must reject", r"^\s*; A full MC68040 does not recognize"]}[ms]   # (FRESTORE and the format-$4 test depend on the FPU: M10)   # blocks (to the next blank line) inside kept sections
 out = lines[:idx[0]]                        # header: macros, vectors, org, start
 for title, a, b in secs:
     if title == "all done":
-        out += [lines[a], "\tmove.w\t#$600D,(DONEREG).l", "halt:", "\tbra.s\thalt", ""]
+        # the halt replaces the battery, but the tail of this block defines
+        # labels the kept sections branch to (mfail, used by the M bit
+        # section), so anything after the DONEREG write is carried over
+        tail = lines[a:b]
+        keep = []
+        for j, l in enumerate(tail):
+            if "(DONEREG)" in l:
+                keep = tail[j + 1:]
+                break
+        keep = [l for l in keep if not l.strip().startswith("stop\t")]
+        out += [lines[a], "\tmove.w\t#$600D,(DONEREG).l", "halt:", "\tbra.s\thalt", ""] + keep
         continue
     if title in ("helpers", "handlers", "wait loops"):
         out += lines[a:b]

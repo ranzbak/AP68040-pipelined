@@ -346,6 +346,8 @@ reg  [3:0] x_k;            // the frame longword being stored (0 .. size/4 - 1)
 reg [31:0] x7 [2:14];      // format $7 longwords 2-14 (frame bytes 8-59), set when the fault is taken
 integer    xk;
 reg [15:0] x_sr;           // SR stacked
+reg        x_pass2;        // (M9.T) building the format $1 throwaway frame
+reg [31:0] x_sp1;          // ... and the master stack's new value, from pass 1
 reg [31:0] x_sp;           // new SP (reset: the loaded ISP)
 reg  [4:0] x_bank;
 reg [31:0] x_target;
@@ -360,15 +362,20 @@ wire       s_bit    = sr_in[13];
 wire [4:0] bank_now = sr_in[12] ? R_MSP : R_ISP;   // supervisor stack the SR selects
 
 //--------------------------------------------------------------- operand reads
-function automatic logic [4:0] ra_a_f(input logic [3:0] p, input eac_t e, input logic [4:0] bank);
-	if (p == P_EXC || p == P_RTE) return bank;       // the supervisor stack pointer
+function automatic logic [4:0] ra_a_f(input logic [3:0] p, input eac_t e, input logic [4:0] bank,
+                                      input logic pass2);
+	// the supervisor stack pointer.  (M9.T) the throwaway pass reads the
+	// INTERRUPT stack instead: the SR still selects the master stack, which
+	// is where the normal frame just went.
+	if (p == P_EXC && pass2) return R_ISP;
+	if (p == P_EXC || p == P_RTE) return bank;
 	if (e.i.cls == CL_CAS2) return {2'b00, e.i.ext[2:0]};    // Dc1 (the source is (Rn1))
 	if (e.i.cls == CL_MOVEC && !e.i.imm[4])         // Rc -> Rn: an SP selector reads the physical SP
 		return (e.i.imm[3:0] == CR_USP) ? R_USP : (e.i.imm[3:0] == CR_ISP) ? R_ISP : R_MSP;
 	return e.src_r;
 endfunction
 
-assign ra_a = ra_a_f(ph, eac_i, bank_now);
+assign ra_a = ra_a_f(ph, eac_i, bank_now, x_pass2);
 assign ra_b = (eac_i.i.cls == CL_CAS2) ? {2'b00, eac_i.i.ext2[2:0]} : eac_i.dst_r;   // CAS2: Dc2
 
 function automatic logic [31:0] fwd(input logic [4:0] r, input logic [31:0] rf,
@@ -885,15 +892,25 @@ endfunction
 // the exception-entry final micro-op
 function automatic ex_t exc_final(input id_t i, input logic [4:0] bank, input logic [31:0] sp,
                                   input logic [15:0] sr, input logic [31:0] target,
-                                  input logic irq, input logic [2:0] lvl);
+                                  input logic irq, input logic [2:0] lvl,
+                                  input logic mclr, input logic [31:0] msp2);
 	ex_t x;
 	x = base_uop(i);
 	x.cls = CL_EXC;
 	x.exc = 1'b1;
 	x.sp_v = 1'b1; x.sp_r = bank; x.sp_val = sp;
-	// S set, T1/T0 cleared, M kept (M68040UM 8.1, p. 8-4); an interrupt
-	// also sets the mask to its level (8.1.4)
-	x.sr_v = 1'b1; x.sr_val = {2'b00, 1'b1, sr[12:11], irq ? lvl : sr[10:8], sr[7:0]} & `AP040_SR_MASK;
+	// (M9.T) the throwaway pass also hands the MASTER stack back its own
+	// new value: the normal frame went there, and this micro-op's `sp_r` is
+	// the INTERRUPT stack the $1 frame went on.  Two stack pointers move, so
+	// the second one rides on the micro-op's spare address-register write --
+	// which must be u1, NOT u0: EX maps a sequenced `sp_v` onto u0
+	// (ap040_execute.v, "a sequenced stack-pointer write goes out on the u0
+	// port"), so a second write placed there is silently overwritten.
+	if (mclr) begin x.u1_v = 1'b1; x.u1_r = R_MSP; x.u1_val = msp2; end
+	// S set, T1/T0 cleared, M kept (M68040UM 8.1, p. 8-4) -- except for an
+	// interrupt taken with M SET, which clears it (8.2.9: the throwaway
+	// frame); an interrupt also sets the mask to its level (8.1.4)
+	x.sr_v = 1'b1; x.sr_val = {2'b00, 1'b1, mclr ? 1'b0 : sr[12], sr[11], irq ? lvl : sr[10:8], sr[7:0]} & `AP040_SR_MASK;
 	x.irq = irq;    // (the core acknowledges the interrupt when this commits)
 	x.target = target;
 	x.redirect = !target[0];
@@ -1964,7 +1981,7 @@ endfunction
 
 wire ex_t disp_x0 = dmux(st.dsel, x_ord,
                         exc_uop(i, x_k, x_sp, x_sr, x_pc, x_fmt, x_vec, x_addr, x7[(x_k < 4'd2) ? 4'd2 : x_k]),
-                        exc_final(i, x_bank, x_sp, x_sr, x_target, x_irq, x_lvl),
+                        exc_final(i, x_bank, x_sp, x_sr, x_target, x_irq, x_lvl, x_pass2, x_sp1),
                         rte_final(i, bank_now, rd_a, r_fv, r_sr, r_pc),
                         ((HAS_FPU != 0) && (ph == P_FPU)) ? fp_w :
                         (ph == P_PMMU || ph == P_CINV) ? pm_x : reset_final(i, x_sp, r_pc),
@@ -2059,6 +2076,7 @@ always @(posedge clk) begin
 		s_addr <= 32'd0; d_addr <= 32'd0; s_val <= 32'd0; d_val <= 32'd0;
 		x_vec <= 8'd0; x_fmt <= 4'd0; x_pc <= 32'd0; x_addr <= 32'd0; x_step <= 3'd0; x_k <= 4'd0;
 		x_sr <= 16'd0; x_sp <= 32'd0; x_bank <= R_ISP; x_target <= 32'd0;
+		x_pass2 <= 1'b0; x_sp1 <= 32'd0;
 		bf_step <= 1'b0;
 		pt_req <= 1'b0; pt_write <= 1'b0; pt_addr <= 32'd0; pf_req <= 1'b0; pf_mode <= 2'd0; pf_addr <= 32'd0;
 		pm_sent <= 1'b0; pm_got <= 1'b0; pm_mmusr <= 32'd0;
@@ -2248,7 +2266,31 @@ always @(posedge clk) begin
 				P_EXC: begin
 					if (x_step == 3'd0 && st.disp) begin
 						x_k <= x_k + 4'd1;
-						if ({28'd0, x_k} == (fsize(x_fmt) >> 2) - 32'd1) x_step <= 3'd3;
+						if ({28'd0, x_k} == (fsize(x_fmt) >> 2) - 32'd1) begin
+							// (M9.T) an INTERRUPT taken with M set stacks TWO
+							// frames (M68040UM 8.2.9, 8.4.2): the normal one on
+							// the MASTER stack, which has just gone out, and
+							// then a four-word format $1 THROWAWAY on the
+							// INTERRUPT stack.  The throwaway's SR image keeps
+							// M set with only S forced, so that the RTE which
+							// pops it switches back to the master stack where
+							// the real frame lives.  M itself is cleared by the
+							// final micro-op.
+							if (x_irq && x_sr[12] && !x_pass2) begin
+								x_pass2 <= 1'b1;
+								x_sp1   <= x_sp;
+								x_fmt   <= 4'd1;
+								x_sr    <= x_sr | 16'h2000;
+								x_bank  <= R_ISP;
+								x_k     <= 4'd0;
+								x_step  <= 3'd6;   // one clock to read the ISP
+							end
+							else x_step <= 3'd3;
+						end
+					end
+					if (x_step == 3'd6) begin
+						x_sp   <= rd_a - 32'd8;   // ra_a reads the ISP in pass 2
+						x_step <= 3'd0;
 					end
 					if (x_step == 3'd4 && st.disp && x_target[0]) begin
 						// odd handler address: an address error on top (reference
@@ -2261,7 +2303,9 @@ always @(posedge clk) begin
 							x_step <= 3'd5;           // wait for the commit, then restart
 						end
 					end
+					if (x_step == 3'd4 && st.disp && !x_target[0]) x_pass2 <= 1'b0;
 					if (x_step == 3'd5 && !older_busy) begin
+						x_pass2 <= 1'b0;
 						x_sr   <= sr_in;
 						x_bank <= bank_now;
 						x_sp   <= rd_a - fsize(x_fmt);  // ra_a = bank_now in P_EXC
