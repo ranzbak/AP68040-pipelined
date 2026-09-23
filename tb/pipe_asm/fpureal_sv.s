@@ -23,7 +23,7 @@
 ;      not sequence -- takes vector 14, checked as deltas.
 ;
 ; diff: --cycles 120000
-v_flin	equ	unexp
+v_flin	equ	h_unimp
 v_fpun	equ	unexp
 v_ill	equ	unexp
 v_adr	equ	unexp
@@ -36,6 +36,8 @@ v_trp0	equ	unexp
 	org	$400
 start:
 	clr.l	$7000			; format errors taken
+	clr.l	$700C			; unimplemented instructions taken
+	clr.l	$7014			; mismatches in the frame round trip
 	clr.l	$7004			; format/vector delta
 	clr.l	$7008			; own-PC delta
 	movea.l	#$5100,a1		; where the frames are written
@@ -67,16 +69,62 @@ start:
 	dc.w	$F35F			; FRESTORE (A7)+
 	move.l	sp,d5			; back again
 
-;------------------------------------- 6: a frame this core cannot install
-	movea.l	#c6e,a6
-	movea.l	#c6,a5
-c6:	dc.w	$F358			; FRESTORE (A0)+      -- $41300000
-c6e:
+;------------------------------------- 6: the $4130 frame IS installable now
+; (M10.7): FRESTORE accepts it and A0 steps by the whole 52 bytes, not 4.
+	dc.w	$F358			; FRESTORE (A0)+      -- $41300000
+
+;------------------------------------- 7: a frame this core still cannot
+; install -- the $4160 BUSY frame, which needs the deferred-exception path
+	movea.l	#c7e,a6
+	movea.l	#c7,a5
+c7:	dc.w	$F358			; FRESTORE (A0)+      -- $41600000
+c7e:
+
+;------------------------------------- 8: the round trip that matters.  An
+; unimplemented instruction leaves a state in the unit; FSAVE must EXTRACT it
+; as the thirteen-longword $4130 frame, FRESTORE must put it back, and a
+; second FSAVE must then produce the same thirteen longwords.  The comparison
+; is done by the program, so the expect file needs to know nothing about the
+; payload's meaning -- only that saving, restoring and saving again is an
+; identity.
+	movea.l	#$5400,a2		; the first frame
+	movea.l	#$5440,a3		; the second
+	dc.w	$F23C,$4000,$0000,$0001	; FMOVE.L #1,FP0
+	dc.w	$F200,$000E		; FSIN.X FP0 -- not in hardware: unimp
+	dc.w	$F312			; FSAVE    (A2)
+	dc.w	$F352			; FRESTORE (A2)
+	dc.w	$F313			; FSAVE    (A3)
+	; 9: the state was EXTRACTED, not copied -- a third FSAVE with no
+	; FRESTORE in between finds nothing to save and writes the IDLE frame
+	movea.l	#$5480,a4
+	dc.w	$F314			; FSAVE    (A4)
+	movea.l	#$5400,a2
+	movea.l	#$5440,a3
+	moveq	#12,d6
+cmpf:	move.l	(a2)+,d2
+	cmp.l	(a3)+,d2
+	beq.s	cmpf1
+	addq.l	#1,$7014
+cmpf1:	dbra	d6,cmpf
+
+;------------------------------------- 10: FMOVECR has NO effective address at
+; all, and the 68040 reports it as an unimplemented instruction so the FPSP
+; can supply the constant (lib/AP68040 S_FPU_DEC's 3'b010 arm, and t_fpu.s
+; test 44).  It must reach the unit rather than be faked in the decoder,
+; because the unit also captures the state frame a following FSAVE extracts.
+	dc.w	$F200,$5C80		; FMOVECR #$00,FP1
 halt:
 	bra.s	halt
 
 ;--------------------------------------------------------------- handler
 ; a5 = the faulting instruction's own PC, a6 = where to resume.
+h_unimp:
+	addq.l	#1,$700C
+	move.w	6(sp),d2
+	move.l	d2,$7018		; the frame word of the LAST unimp
+	move.l	2(sp),$701C		; ... and its stacked PC
+	rte
+
 h_fmt:
 	addq.l	#1,$7000
 	moveq	#0,d2
@@ -97,3 +145,5 @@ unexp:
 	dc.l	$00000000		; NULL
 	dc.l	$41000000		; IDLE
 	dc.l	$41300000		; the 52-byte unimplemented-state frame
+	dcb.l	12,0			; ... and its payload
+	dc.l	$41600000		; the BUSY frame, which is still refused

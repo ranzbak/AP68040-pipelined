@@ -162,6 +162,29 @@ module ap040_ea_fetch
 	input             fp_used,
 	output            fp_frst,          // FRESTORE of a NULL frame: reset the FPU
 	output            fp_fridle,        // ... of an IDLE frame
+	// (M10.7) the $4130 unimplemented-state frame: thirteen longwords out of
+	// the unit's fstate_* on FSAVE, and back into its frestore_* on FRESTORE.
+	input             fp_st_unimp,      // the unit is holding a state to save
+	input      [15:0] fp_st_cmd1,
+	input      [15:0] fp_st_cmd3,
+	input       [2:0] fp_st_stag,
+	input       [2:0] fp_st_dtag,
+	input       [2:0] fp_st_flags,
+	input       [2:0] fp_st_grs,
+	input             fp_st_wbte15,
+	input      [95:0] fp_st_fpt,
+	input      [95:0] fp_st_et,
+	output            fp_fsave_ack,     // the state has been extracted
+	output            fp_fr_unimp,      // ... and this one installs a frame
+	output     [15:0] fp_fr_cmd1,
+	output     [15:0] fp_fr_cmd3,
+	output      [2:0] fp_fr_stag,
+	output      [2:0] fp_fr_dtag,
+	output      [2:0] fp_fr_flags,
+	output      [2:0] fp_fr_grs,
+	output            fp_fr_wbte15,
+	output     [95:0] fp_fr_fpt,
+	output     [95:0] fp_fr_et,
 	input             fp_done,
 	input             fp_accepted,
 	input             fp_unimp,
@@ -294,6 +317,17 @@ reg [95:0] fp_mwd;
 reg        fp_rstp;
 reg        fp_idlp;
 reg        fp_fmte;
+// (M10.7) the state frame: a thirteen-longword sequence with its own index,
+// the fields latched on the way in, and the two pulses that hand the frame to
+// the unit or take it away.
+reg  [3:0] fp_fn;
+reg        fp_frm;         // this FSAVE/FRESTORE is a $4130 frame, not NULL/IDLE
+reg        fp_svack;
+reg        fp_frup;
+reg [15:0] fr_cmd1, fr_cmd3;
+reg  [2:0] fr_stag, fr_dtag, fr_flags, fr_grs;
+reg        fr_wbte15;
+reg [95:0] fr_fpt, fr_et;
 reg        fp_cw;          // a control-register write goes out this clock
 reg  [1:0] fp_csel;        // ... to this register: captured with the data, so
                            //     the beat index may advance on the same edge
@@ -1367,6 +1401,41 @@ assign fp_fridle   = fp_idlp;
 // FSAVE writes ONE longword: the IDLE frame when the unit has been used, the
 // NULL frame when it has not (lib/AP68040 S_FSAVE1's `fpu_used ? ... : ...`).
 wire [31:0] fp_svw = fp_used ? 32'h4100_0000 : 32'h0000_0000;
+assign fp_fsave_ack = fp_svack;
+assign fp_fr_unimp  = fp_frup;
+assign fp_fr_cmd1   = fr_cmd1;
+assign fp_fr_cmd3   = fr_cmd3;
+assign fp_fr_stag   = fr_stag;
+assign fp_fr_dtag   = fr_dtag;
+assign fp_fr_flags  = fr_flags;
+assign fp_fr_grs    = fr_grs;
+assign fp_fr_wbte15 = fr_wbte15;
+assign fp_fr_fpt    = fr_fpt;
+assign fp_fr_et     = fr_et;
+// the thirteen longwords of the $4130 frame, laid out as lib/AP68040's
+// fsave_unimp_word does -- the same order the FPSP reads them in
+function automatic logic [31:0] fp_frame_w(input logic [3:0] n);
+	case (n)
+		4'd0:  return 32'h4130_0000;
+		4'd1:  return {fp_st_cmd3, 16'd0};
+		4'd2:  return 32'd0;
+		4'd3:  return {fp_st_stag, 3'd0, fp_st_grs, 23'd0};
+		4'd4:  return {fp_st_cmd1, 16'd0};
+		4'd5:  return {fp_st_dtag, 8'd0, fp_st_wbte15, 20'd0};
+		4'd6:  return {5'd0, fp_st_flags[2], fp_st_flags[1], 4'd0, fp_st_flags[0], 20'd0};
+		4'd7:  return fp_st_fpt[95:64];
+		4'd8:  return fp_st_fpt[63:32];
+		4'd9:  return fp_st_fpt[31:0];
+		4'd10: return fp_st_et[95:64];
+		4'd11: return fp_st_et[63:32];
+		default: return fp_st_et[31:0];
+	endcase
+endfunction
+// a frame beat's address, and the value An takes when the instruction ends:
+// FSAVE's base was already walked back by 48 at entry, FRESTORE's An steps by
+// the whole 52 bytes
+wire [31:0] fp_fadr = fp_addr + {26'd0, fp_fn, 2'b00};
+wire [31:0] fp_anv  = fp_sv ? fp_addr : (fp_addr + 32'd52);
 assign fp_fm_we    = fp_mw;
 assign fp_fm_wdata = fp_mwd;
 // the longword of the selected register this beat carries, reversed when the
@@ -1392,9 +1461,11 @@ wire [31:0] fp_rv  = fp_cr             ? fp_cr_rdata :
 wire  [4:0] fp_nb    = i.imm[4:0];
 wire  [1:0] fp_beats = (fp_nb <= 5'd4) ? 2'd1 : (fp_nb == 5'd8) ? 2'd2 : 2'd3;
 wire  [1:0] fp_bsz   = (fp_mvm || fp_sv || fp_rs) ? SZ_L : (fp_nb == 5'd1) ? SZ_B : (fp_nb == 5'd2) ? SZ_W : SZ_L;
-wire [31:0] fp_baddr = (fp_mvm || fp_sv || fp_rs) ? fp_addr :
+wire [31:0] fp_baddr = fp_frm ? fp_fadr :
+                       (fp_mvm || fp_sv || fp_rs) ? fp_addr :
                        (fp_nb <= 5'd2) ? fp_addr : (fp_addr + {28'd0, fp_k, 2'b00});
-wire [31:0] fp_bdata = fp_sv           ? fp_svw :
+wire [31:0] fp_bdata = (fp_sv && fp_frm) ? fp_frame_w(fp_fn) :
+                       fp_sv           ? fp_svw :
                        fp_mvm          ? fp_mvwv :
                        fp_cr           ? fp_cr_rdata :
                        (fp_nb == 5'd1) ? {24'd0, fp_buf[95:88]} :
@@ -1427,6 +1498,29 @@ function automatic ex_t fp_upd_uop(input ex_t x0, input logic last);
 	y.wr_ccr = 1'b0; y.cls = CL_NOP; y.last = last;
 	return y;
 endfunction
+// (M10.7) AN EXPLICIT ADDRESS-REGISTER UPDATE VALUE FROM EA-FETCH.  Worth
+// reading even if you are not here for FSAVE: every `(An)+` / `-(An)` step in
+// this core is computed by EA-calc from a byte count the DECODER knew -- the
+// operand's size (M10.1), four per control register (M10.2), twelve per
+// floating-point register (M10.4) -- and that works because the length of all
+// of those is a property of the encoding.  A state FRAME is the first thing
+// whose length is not: it depends on what the unit is holding when the
+// instruction runs, so decode cannot size it and EA-calc cannot step by it.
+// This is the way out, and it is the general one: the micro-op already
+// carries u0_v/u0_r/u0_val (source update) and u1_v/u1_r/u1_val (destination
+// update) for address-register writes, so EA-fetch overrides the VALUE and
+// leaves the register selection where it was.  Anything else with a
+// run-time-sized step -- the $4160 BUSY frame, a future MOVEM variant -- uses
+// the same hook rather than inventing another.
+function automatic ex_t an_ov(input ex_t x0, input logic ov, input logic [31:0] v);
+	ex_t y;
+	y = x0;
+	if (ov) begin
+		if (y.u0_v) y.u0_val = v;
+		if (y.u1_v) y.u1_val = v;
+	end
+	return y;
+endfunction
 // one beat of a memory store, or the trailing update micro-op
 function automatic ex_t fp_st_uop(input ex_t x0, input logic beat, input logic [31:0] a,
                                   input logic [31:0] d, input logic [1:0] sz);
@@ -1438,11 +1532,12 @@ function automatic ex_t fp_st_uop(input ex_t x0, input logic beat, input logic [
 	end
 	return y;
 endfunction
-wire ex_t fp_w = (fp_stt == FS_WR) ? fp_st_uop(x_ord,
+wire ex_t fp_w = (fp_stt == FS_WR) ? an_ov(fp_st_uop(x_ord,
                                               (fp_mvm || fp_sv) ? !(fp_crd && fp_k == 2'd3)
                                                                 : (fp_k != fp_beats),
-                                              fp_baddr, fp_bdata, fp_bsz)
-                                   : fp_x;
+                                              fp_baddr, fp_bdata, fp_bsz),
+                                          fp_frm, fp_anv)
+                                   : an_ov(fp_x, fp_frm, fp_anv);
 // The unimplemented-instruction and unsupported-data-type faults, with the
 // frames lib/AP68040's go_fp_unimp / go_fp_unsupp use -- both validated on
 // the v24 cputest corpus (PLAN.md D19):
@@ -1764,6 +1859,9 @@ always @(posedge clk) begin
 		fp_ae <= 1'b0; fp_avec <= 8'd0; fp_pend <= 1'b0; fp_pvec <= 8'd0;
 		fp_list <= 8'd0; fp_fsel <= 3'd0; fp_mw <= 1'b0; fp_mwd <= 96'd0; fp_mwsel <= 3'd0;
 		fp_rstp <= 1'b0; fp_idlp <= 1'b0; fp_fmte <= 1'b0;
+		fp_fn <= 4'd0; fp_frm <= 1'b0; fp_svack <= 1'b0; fp_frup <= 1'b0;
+		fr_cmd1 <= 16'd0; fr_cmd3 <= 16'd0; fr_stag <= 3'd0; fr_dtag <= 3'd0;
+		fr_flags <= 3'd0; fr_grs <= 3'd0; fr_wbte15 <= 1'b0; fr_fpt <= 96'd0; fr_et <= 96'd0;
 		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
 		irq_take <= 1'b0; irq_take_lvl <= 3'd0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
@@ -1861,7 +1959,7 @@ always @(posedge clk) begin
 								// and a store into Dn or An is finished before it
 								// starts -- cr_rdata reads combinationally.
 								fp_crd <= fp_cr_st && !fp_mem_dst;
-								fp_fmte <= 1'b0;
+								fp_fmte <= 1'b0; fp_frm <= 1'b0; fp_svack <= 1'b0; fp_frup <= 1'b0;
 								fp_mw <= 1'b0;
 								// (M10.4) FMOVEM walks a register list, twelve bytes
 								// each: the list is consumed as it goes and the first
@@ -1874,7 +1972,17 @@ always @(posedge clk) begin
 								// no operand beats, no register list
 								if (fp_pend) ;
 								// (M10.5) FSAVE writes one longword, FRESTORE reads one
-								else if (fp_sv) fp_stt <= FS_WR;
+								else if (fp_sv) begin
+									fp_stt <= FS_WR;
+									// (M10.7) the unit is holding a state: this FSAVE is the
+									// thirteen-longword $4130 frame, not the one-longword
+									// NULL/IDLE one, and a -(An) FSAVE must walk its base back
+									// by the REST of the frame -- EA-calc only knew about four.
+									if (fp_st_unimp) begin
+										fp_frm <= 1'b1; fp_fn <= 4'd0;
+										if (i.dst.upd == UPD_PRE) fp_addr <= d_addr_c - 32'd48;
+									end
+								end
 								else if (fp_rs) fp_stt <= FS_RD;
 								else if (fp_mvm) fp_stt <= fp_mvst ? FS_WR : FS_RD;
 								else if (fp_cr) begin
@@ -1984,11 +2092,40 @@ always @(posedge clk) begin
 						fp_cw <= 1'b0;
 						// (M10.5) FSAVE: one store beat, then the trailing update
 						// micro-op; FRESTORE: one read, then the frame decides.
-						fp_rstp <= 1'b0; fp_idlp <= 1'b0;
-						if (fp_sv && fp_stt == FS_WR && st.disp && !fp_crd) begin
+						fp_rstp <= 1'b0; fp_idlp <= 1'b0; fp_svack <= 1'b0; fp_frup <= 1'b0;
+						// (M10.7) the $4130 frame: thirteen longwords out, or twelve more
+						// in after the header said $41300000.
+						if (fp_sv && fp_frm && fp_stt == FS_WR && st.disp && !fp_crd) begin
+							if (fp_fn == 4'd12) begin
+								fp_crd <= 1'b1; fp_k <= 2'd3;
+								// the unit keeps the state until the whole frame is out
+								fp_svack <= 1'b1;
+							end
+							else fp_fn <= fp_fn + 4'd1;
+						end
+						else if (fp_sv && fp_stt == FS_WR && st.disp && !fp_crd) begin
 							fp_crd <= 1'b1; fp_k <= 2'd3;
 						end
-						if (fp_rs && fp_stt == FS_RD && cap && rd_tag == T_SLD && !fp_crd) begin
+						if (fp_rs && fp_frm && fp_stt == FS_RD && cap && rd_tag == T_SLD && !fp_crd) begin
+							// the payload, in lib/AP68040 S_FREST_U's order
+							case (fp_fn)
+								4'd1:  fr_cmd3 <= rd_data[31:16];
+								4'd3:  begin fr_stag <= rd_data[31:29]; fr_grs <= rd_data[25:23]; end
+								4'd4:  fr_cmd1 <= rd_data[31:16];
+								4'd5:  begin fr_dtag <= rd_data[31:29]; fr_wbte15 <= rd_data[20]; end
+								4'd6:  fr_flags <= {rd_data[26], rd_data[25], rd_data[20]};
+								4'd7:  fr_fpt[95:64] <= rd_data;
+								4'd8:  fr_fpt[63:32] <= rd_data;
+								4'd9:  fr_fpt[31:0]  <= rd_data;
+								4'd10: fr_et[95:64] <= rd_data;
+								4'd11: fr_et[63:32] <= rd_data;
+								4'd12: fr_et[31:0]  <= rd_data;
+								default: ;                       // 2: the reserved longword
+							endcase
+							if (fp_fn == 4'd12) begin fp_crd <= 1'b1; fp_frup <= 1'b1; end
+							else fp_fn <= fp_fn + 4'd1;
+						end
+						else if (fp_rs && fp_stt == FS_RD && cap && rd_tag == T_SLD && !fp_crd) begin
 							fp_crd <= 1'b1;
 							// version byte 0 is the NULL frame, $41000000 the IDLE
 							// frame; the $4130 / $4160 payloads are not sequenced
@@ -1996,6 +2133,11 @@ always @(posedge clk) begin
 							// accepted with a state this core cannot install.
 							if (rd_data[31:24] == 8'd0)          fp_rstp <= 1'b1;
 							else if (rd_data == 32'h4100_0000)   fp_idlp <= 1'b1;
+							else if (rd_data == 32'h4130_0000) begin
+								// (M10.7) the unimplemented-state frame: twelve more
+								// longwords follow, and the instruction is not finished
+								fp_crd <= 1'b0; fp_frm <= 1'b1; fp_fn <= 4'd1;
+							end
 							else                                 fp_fmte <= 1'b1;
 						end
 						// (M10.4) FMOVEM: three longwords per register, the list

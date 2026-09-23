@@ -1,4 +1,4 @@
-halt 00000452
+halt 000004a8
 # plan M10.5, the NULL and IDLE state frames.
 # 1: FSAVE before any floating-point instruction -- the NULL frame.  This is
 # the longword Kickstart's probe at $F80DA4 reads to decide whether there is
@@ -16,12 +16,46 @@ a1 00005110
 d3 00001f00
 d4 00001efc
 d5 00001f00
-# 6: one format error, vector 14 with format $0 and the instruction's own PC,
-# for a $41300000 frame this core does not sequence.  A0 is left where it was:
-# the (An)+ update rides a dispatch that never happened, which is this core's
+# 6, 7: the $4130 frame is INSTALLED now (M10.7) and A0 steps by the whole 52
+# bytes; the $4160 BUSY frame is still refused, so exactly ONE format error is
+# taken -- and the deltas say it was vector 14, format $0, the own PC.  A0 ends
+# at $5008 + 52 for the accepted frame and does not move for the refused one:
+# its (An)+ update rides a dispatch that never happens, which is this core's
 # restart model and is recorded in PLAN.md M10.5 rather than claimed as the
-# 68040's (the manual does not say, and the frame size is variable anyway)
+# 68040's
 m32 00007000 00000001
 m32 00007004 00000000
 m32 00007008 00000000
-a0 00005008
+a0 0000503c
+# 8: one unimplemented instruction (the FSIN), and the frame round trip is an
+# identity -- thirteen longwords saved, restored and saved again with no
+# mismatch.  The program does the comparison, so nothing here depends on what
+# the payload MEANS.
+m32 0000700c 00000002
+# 10: FMOVECR reaches the unit and comes back as UNIMPLEMENTED -- vector 11
+# with format $2 and the NEXT instruction's PC, the FPSP shape of D19, not
+# M10.0's format $4.  The handler records the last one's frame word and PC.
+m32 00007018 0000202c
+m32 0000701c 000004a8
+m32 00007014 00000000
+# the whole frame, as lib/AP68040's fsave_unimp_word lays it out.  The values
+# are predictable from the rule: cmd1 at index 4 is the FSIN's own extension
+# word ($000E), cmd3 at index 1 is $0026, index 2 is the reserved longword,
+# and fpt (7-9) and et (10-12) are the destination register's and the source
+# operand's images -- both 1.0 here, because FSIN.X FP0 was given 1.0.
+m32 00005400 41300000
+m32 00005404 00260000
+m32 00005408 00000000
+m32 0000540c 00000000
+m32 00005410 000e0000
+m32 00005414 00000000
+m32 00005418 00000000
+m32 0000541c 3fff0000
+m32 00005420 80000000
+m32 00005424 00000000
+m32 00005428 3fff0000
+m32 0000542c 80000000
+m32 00005430 00000000
+# 9: and it was EXTRACTED, not copied -- a third FSAVE with no FRESTORE in
+# between has nothing to save and writes IDLE
+m32 00005480 41000000

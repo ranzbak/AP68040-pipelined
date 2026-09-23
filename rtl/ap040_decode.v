@@ -1240,7 +1240,14 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					end else if (x1[15:13] == 3'b010 &&
 					             ((d.src.kind == EK_DREG && fp_ireg) ||
 					              (d.src.kind == EK_MEM && d.src.mi == MI_NONE) ||
-					              d.src.kind == EK_IMM)) begin
+					              d.src.kind == EK_IMM ||
+					              x1[12:10] == 3'b111)) begin
+						// (M10.7) specifier 111 is FMOVECR, which has no
+						// effective address at all.  It goes to the unit rather
+						// than being faked here, because the unit answers
+						// `unimp` AND captures the state frame a following
+						// FSAVE must extract -- which is exactly what
+						// `t_fpu.s` test 44 checks.
 						d.cls = CL_FPU;
 					end else if (x1[15:13] == 3'b011 &&
 					             ((d.src.kind == EK_DREG && fp_ireg) ||
