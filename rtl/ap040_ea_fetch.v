@@ -1785,6 +1785,58 @@ function automatic stp_t irq_st(input stp_t s, input logic go, input logic [2:0]
 		return t;
 	end
 endfunction
+//--------------------------------------------------------------- trace (M9.T)
+// T1 traces EVERY instruction (M68040UM 8.2.6, p. 8-10).  The trace is a
+// POST-instruction exception: the instruction completes and the trace is
+// taken in front of the NEXT one -- vector 9, format $2, the stacked PC =
+// the next instruction and the format-$2 address field = the PC of the
+// instruction that was traced (the reference's fetch_next does exactly this:
+// `exc(VEC_TRACE, 4'd2, pc, pc_i)`).
+//
+// The T bits are sampled at the START of an instruction, so the MOVE to SR
+// that SETS T1 is not itself traced and the one that CLEARS it is.  That
+// falls out of the pipeline here rather than needing a register of its own:
+// an instruction's own SR write commits at ITS writeback, which is after it
+// has left EA-fetch, and `sr_in` is the write-through of that commit -- so
+// `sr_in` while the instruction is still here IS its starting SR, and arming
+// at `st.fin` reads exactly the value the rule asks for.  Nothing else can
+// move it underneath: every SR writer redirects, so no younger instruction
+// is in flight beside it.
+//
+// It is delivered the way M9's interrupt is -- a REGISTER that overrides the
+// dispatch, never a term in stepf's chain, which is the core's longest
+// combinational path and where build m9s measured ~0.9 ns for one term.
+// `hold` is the registered "a trace is due" and it stops the NEXT instruction
+// at the boundary, which a trace -- unlike an interrupt -- REQUIRES: an
+// interrupt may be taken at any later boundary, so M9 lets the instruction go
+// and takes it in front of the following one, but a trace belongs to exactly
+// one boundary.  Without the hold the arm is simply overwritten by the next
+// instruction's, and four traced instructions produce one trace.  It is an AND
+// with a flip-flop, the shape m9s's fix settled on, not a term in the chain.
+function automatic stp_t tr_st(input stp_t s, input logic [3:0] ph, input logic hold,
+                               input logic go,
+                               input logic [31:0] npc, input logic [31:0] tpc);
+	stp_t t;
+	begin
+		t = s;
+		if (hold && ph == P_START) begin
+			t.disp = 1'b0; t.fin = 1'b0; t.mm_go = 1'b0; t.issue = 1'b0;
+		end
+		if (go) begin
+			t.disp = 1'b0; t.fin = 1'b0; t.mm_go = 1'b0;
+			t.exc_go = 1'b1; t.irq = 1'b0;
+			t.ev = 8'd9; t.ef = 4'd2; t.epc = npc; t.eaddr = tpc;
+		end
+		return t;
+	end
+endfunction
+reg         tr_take;      // a trace is due in front of the next instruction
+reg  [31:0] tr_pc;        // the traced instruction's PC (the $2 address field)
+// `!older_busy` is the interrupt's rule for the same reason: the traced
+// instruction's writeback must have committed before the frame's SR is
+// latched.  An interrupt at the same boundary WINS (irq_st sits outside this
+// one); what the 68040 then does with the displaced trace -- deliver it at
+// the interrupt handler's first instruction -- is the next step of M9.T.
 // irq_hold is the REGISTERED "a request is pending and may be taken in front
 // of whatever is at the boundary": while it is set no instruction is
 // dispatched at P_START and no read is issued, so the entry cannot race the
@@ -1796,7 +1848,10 @@ reg  [2:0] irq_take_lvl;
 wire [31:0] irq_take_pc = (ph == P_STOP) ? i.next_pc : i.pc;
 wire irq_go = irq_take && eac_v_use && !rst_pending && !older_busy &&
               ((ph == P_START) || (ph == P_STOP));
-wire stp_t st = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in),
+wire tr_go = tr_take && eac_v_use && !rst_pending && !older_busy &&
+             !irq_go && (ph == P_START);
+
+wire stp_t st_i = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in),
                                      (HAS_FPU != 0) && (ph == P_FPU), stall_in, fp_live, fp_unimp, fp_unsupp,
                                      i.next_pc, fp_ea_v ? fp_addr : i.pc, fp_ea_v ? fp_addr : 32'd0,
                                      (fp_stt == FS_RD) && !rd_pend && !((fp_cr || fp_mvm || fp_rs) && fp_crd) && !fp_mw,
@@ -1810,6 +1865,10 @@ wire stp_t st = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm
                                      (HAS_FPU != 0) && fp_bsun_go && (ph == P_FPU) && !fp_crd,
                                      (HAS_FPU != 0) && fp_trapcc && fp_ctk && !fp_bsun_go),
                                irq_go, irq_take_lvl, irq_take_pc), aerr_go, i, rd_a_q);
+// the trace sits INSIDE the interrupt override, so a simultaneous interrupt
+// wins the boundary (M68040UM 8.3; the reference's fetch_next samples the
+// interrupt first and converts the trace to a pending one)
+wire stp_t st = tr_st(st_i, ph, tr_take, tr_go, i.pc, tr_pc);
 
 //--------------------------------------------------------------- PFLUSH / PTEST
 // M68040UM 3.7 (MMU instructions): privileged; they wait for everything
@@ -1910,7 +1969,7 @@ assign rd_fc     = (st.issue && (ph == P_START || ph == P_OPS) && i.fcsel == 2'd
                    (ph == P_EXC || ph == P_RTE || ph == P_RESET) ? 3'd5 : fc_data;
 wire   use_early = early_v && early.v && !st.issue && (!rd_pend || rd_ack) &&
                    (st.fin || !eac_v_use) && !rst_pending;
-assign rd_req    = (st.issue || use_early) && !flush && !irq_take;   // (registered: out of stepf)
+assign rd_req    = (st.issue || use_early) && !flush && !irq_take && !tr_take;   // (registered: out of stepf)
 assign rd_addr   = st.issue ? st.ia  : early.a;
 assign rd_size   = st.issue ? st.isz : early.sz;
 wire [2:0] rd_t  = st.issue ? st.it  : early.t;
@@ -1986,6 +2045,7 @@ always @(posedge clk) begin
 		fr_flags <= 3'd0; fr_grs <= 3'd0; fr_wbte15 <= 1'b0; fr_fpt <= 96'd0; fr_et <= 96'd0;
 		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
 		irq_take <= 1'b0; irq_take_lvl <= 3'd0;
+		tr_take <= 1'b0; tr_pc <= 32'd0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
 		cm_v <= 1'b0; cm_ea <= 32'd0; cm_pc <= 32'd0; r_ea <= 32'd0; r_ssw <= 16'd0;
 		mm_mask <= 16'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0; mm_tail <= 1'b0;
@@ -2053,7 +2113,7 @@ always @(posedge clk) begin
 				P_START: begin
 					if (rst_pending) begin
 						ph <= P_RESET; r_step <= 3'd0;
-					end else if (eac_v_use && !(i.serialize && older_busy) && !irq_take) begin
+					end else if (eac_v_use && !(i.serialize && older_busy) && !irq_take && !tr_take) begin
 						if (!st.exc_go && i.cls == CL_STOP) begin
 							if (st.disp) ph <= P_STOP;
 						end else if (!st.exc_go && i.cls == CL_RSTO) begin
@@ -2381,6 +2441,20 @@ always @(posedge clk) begin
 			irq_take     <= irq_now && !rd_req && ph != P_EXC && ph != P_RTE &&
 			                ph != P_RESET && ph != P_HALT;
 			irq_take_lvl <= irq_lvl;
+			// (M9.T) arm a trace as the instruction leaves: `sr_in` is still
+			// its STARTING SR here, because its own SR write commits at its
+			// writeback, one stage later.  Exception entry is not a traced
+			// instruction, so P_EXC/P_RESET do not arm.
+			if (st.fin && ph != P_EXC && ph != P_RESET) begin
+				tr_take <= sr_in[15];
+				tr_pc   <= i.pc;
+			end
+			// no trace survives the exception its own instruction took: the
+			// TRAP takes the TRAP and nothing else (the reference clears the
+			// pending trace inside exc(), and hardware agrees -- cputest
+			// basic/all reported "Got unexpected trace exception" when an
+			// earlier revision let one through)
+			if (st.exc_go) tr_take <= 1'b0;
 			if (st.exc_go && ph != P_EXC && i.cls == CL_EXC && i.exc_vec == 8'd2) begin
 				// an instruction fetch fault (ID marked the instruction): FA =
 				// the faulted fetch, SSW RW = 1, SIZE of the fetch, TM = 6/2

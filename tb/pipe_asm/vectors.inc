@@ -20,6 +20,9 @@ v_fpun	equ	unexp		; 55 FP unsupported data type (plan M10.1)
 	ifnd	v_fparith
 v_fparith equ	unexp		; 48-54 the enabled FP arithmetic traps (M10.3)
 	endif
+	ifnd	v_trace
+v_trace	equ	unexp		; 9 trace (plan M9.T)
+	endif
 	org	0
 	dc.l	$1F00
 	dc.l	start
@@ -30,7 +33,7 @@ v_fparith equ	unexp		; 48-54 the enabled FP arithmetic traps (M10.3)
 	dc.l	v_chk		; 6 CHK/CHK2
 	dc.l	v_trapv		; 7 TRAPcc/TRAPV
 	dc.l	v_prv		; 8 privilege
-	dc.l	unexp		; 9 trace
+	dc.l	v_trace		; 9 trace
 	dc.l	v_alin		; 10 A-line
 	dc.l	v_flin		; 11 F-line
 	rept	2

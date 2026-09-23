@@ -1,0 +1,33 @@
+halt 00004ba
+# plan M9.T: T1 traces every instruction.
+#
+# 1: seven traces, and the count is what pins the sampling rule.  The
+# instructions executed with T1 set are t1 (nop $43C), t2 (moveq $43E),
+# t3 (addq $440), t4 (move.l # $442), t5 (the MOVE to SR that CLEARS T1,
+# $448), and then t8 (nop $454) and t9 (the second MOVE to SR, $456).
+# The two MOVE to SR instructions that SET T1 are NOT traced -- T is
+# sampled at the START of an instruction -- and t6 ($44C) is not either.
+m32 00007000 00000007
+# every frame was format $2, vector offset $24
+m32 00007004 00000000
+# ... and exception entry cleared T1/T0, so no handler traced itself
+m32 00007008 00000000
+# 2: the FIRST trace, absolutely: the stacked PC is the NEXT instruction
+# ($43E) and the format-$2 address field is the instruction that was
+# traced ($43C).  A difference check alone would not see the pair moved.
+m32 0000700c 0000043e
+m32 00007010 0000043c
+# 3: the STACKED SR still has T1 set, so the RTE resumes tracing
+m32 00007014 0000a700
+# 2 cont.: the LAST trace is t9, the MOVE to SR at $456, whose next
+# instruction is t10, the nop at $45A that the trace is taken in front of
+m32 00007018 0000045a
+m32 0000701c 00000456
+# 4: the traced TRAP #0 at $452 produced ONE trap and no trace of its own
+m32 00007020 00000001
+# the traced block's own work, unchanged by tracing
+d0 00000006
+d1 12345678
+d7 00000001
+sr 00002700
+isp 00001f00
