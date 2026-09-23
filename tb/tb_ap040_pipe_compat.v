@@ -915,8 +915,20 @@ integer memlat_cls;
 integer mli, mlj;
 // How much of S_MRD/S_MWR is spent waiting for the fetch queue to give
 // the shared memory port back, rather than waiting for memory itself.
+// (These two are the reference core's shape and have no equivalent here;
+//  the pipelined port-conflict counters below replace them -- plan M11.)
 integer memlat_portwait;
 integer memlat_mrd;
+// (plan M11 / the M14 gate) THE PORT CONFLICT, measured the other way round:
+// in this core IF is the LOWEST priority user of the shared memory port
+// (ap040_pipe_bcu.v: split byte > store > data read > instruction fetch), so
+// what matters is how often IF wants the port and a DATA access has it.
+//   if_want   cycles with a fetch request asserted
+//   if_denied ... of which the port was not granted to it
+//   prof_total cycles the profile covers
+// The plan's gate: if the denial is more than 15 % of all cycles, the split
+// I/D caches of M14 are justified.
+integer if_want, if_denied, prof_total;
 integer pi;
 initial begin
 	prof_on = $test$plusargs("prof");
@@ -924,6 +936,7 @@ initial begin
 	memlat_run = -1;
 	memlat_portwait = 0;
 	memlat_mrd = 0;
+	if_want = 0; if_denied = 0; prof_total = 0;
 	for (mli = 0; mli < 3; mli = mli + 1) begin
 		memlat_n[mli] = 0; memlat_sum[mli] = 0; memlat_max[mli] = 0;
 		for (mlj = 0; mlj < 32; mlj = mlj + 1) memlat_hist[mli][mlj] = 0;
@@ -959,6 +972,18 @@ always @(posedge clk) if (memlat_on && nreset) begin
 	end
 end
 
+always @(posedge clk) if ((prof_on || memlat_on) && nreset) begin
+	prof_total = prof_total + 1;
+	if (dut.core.g_bus.u_bcu.f_req) begin
+		if_want = if_want + 1;
+		// "denied" means DATA has the port, not that IF's own previous
+		// fetch is still in flight -- the gate is about the conflict
+		// between the two users, so the port being busy with an
+		// instruction fetch does not count against it.
+		if (!dut.core.g_bus.u_bcu.go_if &&
+		    !(dut.core.mem_req && dut.core.mem_instr)) if_denied = if_denied + 1;
+	end
+end
 always @(posedge clk) if (prof_on && nreset) begin
 	prof_cnt[shim_state] = prof_cnt[shim_state] + 1;
 	if (!clkena_in)
@@ -969,9 +994,14 @@ task memlat_dump;
 	input integer ph;
 	integer c, b;
 	begin
-		$display("MEMLAT phase %0d: S_MRD/S_MWR %0d cycles, %0d waiting for the fetch queue to release the port (%0d%%)",
-		         ph, memlat_mrd, memlat_portwait,
-		         (memlat_mrd == 0) ? 0 : (memlat_portwait * 100) / memlat_mrd);
+		// (M11) the pipelined port-conflict profile, which is the M14 gate
+		$display("PORTCONF phase %0d: %0d cycles, IF wanted the port %0d (%0d%%), denied %0d (%0d%% of all cycles, %0d%% of its own requests)",
+		         ph, prof_total, if_want,
+		         (prof_total == 0) ? 0 : (if_want * 100) / prof_total,
+		         if_denied,
+		         (prof_total == 0) ? 0 : (if_denied * 100) / prof_total,
+		         (if_want == 0) ? 0 : (if_denied * 100) / if_want);
+		if_want = 0; if_denied = 0; prof_total = 0;
 		memlat_mrd = 0; memlat_portwait = 0;
 		for (c = 0; c < 3; c = c + 1) begin
 			if (memlat_n[c] != 0) begin
