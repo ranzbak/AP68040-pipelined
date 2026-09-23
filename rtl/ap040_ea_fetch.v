@@ -1475,6 +1475,7 @@ wire  [3:0] fp_mvn   = {3'd0, fp_mvmk[7]} + {3'd0, fp_mvmk[6]} + {3'd0, fp_mvmk[
                        {3'd0, fp_mvmk[4]} + {3'd0, fp_mvmk[3]} + {3'd0, fp_mvmk[2]} +
                        {3'd0, fp_mvmk[1]} + {3'd0, fp_mvmk[0]};
 wire  [6:0] fp_mvb12 = {fp_mvn, 3'd0} + {1'b0, fp_mvn, 2'd0};       // 12 x n
+reg   [6:0] fp_mvb12_q;   // fp_mvb12 as it was in the P_FPU entry clock (fp_anv)
 wire        fp_mvpd  = fp_mvst && (i.dst.upd == UPD_PRE);
 wire        fp_lsb   = fp_mvpd;
 wire        fp_rev   = fp_mvst && (i.ext[12] == fp_mvpd);
@@ -1537,9 +1538,15 @@ endfunction
 wire [31:0] fp_fadr = fp_addr + {26'd0, fp_fn, 2'b00};
 // the effective address as EA-calc gave it, before any frame or list walk
 wire [31:0] fp_addr0 = fp_mem_dst ? d_addr_c : s_addr_c;
+// (timing) fp_anv is only used in P_FPU, after the entry clock, and the
+// dynamic list's register cannot change in between: an FP instruction
+// serialises (nothing older is in EX or WB at entry, so op_c is the register
+// file's value), and FMOVEM writes no data register.  So the count latched at
+// entry (fp_mvb12_q) is the same value op_c would give, and EX's forwarded
+// result no longer reaches the An update through the popcount.
 wire [31:0] fp_anv  = fp_mvdy ? ((i.dst.upd == UPD_PRE) || (i.src.upd == UPD_PRE)
-                                ? fp_addr0 - {25'd0, fp_mvb12} + 32'd12
-                                : fp_addr0 + {25'd0, fp_mvb12}) :
+                                ? fp_addr0 - {25'd0, fp_mvb12_q} + 32'd12
+                                : fp_addr0 + {25'd0, fp_mvb12_q}) :
                       fp_sv   ? fp_addr : (fp_addr + 32'd52);
 assign fp_fm_we    = fp_mw;
 assign fp_fm_wdata = fp_mwd;
@@ -2118,7 +2125,7 @@ always @(posedge clk) begin
 		fp_stt <= FS_RD; fp_k <= 2'd0; fp_addr <= 32'd0;
 		fp_cw <= 1'b0; fp_csel <= 2'd0; fp_cwd <= 32'd0; fp_crd <= 1'b0;
 		fp_ae <= 1'b0; fp_avec <= 8'd0; fp_pend <= 1'b0; fp_pvec <= 8'd0;
-		fp_list <= 8'd0; fp_fsel <= 3'd0; fp_mw <= 1'b0; fp_mwd <= 96'd0; fp_mwsel <= 3'd0;
+		fp_list <= 8'd0; fp_mvb12_q <= 7'd0; fp_fsel <= 3'd0; fp_mw <= 1'b0; fp_mwd <= 96'd0; fp_mwsel <= 3'd0;
 		fp_rstp <= 1'b0; fp_idlp <= 1'b0; fp_fmte <= 1'b0;
 		fp_fn <= 4'd0; fp_frm <= 1'b0; fp_svack <= 1'b0; fp_frup <= 1'b0;
 		fr_cmd1 <= 16'd0; fr_cmd3 <= 16'd0; fr_stag <= 3'd0; fr_dtag <= 3'd0;
@@ -2235,6 +2242,7 @@ always @(posedge clk) begin
 								// each: the list is consumed as it goes and the first
 								// register is picked here.
 								fp_list <= fp_mvmk & ~(8'd1 << mv_bit(fp_mvmk, fp_lsb));
+								fp_mvb12_q <= fp_mvb12;
 								fp_fsel <= (!fp_mvst || i.ext[12]) ? (3'd7 - mv_bit(fp_mvmk, fp_lsb))
 								                                   : mv_bit(fp_mvmk, fp_lsb);
 								// (M10.3) a PENDING exception is taken in front of this
