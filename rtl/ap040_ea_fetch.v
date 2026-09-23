@@ -1910,12 +1910,31 @@ wire stp_t st_i = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, 
                                      (HAS_FPU != 0) && fp_bsun_go && (ph == P_FPU) && !fp_crd,
                                      (HAS_FPU != 0) && fp_trapcc && fp_ctk && !fp_bsun_go),
                                irq_go, irq_take_lvl, irq_take_pc), aerr_go, i, rd_a_q);
+// (M9.T step 4) A TRACE AND AN INTERRUPT PENDING AT THE SAME BOUNDARY: the
+// trace goes FIRST.  M68040UM 8.3, Table 8-4 puts Trace in priority group 6
+// and Interrupt in group 8, "with 0 as the highest priority", and 8.3 then
+// says what happens to the loser: "As soon as the M68040 has completed
+// exception processing for a condition when an interrupt exception is
+// pending, it begins exception processing for the interrupt exception instead
+// of executing the exception handler for the original exception condition."
+// So the trace frame is built, and the still-pending interrupt is taken in
+// FRONT OF THE TRACE HANDLER's first instruction -- which this core already
+// does for any exception (t_exceptions tests 93-105).  The interrupt handler
+// returns to the trace handler, which returns to the traced program.
+//
+// This is a deliberate divergence from lib/AP68040, which takes the interrupt
+// first and delivers the displaced trace at the interrupt handler's entry
+// (its `texc` machinery), and from WinUAE, which takes the interrupt and DROPS
+// the trace.  The reference's own comment calls its behaviour OPEN.  PLAN D23
+// has the three readings side by side; the manual is authority rule 1.
 wire tr_go = tr_take && eac_v_use && !rst_pending && !older_busy &&
-             !irq_go && (ph == P_START) && !(tr_yield && st_i.exc_go);
+             (ph == P_START) && !(tr_yield && st_i.exc_go && !irq_go);
 
-// the trace sits INSIDE the interrupt override, so a simultaneous interrupt
-// wins the boundary (M68040UM 8.3; the reference's fetch_next samples the
-// interrupt first and converts the trace to a pending one)
+// the trace is applied OUTSIDE the interrupt override, so it wins a boundary
+// they both want (M68040UM 8.3: trace is priority group 6, interrupt 8).  The
+// interrupt is not acknowledged here -- `tr_st` clears the `irq` flag -- so
+// the request simply stays pending and is taken in front of the trace
+// handler's first instruction.
 wire stp_t st = tr_st(st_i, ph, tr_take, tr_go, i.pc, tr_pc);
 
 //--------------------------------------------------------------- PFLUSH / PTEST

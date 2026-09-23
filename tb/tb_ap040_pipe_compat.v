@@ -316,6 +316,18 @@ wire        shim_m_issued = 1'b0;
 wire        shim_mem_req = dut.mem_req, shim_mem_instr = dut.mem_instr, shim_mem_write = dut.mem_write;
 wire        shim_mem_ack = dut.mem_ack, shim_mem_flt = dut.mem_flt;
 
+// (plan M9.T step 4) The two points the cycle-fine IRQ injector ($F144) needs,
+// named on THIS pipeline instead of the reference's state numbers 34 and 42:
+//   exc_stacking  the exception is writing its frame            (was state 34)
+//   exc_vecdone   its vector has been read and the handler's
+//                 first fetch is about to go out                (was state 42)
+// The reference bench watched a microcoded state machine; EA-fetch's P_EXC
+// walk is the same sequence -- x_step 0 writes the frame longwords, 3 reads
+// the vector, 4 dispatches the final micro-op that redirects to the handler.
+wire        exc_stacking = (dut.core.u_eaf.ph == 4'd2) && (dut.core.u_eaf.x_step == 3'd0);
+wire        exc_vecdone  = (dut.core.u_eaf.ph == 4'd2) && (dut.core.u_eaf.x_step == 3'd4);
+wire  [7:0] exc_vec_now  = dut.core.u_eaf.x_vec;
+
 wire [31:0] dbg_pc = debug_status[31:0];
 
 wire [15:0] dbg_ir = debug_status[63:48];
@@ -447,16 +459,14 @@ always @(posedge clk) begin
 			         dut.mem_wdata[1:0], dbg_pc);
 			`endif
 	end
-	else if (irq_exc_armed == 1 && shim_state == 8'd34 &&
-	         shim_exc_vec == 8'd32) begin
+	else if (irq_exc_armed == 1 && exc_stacking && exc_vec_now == 8'd32) begin
 		ipl_lvl <= 3'd2;
 		irq_exc_armed <= 0;
 			`ifdef AP040_TRACE
 			$display("TRACE raised stacking-time IPL2 pc=%h", dbg_pc);
 			`endif
 	end
-	else if (irq_exc_armed == 2 && shim_state == 8'd42 &&
-	         shim_exc_vec == 8'd32) begin
+	else if (irq_exc_armed == 2 && exc_vecdone && exc_vec_now == 8'd32) begin
 		ipl_lvl <= 3'd2;
 		irq_exc_armed <= 0;
 		irq_fetch_stall <= 3'd5;
