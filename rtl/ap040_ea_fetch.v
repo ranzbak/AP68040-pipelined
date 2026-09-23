@@ -1128,11 +1128,40 @@ wire tr_stop_t0 = {i.imm[15:12], i.imm[10:8]} != {sr_in[15:12], sr_in[10:8]};
 wire tr_t0_ev   = (i.cls == CL_STOP) ? tr_stop_t0 : (i.t0sync || tr_flow);
 wire tr_arm     = sr_in[15] || (sr_in[14] && tr_t0_ev);
 
-wire stp_t st0 = stepf(ph, eac_v_use, rst_pending, i, older_busy, !bf_rdblk, rd_pend, rd_ack, cap,
-                      s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, trap_n, trap_vec,
+// (timing) TRAPcc's decision, br_cc, comes from the CCR EX forwards this
+// clock, and inside stepf it sat at the head of the if-chain that decides
+// `fin` -- so EX's flags reached eaf_stall, and from there EA-calc's
+// redirect, ID's consume and IF's fetch PC.  stepf is therefore evaluated
+// with trap_n = 0 and the TRAPcc arm is applied AFTER it, where br_cc is one
+// term of the last gate.  Exactly equivalent: trap_n implies i.cls ==
+// CL_TRAPCC, so in stepf's P_START/P_OPS arm every class test before the
+// final `else` is false, and so are jmp_odd (JMP/JSR), rts_odd (RTS/RTD) and
+// trap_u (CHK/CHK2/DIV) -- the only arms that could have come first.  With
+// trap_n = 0 that arm reaches the ordinary dispatch instead, which sets only
+// disp/dsel/fin; trapn_ov puts them back to what the trap arm leaves (0) and
+// sets the exception fields the trap arm sets.  The STOP arm's `tr_arm` is
+// likewise given its STOP-only form (tr_t0_ev is tr_stop_t0 when i.cls ==
+// CL_STOP), which is the same value there and has no branch in it.
+function automatic stp_t trapn_ov(input stp_t s0, input logic go, input logic [7:0] vec,
+                                  input logic [31:0] npc, input logic [31:0] pc);
+	stp_t s;
+	s = s0;
+	if (go) begin
+		s.disp = 1'b0; s.dsel = 3'd0; s.fin = 1'b0;
+		s.exc_go = 1'b1; s.ev = vec; s.ef = 4'd2; s.epc = npc; s.eaddr = pc;
+	end
+	return s;
+endfunction
+wire tr_arm_stop = sr_in[15] || (sr_in[14] && tr_stop_t0);
+wire trapn_arm = ((ph == P_START) || (ph == P_OPS)) && eac_v_use && !rst_pending &&
+                 !(i.serialize && older_busy && ph == P_START) && !(i.priv && !s_bit) &&
+                 ops_done && !(rd_pend && !rd_ack);
+wire stp_t st0_nt = stepf(ph, eac_v_use, rst_pending, i, older_busy, !bf_rdblk, rd_pend, rd_ack, cap,
+                      s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, 1'b0, trap_vec,
                       indexed_mode, two_uop, bf_step, sync_busy, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes,
-                      r_fv[15:12] == 4'd7, rs_cnt == 10'd0, HAS_FPU != 0, tr_arm);
+                      r_fv[15:12] == 4'd7, rs_cnt == 10'd0, HAS_FPU != 0, tr_arm_stop);
+wire stp_t st0 = trapn_ov(st0_nt, trap_n && trapn_arm, trap_vec, i.next_pc, i.pc);
 
 //--------------------------------------------------------------- access errors
 // A data read that ends in an access error (M68040UM 8.2.1, p. 8-6): the
