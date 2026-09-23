@@ -140,8 +140,12 @@ c9e:
 c10:	dc.w	$F200,$0005
 c10e:
 
-; 11: opmode $78 -- vector 4 (illegal instruction), not vector 11
-	setup	11,$0010
+; 11: opmode $78.  On a 68040 that HAS an FPU this is the ILLEGAL vector; with
+;     NO FPU it is just another F-line, vector 11 with the instruction's own PC
+;     -- the cputest corpus says so (Basic/ILLEGAL slice 0007, opcode F23D 4AFC,
+;     opmode $7C), and it is the hardware-validated oracle.  The core keeps the
+;     vector-4 rule behind HAS_FPU for when the FPU arrives in M10.
+	setup	11,$002C
 	lea	c11(pc),a4
 	lea	c11(pc),a5
 	lea	c11e(pc),a1

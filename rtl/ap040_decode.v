@@ -33,6 +33,10 @@
 
 module ap040_decode
 	import ap040_pipe_pkg::*;
+#(
+	// 1: a full MC68040 with the FPU.  0 (the LC040 build): every well-formed
+	parameter HAS_FPU = 0
+)
 (
 	input             clk,
 	input             nreset,
@@ -721,6 +725,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 	logic        s2set;        // the destination EA has its own size (size2)
 	logic [1:0]  s2;
 	int ks, kd; elen_t e;
+	logic fsave_ok, frest_ok;   // the coprocessor-id-1 state instructions' legal EA modes
 	tot = tot_w;
 	op = vbuf[0];
 	x1 = vbuf[1];
@@ -736,6 +741,11 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 	d.alu = sh.alu;
 	d.cond = op[11:8];
 	d.src.idx_reg = R_NONE; d.dst.idx_reg = R_NONE;
+	// FSAVE: control alterable or -(An).  FRESTORE: control or (An)+.
+	fsave_ok = (op[5:3] == 3'd2) || (op[5:3] == 3'd4) || (op[5:3] == 3'd5) || (op[5:3] == 3'd6) ||
+	           (op[5:3] == 3'd7 && op[2:0] <= 3'd1);
+	frest_ok = (op[5:3] == 3'd2) || (op[5:3] == 3'd3) || (op[5:3] == 3'd5) || (op[5:3] == 3'd6) ||
+	           (op[5:3] == 3'd7 && op[2:0] <= 3'd3);
 	d.src.reg_n = R_NONE; d.dst.reg_n = R_NONE;
 	// the pre-EA immediate (B: low byte of word 1, W: word 1, L: words 1-2)
 	ipre = (sh.sz == SZ_L) ? {x1, vbuf[2]} : (sh.sz == SZ_W) ? {16'd0, x1} : {24'd0, x1[7:0]};
@@ -1052,7 +1062,16 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				// F-line at all (M68040UM 8.2.5; WinUAE does the same, PLAN.md D18).
 				// EA-fetch checks i.priv before it looks at CL_EXC, so this is all
 				// it takes.
-				d.priv = (op[8:6] == 3'b100) || (op[8:6] == 3'b101);
+				// ... but only when the ENCODING is a real FSAVE/FRESTORE.  A
+				// malformed one is an F-line first and is not privileged at all:
+				// the cputest corpus sweeps $F300 and $F301 (FSAVE with a data
+				// register as its operand) in USER mode and expects vector 11,
+				// not the privilege violation.  So encoding, then privilege,
+				// then the FPU.
+				// FSAVE takes control-alterable or -(An); FRESTORE takes control
+				// or (An)+ (PC-relative included).  M68000PRM, and lib/AP68040's
+				// own cpid-1 arms.
+				d.priv = (op[8:6] == 3'b100 && fsave_ok) || (op[8:6] == 3'b101 && frest_ok);
 				if (op[8:6] == 3'b000) begin
 					if (x1[15:13] == 3'b001) begin
 						d.exc_fmt = 4'd0; d.exc_next = 1'b0;         // reserved opclass
@@ -1063,10 +1082,39 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						// low bits are a ROM offset)
 						case (fp_opmode_class(x1[6:0]))
 							2'd1: begin d.exc_fmt = 4'd0; d.exc_next = 1'b0; end
-							2'd2: begin d.exc_fmt = 4'd0; d.exc_next = 1'b0; d.exc_vec = 8'd4; end
+							// Opmodes $78-$7F are the ILLEGAL vector on a 68040
+							// that HAS an FPU (lib/AP68040's go_illegal, and
+							// WinUAE's fault_if_unimplemented_680x0, whose own
+							// comment is "Unexpected, isn't it?!").  With NO FPU
+							// they are just another F-line: the cputest corpus
+							// says so and it is the hardware-validated oracle --
+							// Basic/ILLEGAL slice 0007, opcode F23D 4AFC (opmode
+							// $7C), expects vector 11 with the instruction's own
+							// PC.  Getting this wrong cost that slice, and the
+							// full-group replay is what found it.
+							2'd2: begin
+								d.exc_fmt = 4'd0; d.exc_next = 1'b0;
+								if (HAS_FPU != 0) d.exc_vec = 8'd4;
+							end
 							default: ;
 						endcase
 					end
+				end
+				// Mode 7 registers 5, 6 and 7 are reserved for EVERY coprocessor
+				// command, so a primary word carrying one is a malformed
+				// encoding and takes the plain F-line -- format $0, own PC --
+				// whatever its extension word says.  The reference rejects them
+				// "before fetching an extension word" (ap040_core.v, the cpid-1
+				// arms), and the cputest corpus agrees: Basic/ILLEGAL slice 0007
+				// sweeps $F27D and $F27E and expects vector 11 with the
+				// instruction's own PC.  (This overrides the opclass decision
+				// above; FSAVE/FRESTORE keep their privilege check, which is
+				// older still.)
+				if ((op[5:3] == 3'b111 && op[2:0] > 3'b100 &&
+				     (op[8:6] == 3'b000 || op[8:6] == 3'b001)) ||
+				    (op[8:6] == 3'b100 && !fsave_ok) ||
+				    (op[8:6] == 3'b101 && !frest_ok)) begin
+					d.exc_vec = 8'd11; d.exc_fmt = 4'd0; d.exc_next = 1'b0;
 				end
 				// The source EA is kept ONLY for a format $4 frame, which
 				// stacks it: EA-calc computes the address, EA-fetch takes it

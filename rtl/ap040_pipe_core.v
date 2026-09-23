@@ -420,7 +420,7 @@ ap040_inst_fetch #(
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1)
 );
 
-ap040_decode u_id
+ap040_decode #(.HAS_FPU(HAS_FPU)) u_id
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ea_stall), .flush(flush_id),
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1),
