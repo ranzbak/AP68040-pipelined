@@ -218,18 +218,23 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 	else
 		echo "  (AP68040-reference not found: t_movem_restart skipped)"
 	fi
-	for t in t_integer t_cache t_bitfield_mmu t_mmu_m9s t_mmu_pipe texc_m9t t_irq_pipe t_mbit_pipe t_trirq_pipe t_ipend_pipe $TMR; do
+	# t_irqwedge_pipe (2026-09-23, the board's black screen): an interrupt
+	# landing on an instruction past P_START with no read in flight.  The
+	# failure is a WEDGE, so it gets a short phase timeout (it passes in
+	# 180k clocks) instead of the bench's 20M default.
+	for t in t_integer t_cache t_bitfield_mmu t_mmu_m9s t_mmu_pipe texc_m9t t_irq_pipe t_mbit_pipe t_trirq_pipe t_ipend_pipe t_irqwedge_pipe $TMR; do
 		if [ "$t" = t_mmu_m9s ] || [ "$t" = t_movem_restart_m9s ] || [ "$t" = texc_m9t ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "$WORK/$t.s"
 		elif [ "$t" = t_mmu_pipe ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "mmu_asm/$t.s"
-		elif [ "$t" = t_irq_pipe ] || [ "$t" = t_mbit_pipe ] || [ "$t" = t_trirq_pipe ] || [ "$t" = t_ipend_pipe ]; then
+		elif [ "$t" = t_irq_pipe ] || [ "$t" = t_mbit_pipe ] || [ "$t" = t_trirq_pipe ] || [ "$t" = t_ipend_pipe ] || [ "$t" = t_irqwedge_pipe ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "irq_asm/$t.s"
 		else
 			( cd "$AP040_REF/tb/asm" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OLDPWD/$WORK/$t.bin" "$t.s" )
 		fi
 		python3 bin2hex.py "$WORK/$t.bin" "$WORK/$t.hex"
-		if timeout 1800 vvp "$WORK/tb_compat.vvp" +prog="$WORK/$t.hex" > "$WORK/compat_$t.log" 2>&1 &&
+		tmo=""; [ "$t" = t_irqwedge_pipe ] && tmo="+timeout=2000000"
+		if timeout 1800 vvp "$WORK/tb_compat.vvp" +prog="$WORK/$t.hex" $tmo > "$WORK/compat_$t.log" 2>&1 &&
 		   grep -q "ALL TESTS PASSED" "$WORK/compat_$t.log"; then
 			echo "  pass  compat:$t"
 		else

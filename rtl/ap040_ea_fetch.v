@@ -2036,7 +2036,21 @@ assign rd_fc     = (st.issue && (ph == P_START || ph == P_OPS) && i.fcsel == 2'd
                    (ph == P_EXC || ph == P_RTE || ph == P_RESET) ? 3'd5 : fc_data;
 wire   use_early = early_v && early.v && !st.issue && (!rd_pend || rd_ack) &&
                    (st.fin || !eac_v_use) && !rst_pending;
-assign rd_req    = (st.issue || use_early) && !flush && !irq_take && !tr_take;   // (registered: out of stepf)
+// An armed interrupt holds back only the reads it can be taken in front of:
+// the instruction still at P_START (irq_go fires only there, or in P_STOP,
+// which reads nothing) and the NEXT instruction's early read.  An
+// instruction that has LEFT P_START -- P_OPS, P_MOVEM, P_FPU -- cannot be
+// interrupted; it must finish, and it cannot finish without its reads.
+// irq_take arms in whatever phase it sees a request with nothing read yet
+// and no read going out, so gating every read on it wedged such an
+// instruction for good: its read never went out, it never returned to
+// P_START, and the interrupt was never taken.  No request, no fault, no
+// exception -- the board's black screen of 2026-09-23 (a MOVEM load past
+// its first clock when Enable()'s INTENA write let a pending Paula request
+// through; t_irqwedge_pipe.s).  `irq_blk` is registers only: the chain
+// still sees a flip-flop's worth of logic, not a term (the m9s rule).
+wire   irq_blk   = irq_take && (ph == P_START);
+assign rd_req    = ((st.issue && !irq_blk) || (use_early && !irq_take)) && !flush && !tr_take;   // (registered: out of stepf)
 assign rd_addr   = st.issue ? st.ia  : early.a;
 assign rd_size   = st.issue ? st.isz : early.sz;
 wire [2:0] rd_t  = st.issue ? st.it  : early.t;

@@ -336,7 +336,12 @@ wire  [7:0] shim_exc_vec = dut.core.u_eaf.x_vec;
 reg         in_exc_q = 0;
 always @(posedge clk) in_exc_q <= shim_in_exc;
 wire        exc_accept = shim_in_exc && !in_exc_q;
-wire        insn_start = dut.core.u_eaf.st.fin;
+// (2026-09-23) only on an ENABLED edge: `fin` is a level that stays up
+// across the clocks clkena_in holds low, and an instruction leaves EA-fetch
+// once, on the edge the core is enabled.  Counted per clock, a NOP waiting
+// out a bus wait counted five or six times, and t_irqwedge_pipe.s's shape D
+// -- an interrupt taken after four real instructions -- read as a lost hold.
+wire        insn_start = dut.core.u_eaf.st.fin && dut.core.ce;
 // ... and the tail of an entry.  The reference bench excluded "states 34..42"
 // because between the acceptance and the cycle the new mask reaches SR the
 // level is still above the OLD mask, and a claim armed there is a phantom.
@@ -451,6 +456,38 @@ reg  [2:0] walker_lat_cnt;
 integer   walker_lat_idx;
 integer   walker_cycles;
 
+// $F158: a SLOW INTERRUPT-ENABLE register, modelled on the board's
+// Enable() -- `move.w #$C000,$DFF09A`, an uncached chip-bus write that holds
+// the core's WB for a whole 7 MHz cycle while Paula, which latches INTENA
+// part way through that cycle, raises IPL before the CPU has its
+// acknowledge.  A word write here takes SLOW_LAT clocks to acknowledge, and
+// the IPL lines rise to data[2:0] data[15:8] clocks into it (at the
+// acknowledge if that is later).  (2026-09-23 black-screen hunt,
+// t_irqwedge_pipe.s shape D.)
+localparam SLOW_LAT = 24;
+reg  [5:0] slow_cnt  = 0;
+reg        slow_done = 0;
+reg  [7:0] slow_rise = 0;
+reg  [2:0] slow_lvl  = 0;
+wire       slow_acc  = nreset && (busstate == 2'b11) && (addr_out[15:0] == 16'hF158);
+wire       slow_wait = slow_acc && !slow_done;
+always @(posedge clk) begin
+	if (!nreset) begin slow_cnt <= 0; slow_done <= 0; end
+	else if (slow_acc && !slow_done && slow_cnt == 0 && !mem_ready) begin
+		slow_cnt  <= SLOW_LAT;
+		slow_rise <= data_write[15:8];
+		slow_lvl  <= data_write[2:0];
+		if (data_write[15:8] == 0) ipl_lvl <= data_write[2:0];
+	end
+	else if (slow_cnt != 0) begin
+		if (SLOW_LAT - slow_cnt + 1 == slow_rise || slow_cnt == 1 && slow_rise >= SLOW_LAT)
+			ipl_lvl <= slow_lvl;
+		slow_cnt <= slow_cnt - 1'd1;
+		if (slow_cnt == 1) slow_done <= 1;
+	end
+	else if (!slow_acc) slow_done <= 0;
+end
+
 always @(posedge clk) begin
 	if (phase != 2) mem_ready <= 0;
 	if (!nreset) begin
@@ -478,7 +515,7 @@ always @(posedge clk) begin
 			mem_ready <= 0;
 			lvl_hold <= 0;
 		end
-		else if (!lvl_hold) begin
+		else if (!lvl_hold && !slow_wait) begin
 			if (lat_cnt == 0) begin
 				mem_ready <= 1;
 				lvl_hold <= 1;
@@ -495,7 +532,7 @@ always @(posedge clk) begin
 		// Keep the first handler refill outstanding while IPL synchronizes.
 		irq_fetch_stall <= irq_fetch_stall - 1'd1;
 	end
-	else if (busstate != 2'b01 && !mem_ready) begin
+	else if (busstate != 2'b01 && !mem_ready && !slow_wait) begin
 		if (lat_cnt == 0) begin
 			mem_ready <= 1;
 			lat_cnt   <= latency(phase, lat_idx);
@@ -1044,6 +1081,7 @@ task prof_dump;
 endtask
 
 integer timeout;
+integer timeout_lim;   // +timeout=<clocks> per phase (default 20M): a wedged core fails fast
 integer i;
 
 task run_phase;
@@ -1067,7 +1105,7 @@ task run_phase;
 		nreset = 1;
 
 		timeout = 0;
-		while (result == 0 && timeout < 20000000) begin
+		while (result == 0 && timeout < timeout_lim) begin
 			@(posedge clk);
 			timeout = timeout + 1;
 		end
@@ -1076,6 +1114,11 @@ task run_phase;
 			errors = errors + 1;
 			$display("FAIL: phase %0d timeout, pc=%h ir=%h fault=%b halted=%b",
 			         ph, dbg_pc, dbg_ir, debug_fault, debug_halted);
+			// where the pipeline stands: a wedge with no request pending
+			// is an internal hand-off, not a bus hang (2026-09-23)
+			$display("      EA-fetch ph=%0d pc=%08h valid=%b irq_req=%b irq_take=%b mem_req=%b older_busy=%b",
+			         dut.core.u_eaf.ph, dut.core.dbg_eac_pc, dut.core.eac_valid,
+			         dut.core.irq_req, dut.core.u_eaf.irq_take, dut.core.mem_req, dut.core.older_busy);
 		end
 		else if (result == 1)
 			$display("phase %0d passed (%0d cycles)", ph, timeout);
@@ -1091,6 +1134,7 @@ initial begin
 		$finish;
 	end
 	$display("tb_ap040_program: running %0s", prog_file);
+	if (!$value$plusargs("timeout=%d", timeout_lim)) timeout_lim = 20000000;
 
 	run_phase(0);
 	run_phase(1);
