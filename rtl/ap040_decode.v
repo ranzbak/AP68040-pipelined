@@ -1406,9 +1406,12 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					if (d.cls == CL_FPU && x1[15:14] == 2'b11) begin
 						// twelve bytes per selected register -- up to 96, which
 						// is why the explicit step is seven bits wide
-						// a static list's step is known here; a dynamic one's
-						// is computed in EA-fetch and applied through an_ov
-						d.imm[6:0] = x1[11] ? 7'd0
+						// A static list's step is known here.  A DYNAMIC one's is
+						// not, and it is given ONE register's worth rather than
+						// zero: `nb == 0` means "use the size rule" in eacomp,
+						// not "do not step", so zero would silently step by four.
+						// EA-fetch adds the remaining 12 x (n-1) through an_ov.
+						d.imm[6:0] = x1[11] ? 7'd12
 						                    : {fp_mvn, 3'd0} + {1'b0, fp_mvn, 2'd0};   // 8n + 4n
 						d.size = SZ_L;
 					end else if (d.cls == CL_FPU && x1[15:14] == 2'b10) begin

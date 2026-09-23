@@ -89,6 +89,13 @@ c6e:
 	; ... and OUT through a STATIC list naming FP0-FP2.  A round trip through
 	; the same dynamic mask could not see a permuted one (the M10.7 lesson).
 	dc.w	$F216,$F0E0		; FMOVEM.X FP0-FP2,(A6)
+	; ... and the PREDECREMENT dynamic store, which is what lib/AP68040's
+	; t_fpu.s test 59 checks: one register selected, so A0 must move by
+	; twelve and not by the size rule EA-calc would use for a zero step
+	dc.w	$F23C,$43C0,$0000,$014D	; FMOVE.L #333,FP7
+	move.l	#$80,d0			; the predecrement convention: bit 7 = FP7
+	movea.l	#$5700,a0
+	dc.w	$F220,$E800		; FMOVEM.X D0,-(A0)
 halt:
 	bra.s	halt
 

@@ -1495,7 +1495,7 @@ wire [31:0] fp_fadr = fp_addr + {26'd0, fp_fn, 2'b00};
 // the effective address as EA-calc gave it, before any frame or list walk
 wire [31:0] fp_addr0 = fp_mem_dst ? d_addr_c : s_addr_c;
 wire [31:0] fp_anv  = fp_mvdy ? ((i.dst.upd == UPD_PRE) || (i.src.upd == UPD_PRE)
-                                ? fp_addr0 - {25'd0, fp_mvb12}
+                                ? fp_addr0 - {25'd0, fp_mvb12} + 32'd12
                                 : fp_addr0 + {25'd0, fp_mvb12}) :
                       fp_sv   ? fp_addr : (fp_addr + 32'd52);
 assign fp_fm_we    = fp_mw;
@@ -2130,8 +2130,10 @@ always @(posedge clk) begin
 									// (M10.9) a dynamic list's step was not known to
 									// EA-calc, so the base and the register update
 									// are computed here
+									// EA-calc stepped by ONE register (see decode), so
+									// the base is short by the other n-1
 									if (fp_mvdy && (i.dst.upd == UPD_PRE))
-										fp_addr <= d_addr_c - {25'd0, fp_mvb12};
+										fp_addr <= d_addr_c - {25'd0, fp_mvb12} + 32'd12;
 								end
 								else if (fp_cr) begin
 									if (fp_mem_src)      fp_stt <= FS_RD;

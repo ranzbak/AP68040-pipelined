@@ -1,4 +1,4 @@
-halt 00004da
+halt 00004f2
 # plan M10.4.  FP0 = 1.0, FP1 = 2.0, FP2 = 3.0 throughout; their extended
 # images are 3FFF/8000.../0, 4000/8000.../0 and 4000/C000.../0.
 #
@@ -68,3 +68,7 @@ m32 00005604 80000000
 m32 0000560c 40000000
 m32 00005618 40000000
 m32 0000561c c0000000
+
+# ... and the predecrement dynamic store moved A0 by twelve, one register
+a0 000056f4
+m32 000056f4 40070000
