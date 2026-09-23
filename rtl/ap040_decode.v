@@ -121,6 +121,28 @@ function automatic logic [2:0] fp_cr_n(input logic [2:0] sel);
 	return {2'd0, sel[2]} + {2'd0, sel[1]} + {2'd0, sel[0]};
 endfunction
 
+// (M10.6) The opmodes THIS unit implements in hardware, copied from
+// `ap040_fpu.v`'s op_in_hw so decode and the unit cannot disagree.  It is
+// needed in the decoder because the 68040 reports an FPSP-emulated opmode as
+// an UNIMPLEMENTED instruction even when its effective address is illegal --
+// WinUAE runs fault_if_unimplemented_680x0 before it rejects a Dn or An
+// source, and lib/AP68040's t_fpu.s test 326 (`fint.x a1,fp1`) pins it.  A
+// hardware opmode with the same EA stays a plain format $0 F-line.
+function automatic logic fp_op_hw(input logic [6:0] op);
+	case (op)
+		7'h00, 7'h40, 7'h44,          // FMOVE, FSMOVE, FDMOVE
+		7'h18, 7'h58, 7'h5C,          // FABS, FSABS, FDABS
+		7'h1A, 7'h5A, 7'h5E,          // FNEG, FSNEG, FDNEG
+		7'h38, 7'h3A,                 // FCMP, FTST
+		7'h22, 7'h62, 7'h66,          // FADD, FSADD, FDADD
+		7'h28, 7'h68, 7'h6C,          // FSUB, FSSUB, FDSUB
+		7'h23, 7'h27, 7'h63, 7'h67,   // FMUL, FSGLMUL, FSMUL, FDMUL
+		7'h20, 7'h24, 7'h60, 7'h64,   // FDIV, FSGLDIV, FSDIV, FDDIV
+		7'h04, 7'h41, 7'h45: return 1'b1;   // FSQRT, FSSQRT, FDSQRT
+		default: return 1'b0;
+	endcase
+endfunction
+
 // An FP opmode that no 68040 implements.  1 = the encoding is not a floating-
 // point instruction at all and takes the ordinary F-line (vector 11, format
 // $0); 2 = $78..$7F, which take the ILLEGAL vector 4; 0 = a real FP opmode.
@@ -1267,6 +1289,39 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						// ... and a LEGAL one this core does not sequence -- a
 						// memory-indirect EA -- keeps the format $4 frame it has
 						// today, which is M10.1's recorded gap and not this rule.
+					end
+					// (M10.6) An effective address the 68040 REJECTS for an
+					// opclass 010 or 011 instruction is the ordinary F-line --
+					// vector 11 with format $0 and the instruction's own PC --
+					// and not M10.0's format $4 (PLAN.md D22).  `t_fpu.s` is
+					// the oracle and it names the cputest rounds: an address
+					// register is never a legal floating-point source or
+					// destination, and a data register holds only the formats
+					// that fit in it.  A LEGAL address this core does not
+					// sequence (memory indirect) keeps format $4, which is the
+					// separate, recorded gap.
+					else if ((x1[15:13] == 3'b010 &&
+					          (d.src.kind == EK_AREG ||
+					           (d.src.kind == EK_DREG && !fp_ireg))) ||
+					         (x1[15:13] == 3'b011 &&
+					          (d.src.kind == EK_AREG ||
+					           d.src.kind == EK_IMM ||
+					           (sh.sm == 3'd7 && sh.sr[1]) ||
+					           (d.src.kind == EK_DREG && !fp_ireg &&
+					            x1[12:10] != 3'b011)))) begin
+						// (packed into a data register is the DATATYPE fault,
+						// vector 55, not the F-line -- it keeps format $4 for
+						// now and is recorded with the rest of M10.6)
+						if (fp_op_hw(x1[6:0])) begin
+							d.exc_fmt = 4'd0; d.exc_next = 1'b0;
+						end else begin
+							// an FPSP-emulated opmode reports as UNIMPLEMENTED
+							// whatever its effective address is: vector 11,
+							// format $2, the NEXT instruction's PC, and the
+							// address field is the faulting PC because there is
+							// no addressable operand (D19's shape)
+							d.exc_fmt = 4'd2; d.exc_next = 1'b1;
+						end
 					end
 					// (M10.4) opclass 110/111: FMOVEM of the floating-point
 					// registers, twelve bytes each.  The 68040's effective-
