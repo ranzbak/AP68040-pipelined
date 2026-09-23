@@ -243,8 +243,16 @@ wire  [2:0] pf_fcw;
 
 // The pipelined core (Minimig plan M5) in place of lib/AP68040's
 // ap040_core.  The MMU sits between the core and the cache (M7); CINV is
-// not requested.  No FPU until M10, no interrupts until M9.
+// not requested.  The FPU (M10.1) sits beside it, as the MMU does.
 wire        core_st_err;
+// the core's FPU port group (plan M10.1).  With AP040_HAS_FPU = 0, which is
+// what the Minimig build uses, nothing decodes to CL_FPU, fp_req stays low
+// and g_nofpu's constants are exact rather than merely safe.
+wire        fp_req, fp_done, fp_accepted, fp_unimp, fp_unsupp, fp_ia_we;
+wire  [2:0] fp_op_class, fp_src_fmt, fp_src_r, fp_dst_r;
+wire  [6:0] fp_opmode;
+wire [95:0] fp_din, fp_dout;
+wire [31:0] fp_ia_wdata;
 wire [31:0] c_dbg_pc, c_dbg_d0, c_dbg_d1, c_dbg_d2, c_dbg_a0, c_dbg_sp, c_dbg_usp, c_dbg_isp;
 wire [15:0] c_dbg_sr;
 wire        c_dbg_halted;
@@ -294,13 +302,26 @@ ap040_pipe_core #(
 	.pf_req(pf_req), .pf_mode(pf_mode), .pf_addr(pf_addr), .pf_fc(pf_fcw), .pf_done(pf_done),
 	.ipl(ipl), .nmi_ack_toggle(nmi_ack_toggle), .nresetout(nresetout), .dbg_stopped(),
 	.cinv_req(cinv_req), .cinv_ic(cinv_ic), .cinv_dc(cinv_dc), .cinv_done(cinv_done),
-	// the FPU port group (plan M10.1): no unit is instantiated here yet --
-	// M10.1 step (b) wires ap040_fpu in.  With AP040_HAS_FPU = 0, which is
-	// what the Minimig build uses, nothing ever decodes to CL_FPU and fp_req
-	// stays low, so tying the answers off is exact and not merely safe.
-	.fp_req(), .fp_op_class(), .fp_opmode(), .fp_src_fmt(), .fp_src_r(), .fp_dst_r(), .fp_din(),
-	.fp_done(1'b0), .fp_accepted(1'b0), .fp_unimp(1'b0), .fp_unsupp(1'b0), .fp_dout(96'd0)
+	// the FPU port group (plan M10.1 step 3): the unit is instantiated below
+	// under AP040_HAS_FPU, the way the MMU is.
+	.fp_req(fp_req), .fp_op_class(fp_op_class), .fp_opmode(fp_opmode),
+	.fp_src_fmt(fp_src_fmt), .fp_src_r(fp_src_r), .fp_dst_r(fp_dst_r), .fp_din(fp_din),
+	.fp_ia_we(fp_ia_we), .fp_ia_wdata(fp_ia_wdata),
+	.fp_done(fp_done), .fp_accepted(fp_accepted), .fp_unimp(fp_unimp), .fp_unsupp(fp_unsupp),
+	.fp_dout(fp_dout)
 );
+
+// the FPU (M10.1 step 3): lifted from the reference unchanged (02ebcee),
+// driven by EA-fetch's P_FPU request.  The ports this step does not use yet
+// are tied off in the include, which the program bench includes too, so the
+// simulated unit and the synthesised one are the same instance.
+wire fp_ce = ce_core;
+generate if (AP040_HAS_FPU != 0) begin : g_fpu
+`include "ap040_fpu_tie.vh"
+end else begin : g_nofpu
+	assign fp_done = 1'b0, fp_accepted = 1'b0, fp_unimp = 1'b0, fp_unsupp = 1'b0;
+	assign fp_dout = 96'd0;
+end endgenerate
 
 // the MMU (M7): lifted from the reference as it is, wired as the reference
 // compat wires it -- the core's request port is its c_* side, the cache

@@ -17,6 +17,7 @@
 //   vbr <v>                                                                //
 //   m8|m16|m32 <addr> <v>  memory (big-endian)                             //
 //   noread <addr>        no data read may touch this byte (pure writes)     //
+//   fpiar <v>            the FPU's FPIAR, read hierarchically (-DFPU_REAL)  //
 //   # ...                comment (the # a word of its own)                 //
 // Prints "ALL TESTS PASSED" or one FAIL line per mismatch.                  //
 //                                                                          //
@@ -56,11 +57,20 @@ reg  [31:0] m_rdata = 32'd0;
 // (plan M10.1) the FPU port group: with -DFPU_STUB the core is built with
 // HAS_FPU = 1 and tb_fpu_stub.v answers it, so the req/accepted/done
 // interlock can be exercised by a program before the real unit goes in.
+// With -DFPU_REAL the lifted ap040_fpu answers instead, wired by the SAME
+// include the wrapper uses (rtl/compat/ap040_fpu_tie.vh), so a program that
+// passes here drives the instance the bitstream carries.
 wire        fp_req, fp_done, fp_accepted, fp_unimp, fp_unsupp, fp_dbl;
 wire  [2:0] fp_op_class, fp_src_fmt, fp_src_r, fp_dst_r;
 wire  [6:0] fp_opmode;
 wire [95:0] fp_din, fp_dout;
-`ifdef FPU_STUB
+wire        fp_ia_we;
+wire [31:0] fp_ia_wdata;
+wire        fp_ce = ce;
+`ifdef FPU_REAL
+`include "ap040_fpu_tie.vh"
+assign fp_dbl = 1'b0;
+`elsif FPU_STUB
 tb_fpu_stub u_fpu
 (
 	.clk(clk), .nreset(nreset), .ce(ce),
@@ -82,6 +92,9 @@ ap040_pipe_core #(
 `ifdef FPU_STUB
 	, .HAS_FPU(1)
 `endif
+`ifdef FPU_REAL
+	, .HAS_FPU(1)
+`endif
 ) dut (
 	.clk(clk), .nreset(nreset), .ce(ce),
 	.mem_req(mem_req), .mem_write(mem_write), .mem_instr(mem_instr), .mem_size(mem_size),
@@ -95,6 +108,7 @@ ap040_pipe_core #(
 	.dbg_ccr(dbg_ccr), .dbg_sr(dbg_sr),
 	.fp_req(fp_req), .fp_op_class(fp_op_class), .fp_opmode(fp_opmode),
 	.fp_src_fmt(fp_src_fmt), .fp_src_r(fp_src_r), .fp_dst_r(fp_dst_r), .fp_din(fp_din),
+	.fp_ia_we(fp_ia_we), .fp_ia_wdata(fp_ia_wdata),
 	.fp_done(fp_done), .fp_accepted(fp_accepted), .fp_unimp(fp_unimp), .fp_unsupp(fp_unsupp),
 	.fp_dout(fp_dout)
 );
@@ -448,6 +462,24 @@ initial begin
 		else if (key == "berr") rc = $fscanf(fd, "%h %s", v, key);
 		else if (key == "fc") rc = $fscanf(fd, "%h %d", a, v);
 		else if (key == "rb") rc = $fscanf(fd, "%h", v);
+		// "fpiar <v>": the unit's FPIAR, which no instruction can read until
+		// opclass 100/101 is decoded, so the bench reads it hierarchically.
+		// Only the -DFPU_REAL build has a unit to read; any other build that
+		// meets the key fails rather than skipping it quietly.
+		else if (key == "fpiar") begin
+			rc = $fscanf(fd, "%h", v);
+			nchk = nchk + 1;
+`ifdef FPU_REAL
+			got = u_fpu.fpiar;
+`else
+			got = 32'hDEAD_DEAD;
+			$display("FAIL: 'fpiar' needs the -DFPU_REAL build");
+`endif
+			if (got !== v) begin
+				errors = errors + 1;
+				$display("FAIL: fpiar = %h, expected %h", got, v);
+			end
+		end
 		else if (key == "#") begin : skipline2
 			integer ch;
 			ch = 0;

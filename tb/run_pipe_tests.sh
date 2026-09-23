@@ -107,6 +107,8 @@ if command -v vasmm68k_mot > /dev/null; then
 		[ -f "$s" ] || continue
 		n=$(basename "$s" .s)
 		[ -f "pipe_asm/$n.exp" ] || continue
+		# fpureal.s answers to the REAL unit, not the stub: its own leg below
+		case "$n" in fpureal*) continue ;; esac
 		( cd pipe_asm && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "../$WORK/$n.bin" "$n.s" ) || { echo "  FAIL  fpu:$n (assembler)"; fail=1; continue; }
 		python3 bin2hex.py "$WORK/$n.bin" "$WORK/$n.hex"
 		cyc=$(sed -n 's/^; diff:.*--cycles \([0-9]*\).*/\1/p' "$s" | head -1)
@@ -124,6 +126,41 @@ if command -v vasmm68k_mot > /dev/null; then
 					echo "  pass  fpubus$p:$n"
 				else
 					echo "  FAIL  fpubus$p:$n  (see $WORK/fpubus_${n}_$p.log)"
+					fail=1
+				fi
+			done
+		fi
+	done
+	# plan M10.1 step 3: the REAL ap040_fpu (rtl/compat/) on the same port
+	# group, instantiated by the same include the wrapper uses, so these
+	# programs drive the instance the bitstream carries.  pipe_asm/fpureal*.s
+	# holds hand-computed IEEE results, which the stub could not produce.
+	FSRC="$SRC $RTL/compat/ap040_fpu.v"
+	iverilog -g2012 -DFPU_REAL -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_pipe_fpr.vvp" tb_ap040_pipe_prog.v $FSRC > "$WORK/tb_pipe_fpr.clog" 2>&1 || {
+		echo "  COMPILE-ERROR fpu-real prog bench"; grep -v "constant selects" "$WORK/tb_pipe_fpr.clog" | head -5; exit 1; }
+	iverilog -g2012 -DFPU_REAL -DBUS_MODE -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_fpr_bus.vvp" tb_ap040_pipe_prog.v $FSRC > "$WORK/tb_fpr_bus.clog" 2>&1 || {
+		echo "  COMPILE-ERROR fpu-real bus bench"; grep -v "constant selects" "$WORK/tb_fpr_bus.clog" | head -5; exit 1; }
+	for s in pipe_asm/fpureal*.s; do
+		[ -f "$s" ] || continue
+		n=$(basename "$s" .s)
+		[ -f "pipe_asm/$n.exp" ] || continue
+		( cd pipe_asm && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "../$WORK/$n.bin" "$n.s" ) || { echo "  FAIL  fpr:$n (assembler)"; fail=1; continue; }
+		python3 bin2hex.py "$WORK/$n.bin" "$WORK/$n.hex"
+		cyc=$(sed -n 's/^; diff:.*--cycles \([0-9]*\).*/\1/p' "$s" | head -1)
+		if timeout 900 vvp "$WORK/tb_pipe_fpr.vvp" +prog="$WORK/$n.hex" +expect="pipe_asm/$n.exp" +cycles=${cyc:-20000} > "$WORK/fpr_$n.log" 2>&1 &&
+		   grep -q "ALL TESTS PASSED" "$WORK/fpr_$n.log"; then
+			echo "  pass  fpr:$n"
+		else
+			echo "  FAIL  fpr:$n  (see $WORK/fpr_$n.log)"
+			fail=1
+		fi
+		if [ -z "${PIPE_NO_BUS:-}" ]; then
+			for p in 0 1 2; do
+				if timeout 1800 vvp "$WORK/tb_fpr_bus.vvp" +prog="$WORK/$n.hex" +expect="pipe_asm/$n.exp" +prof=$p +cycles=$(( ${cyc:-20000} * 8 )) > "$WORK/fprbus_${n}_$p.log" 2>&1 &&
+				   grep -q "ALL TESTS PASSED" "$WORK/fprbus_${n}_$p.log"; then
+					echo "  pass  fprbus$p:$n"
+				else
+					echo "  FAIL  fprbus$p:$n  (see $WORK/fprbus_${n}_$p.log)"
 					fail=1
 				fi
 			done

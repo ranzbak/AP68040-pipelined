@@ -1,0 +1,53 @@
+halt 00000704
+# plan M10.1 step 3.  Every value below is an IEEE bit pattern computed
+# outside the design (python3 Fraction, exactly rounded, round-to-nearest-
+# even, which is FPCR's reset state), not read back from the unit.
+#
+# 1, 2: FP2 = 2.0 + 3.0 = 5.0, extended
+m32 00005100 40010000
+m32 00005104 a0000000
+m32 00005108 00000000
+# 3: FP3 = 3.0 - 2.0 = 1.0
+m32 0000510c 3fff0000
+m32 00005110 80000000
+m32 00005114 00000000
+# 4: FP4 = 2.0 * 3.0 = 6.0
+m32 00005118 40010000
+m32 0000511c c0000000
+m32 00005120 00000000
+# 5: FP5 = 3.0 / 2.0 = 1.5
+m32 00005124 3fff0000
+m32 00005128 c0000000
+m32 0000512c 00000000
+# 6: FP6 = 1.0 / 3.0 extended -- inexact, and rounded UP (...AAAB)
+m32 00005130 3ffd0000
+m32 00005134 aaaaaaaa
+m32 00005138 aaaaaaab
+# 7: the same register as single, then as double: two roundings of one value
+m32 0000513c 3eaaaaab
+m32 00005140 3fd55555
+m32 00005144 55555555
+# 8: a single source, 1.5, converted to extended
+m32 00005148 3fff0000
+m32 0000514c c0000000
+m32 00005150 00000000
+# 9: a double source, 0.25
+m32 00005154 3ffd0000
+m32 00005158 80000000
+m32 0000515c 00000000
+# 11: -2 from a long integer, as extended
+m32 00005160 c0000000
+m32 00005164 80000000
+m32 00005168 00000000
+a1 0000516c
+# both operand loads walked A0 by the OPERAND's length: 12 + 12 + 4 + 8
+a0 00005024
+# 10, 11, 12: the integer conversions back out
+d0 00000064
+d1 fffffffe
+d2 0000fffd
+# the integer work that ran while the divide was in the background
+d4 00000018
+# 13: FPIAR carries the last dispatch's own PC (read hierarchically: no
+# instruction can read it until opclass 100/101 is decoded)
+fpiar 00000700

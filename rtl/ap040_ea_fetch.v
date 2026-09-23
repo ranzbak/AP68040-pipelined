@@ -138,6 +138,11 @@ module ap040_ea_fetch
 	output      [2:0] fp_src_r,
 	output      [2:0] fp_dst_r,
 	output     [95:0] fp_din,
+	// FPIAR: the reference writes it on every dispatch that engages the unit
+	// (lib/AP68040 ap040_core.v, `fpu_iawe`), so a handler -- and the FPSP --
+	// reads the address of the instruction the unit is holding and not zero.
+	output            fp_ia_we,
+	output     [31:0] fp_ia_wdata,
 	input             fp_done,
 	input             fp_accepted,
 	input             fp_unimp,
@@ -1227,6 +1232,17 @@ assign fp_opmode   = i.ext[6:0];
 assign fp_src_fmt  = i.ext[12:10];
 assign fp_src_r    = (i.ext[15:13] == 3'b011) ? i.ext[9:7] : i.ext[12:10];
 assign fp_dst_r    = i.ext[9:7];
+// FPIAR is written with the dispatching instruction's own PC, on the same
+// clock the request goes out; `i` does not move while P_FPU owns the stage,
+// so the PC that rides the pulse is the instruction in the unit.  This is
+// the reference's rule exactly: every `fpu_iawe` in lib/AP68040's
+// ap040_core.v is asserted together with `fpu_req`, and the subset that
+// reaches the unit today (opclass 000/010/011) is all FPIAR-writing.  When
+// opclass 100/101 arrives it must NOT write FPIAR -- a move to or from a
+// control register leaves it alone -- so that decode has to break this
+// equality rather than extend it.
+assign fp_ia_we    = fp_req;
+assign fp_ia_wdata = (HAS_FPU != 0) ? i.pc : 32'd0;
 // where the operand comes from, always LEFT aligned in the 96-bit window:
 // memory (assembled in fp_buf), the instruction stream (the decoder's
 // fpimm -- never a bus access, lib/AP68040 S_FPU_IMM), or a data register.
