@@ -73,6 +73,22 @@ c5e:
 	movea.l	#c6,a5
 c6:	dc.w	$F23A,$F0E0,$0000	; FMOVEM.X FP0-FP2,(d16,PC) -- nor PC-relative
 c6e:
+
+;------------------------------------- 7: a DYNAMIC mask (M10.9).  The count
+; -- and therefore the (An)+ step -- is not known until the instruction runs,
+; which is what the an_ov hook exists for.  The block written by case 2 is
+; read back through a dynamic list and written out again: A5 must move by
+; twelve per SELECTED register, and the images must survive.
+	movea.l	#$5400,a5
+	movea.l	#$5600,a6
+	dc.w	$F23C,$4000,$0000,$0000	; FMOVE.L #0,FP0 -- clear the three first,
+	dc.w	$F23C,$4080,$0000,$0000	; FMOVE.L #0,FP1    so a mask that selects
+	dc.w	$F23C,$4100,$0000,$0000	; FMOVE.L #0,FP2    the wrong registers shows
+	move.l	#$E0,d7			; FP0, FP1, FP2, load convention
+	dc.w	$F21D,$D870		; FMOVEM.X (A5)+,D7  -- the mask comes from D7
+	; ... and OUT through a STATIC list naming FP0-FP2.  A round trip through
+	; the same dynamic mask could not see a permuted one (the M10.7 lesson).
+	dc.w	$F216,$F0E0		; FMOVEM.X FP0-FP2,(A6)
 halt:
 	bra.s	halt
 

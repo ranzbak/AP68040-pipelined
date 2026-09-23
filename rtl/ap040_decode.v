@@ -1390,22 +1390,26 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						if (fp_mvbad) begin
 							d.exc_fmt = 4'd0; d.exc_next = 1'b0;
 						end
-						// A DYNAMIC list (x1[11]) takes its mask from a data
-						// register, which needs a register read before the
-						// transfers and P_FPU does not sequence that: it keeps
-						// M10.0's format $4 frame, the same recorded gap as a
-						// memory-indirect effective address.  Everything a
-						// compiler emits is static.
-						else if (!x1[11] && d.src.kind == EK_MEM && d.src.mi == MI_NONE) begin
+						// (M10.9) A DYNAMIC list takes its mask from a data
+						// register named by x1[6:4], so the count -- and with it
+						// the (An)+ / -(An) step -- is not known until the
+						// instruction runs.  `reg_c` carries the register to
+						// EA-fetch, which reads it on op_c, and the step goes
+						// through the an_ov hook M10.7 built for exactly this.
+						else if (d.src.kind == EK_MEM && d.src.mi == MI_NONE) begin
 							d.cls  = CL_FPU;
 							d.size = SZ_L;
+							if (x1[11]) d.reg_c = {2'b00, x1[6:4]};
 							if (fp_mvst) d.dst = d.src;
 						end
 					end
 					if (d.cls == CL_FPU && x1[15:14] == 2'b11) begin
 						// twelve bytes per selected register -- up to 96, which
 						// is why the explicit step is seven bits wide
-						d.imm[6:0] = {fp_mvn, 3'd0} + {1'b0, fp_mvn, 2'd0};   // 8n + 4n
+						// a static list's step is known here; a dynamic one's
+						// is computed in EA-fetch and applied through an_ov
+						d.imm[6:0] = x1[11] ? 7'd0
+						                    : {fp_mvn, 3'd0} + {1'b0, fp_mvn, 2'd0};   // 8n + 4n
 						d.size = SZ_L;
 					end else if (d.cls == CL_FPU && x1[15:14] == 2'b10) begin
 						// the (An)+ / -(An) step and the beat count: one

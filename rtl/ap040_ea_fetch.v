@@ -1423,6 +1423,15 @@ assign fp_cr_wdata = fp_cwd;
 // A load always maps mask bit 7 to FP0, whatever the mode field says.
 wire        fp_mvm   = (HAS_FPU != 0) && fp_gen && (i.ext[15:14] == 2'b11);
 wire        fp_mvst  = fp_mvm && i.ext[13];
+// (M10.9) a DYNAMIC list: the mask is in the data register `reg_c` names, so
+// the count and the (An)+ / -(An) step are run-time values -- the step goes
+// out through the an_ov hook, which is what it was built for.
+wire        fp_mvdy  = fp_mvm && i.ext[11];
+wire  [7:0] fp_mvmk  = fp_mvdy ? op_c[7:0] : i.ext[7:0];
+wire  [3:0] fp_mvn   = {3'd0, fp_mvmk[7]} + {3'd0, fp_mvmk[6]} + {3'd0, fp_mvmk[5]} +
+                       {3'd0, fp_mvmk[4]} + {3'd0, fp_mvmk[3]} + {3'd0, fp_mvmk[2]} +
+                       {3'd0, fp_mvmk[1]} + {3'd0, fp_mvmk[0]};
+wire  [6:0] fp_mvb12 = {fp_mvn, 3'd0} + {1'b0, fp_mvn, 2'd0};       // 12 x n
 wire        fp_mvpd  = fp_mvst && (i.dst.upd == UPD_PRE);
 wire        fp_lsb   = fp_mvpd;
 wire        fp_rev   = fp_mvst && (i.ext[12] == fp_mvpd);
@@ -1483,7 +1492,12 @@ endfunction
 // FSAVE's base was already walked back by 48 at entry, FRESTORE's An steps by
 // the whole 52 bytes
 wire [31:0] fp_fadr = fp_addr + {26'd0, fp_fn, 2'b00};
-wire [31:0] fp_anv  = fp_sv ? fp_addr : (fp_addr + 32'd52);
+// the effective address as EA-calc gave it, before any frame or list walk
+wire [31:0] fp_addr0 = fp_mem_dst ? d_addr_c : s_addr_c;
+wire [31:0] fp_anv  = fp_mvdy ? ((i.dst.upd == UPD_PRE) || (i.src.upd == UPD_PRE)
+                                ? fp_addr0 - {25'd0, fp_mvb12}
+                                : fp_addr0 + {25'd0, fp_mvb12}) :
+                      fp_sv   ? fp_addr : (fp_addr + 32'd52);
 assign fp_fm_we    = fp_mw;
 assign fp_fm_wdata = fp_mwd;
 // the longword of the selected register this beat carries, reversed when the
@@ -1630,8 +1644,8 @@ wire ex_t fp_w = (fp_stt == FS_WR) ? an_ov(fp_st_uop(x_ord,
                                               (fp_mvm || fp_sv || fp_scc) ? !(fp_crd && fp_k == 2'd3)
                                                                             : (fp_k != fp_beats),
                                               fp_baddr, fp_bdata, fp_bsz),
-                                          fp_frm, fp_anv)
-                                   : an_ov(fp_x, fp_frm, fp_anv);
+                                          fp_frm || fp_mvdy, fp_anv)
+                                   : an_ov(fp_x, fp_frm || fp_mvdy, fp_anv);
 // The unimplemented-instruction and unsupported-data-type faults, with the
 // frames lib/AP68040's go_fp_unimp / go_fp_unsupp use -- both validated on
 // the v24 cputest corpus (PLAN.md D19):
@@ -2072,9 +2086,9 @@ always @(posedge clk) begin
 								// (M10.4) FMOVEM walks a register list, twelve bytes
 								// each: the list is consumed as it goes and the first
 								// register is picked here.
-								fp_list <= i.ext[7:0] & ~(8'd1 << mv_bit(i.ext[7:0], fp_lsb));
-								fp_fsel <= (!fp_mvst || i.ext[12]) ? (3'd7 - mv_bit(i.ext[7:0], fp_lsb))
-								                                   : mv_bit(i.ext[7:0], fp_lsb);
+								fp_list <= fp_mvmk & ~(8'd1 << mv_bit(fp_mvmk, fp_lsb));
+								fp_fsel <= (!fp_mvst || i.ext[12]) ? (3'd7 - mv_bit(fp_mvmk, fp_lsb))
+								                                   : mv_bit(fp_mvmk, fp_lsb);
 								// (M10.3) a PENDING exception is taken in front of this
 								// instruction, so nothing of it starts: no command,
 								// no operand beats, no register list
@@ -2111,7 +2125,14 @@ always @(posedge clk) begin
 									end
 								end
 								else if (fp_rs) fp_stt <= FS_RD;
-								else if (fp_mvm) fp_stt <= fp_mvst ? FS_WR : FS_RD;
+								else if (fp_mvm) begin
+									fp_stt <= fp_mvst ? FS_WR : FS_RD;
+									// (M10.9) a dynamic list's step was not known to
+									// EA-calc, so the base and the register update
+									// are computed here
+									if (fp_mvdy && (i.dst.upd == UPD_PRE))
+										fp_addr <= d_addr_c - {25'd0, fp_mvb12};
+								end
 								else if (fp_cr) begin
 									if (fp_mem_src)      fp_stt <= FS_RD;
 									else if (fp_mem_dst) fp_stt <= FS_WR;
