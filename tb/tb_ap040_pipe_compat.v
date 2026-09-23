@@ -102,8 +102,7 @@ always @(posedge clk) begin
 			else if (shim_irq_lvl == ql && ql > shim_sr[10:8])
 				tb_qual[ql] <= 1;
 		end
-		if ((shim_state == 8'd34) && shim_exc_is_irq &&
-		    !irq_seen_q && shim_irq_lvl_l != 3'd7 &&
+		if (exc_accept && shim_exc_is_irq && shim_irq_lvl_l != 3'd7 &&
 		    shim_irq_lvl_l != 3'd0)
 			tb_qual[shim_irq_lvl_l] <= 0;
 	end
@@ -124,12 +123,11 @@ end
 // land inside the MOVE with a fixed delay, which stopped landing there
 // the moment the core stopped freezing during bus waits (plan A2b-0).
 reg   [6:1] tb_must = 0;
-reg   [1:0] must_age [1:6];
+reg   [7:0] must_age [1:6];
 reg   [7:0] must_prev = 0;
 integer ml;
 initial for (ml = 1; ml <= 6; ml = ml + 1) must_age[ml] = 0;
 always @(posedge clk) begin
-	must_prev <= shim_state;
 	if (!nreset) begin
 		tb_must <= 0;
 		for (ml = 1; ml <= 6; ml = ml + 1) must_age[ml] <= 0;
@@ -140,8 +138,7 @@ always @(posedge clk) begin
 				tb_must[ml] <= 0;
 				must_age[ml] <= 0;
 			end
-			else if ((shim_state == 8'd34) && shim_exc_is_irq &&
-			         must_prev != 8'd34 && shim_irq_lvl_l >= ml) begin
+			else if (exc_accept && shim_exc_is_irq && shim_irq_lvl_l >= ml) begin
 				tb_must[ml] <= 0;
 				must_age[ml] <= 0;
 			end
@@ -152,17 +149,29 @@ always @(posedge clk) begin
 			// and a request raised during stacking is taken at the
 			// handler's entry fetch without ever starting an
 			// instruction.
-			else if (!tb_must[ml] && !shim_in_exc &&
-			         !(shim_state >= 8'd34 && shim_state <= 8'd42) &&
+			else if (!tb_must[ml] && !exc_window &&
 			         shim_irq_lvl == ml && ml > shim_sr[10:8]) begin
 				tb_must[ml] <= 1;
 				must_age[ml] <= 0;
 			end
-			else if (tb_must[ml] && shim_state == 8'd4 &&
-			         must_prev != 8'd4) begin
-				// an instruction started with the claim still held
+			else if (tb_must[ml] && insn_start) begin
+				// An instruction started with the claim still held.  The
+				// reference allowed ONE such start; this pipeline needs a
+				// wider bound and the number is CALIBRATED, not copied:
+				// `irq_take` does not arm while a data read is outstanding
+				// (the M9 operand-read rule, 0bbab45 -- an interrupt must not
+				// land between an instruction's operand read and its
+				// execution), so a run of back-to-back reads legitimately
+				// defers a qualified request.  Measured across the interrupt
+				// programs, the worst case is SIX, in t_irq_pipe's own
+				// read-to-clear test (case 32/33).  Sixteen is therefore well
+				// above anything the design does and far below a LOST hold,
+				// which survives until the program changes the mask or the
+				// device lets go -- dozens of instructions in every one of
+				// these loops.  To re-derive it: widen `must_age`, print the
+				// running maximum here, and run the interrupt programs.
 				must_age[ml] <= must_age[ml] + 1'd1;
-				if (must_age[ml] == 2'd1) begin
+				if (must_age[ml] == 8'd16) begin
 					errors = errors + 1;
 					$display("FAIL: qualified level-%0d request not taken at the next boundary (pc=%h sr=%h)",
 					         ml, dbg_pc, shim_sr);
@@ -300,15 +309,80 @@ ap040_pipe_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
 );
 
 
-// The reference core's internals this bench probes (interrupt, exception,
-// trace and profiling models); the pipelined core has none of them yet
-// (interrupts M9), so they read as idle.
-wire  [7:0] shim_state = 8'd0;
+// The reference core's internals this bench probes.  Most of them were
+// TIED OFF when the bench was ported to the pipelined core, and that is a
+// trap in itself: three interrupt assertions and the IPEND shadow below
+// went on compiling while shadowing NOTHING, and `IPLCAP` kept advertising
+// a cycle-fine injector that could not fire (plan M9.T step 4 (a)).  Every
+// probe this pipeline HAS an equivalent for is now wired to it; the ones it
+// genuinely does not have are named, with the reason, in the plan's bench
+// list rather than left looking alive.
+wire  [7:0] shim_state = 8'd0;           // (no microcoded state machine here:
+                                         //  the assertions below use the named
+                                         //  pipeline events instead)
 wire [15:0] shim_sr = debug_status[47:32];
 wire        shim_ce = 1'b1;
-wire  [2:0] shim_irq_lvl = 3'd0, shim_irq_lvl_l = 3'd0;
-wire        shim_exc_is_irq = 1'b0, shim_in_exc = 1'b0, shim_lk_cyc = 1'b0, shim_epf_pend = 1'b0;
-wire  [7:0] shim_exc_vec = 8'd0;
+// the synchronized level on the pins, and the level an entry accepted
+wire  [2:0] shim_irq_lvl   = dut.core.g_irq.irq_lvl_live;
+wire  [2:0] shim_irq_lvl_l = dut.core.u_eaf.x_lvl;
+wire        shim_exc_is_irq = dut.core.u_eaf.x_irq;
+wire        shim_in_exc     = (dut.core.u_eaf.ph == 4'd2);   // P_EXC
+wire        shim_lk_cyc = 1'b0, shim_epf_pend = 1'b0;
+wire  [7:0] shim_exc_vec = dut.core.u_eaf.x_vec;
+// The three events the reference bench spelled as state numbers:
+//   exc_accept  an exception ENTRY begins           (was state 34, edge)
+//   shim_in_exc it is still being processed         (was 34..42 / in_exc)
+//   insn_start  an instruction leaves EA-fetch      (was state 4, edge)
+reg         in_exc_q = 0;
+always @(posedge clk) in_exc_q <= shim_in_exc;
+wire        exc_accept = shim_in_exc && !in_exc_q;
+wire        insn_start = dut.core.u_eaf.st.fin;
+// ... and the tail of an entry.  The reference bench excluded "states 34..42"
+// because between the acceptance and the cycle the new mask reaches SR the
+// level is still above the OLD mask, and a claim armed there is a phantom.
+// In THIS core that window outlives the phase: EA-fetch leaves P_EXC when it
+// dispatches the entry's final micro-op, and that micro-op's SR write commits
+// one or two clocks later in WB.  So the exclusion runs from entering P_EXC
+// until the entry's SR write has actually landed -- which is the reference's
+// rule stated as what it means rather than as a state range.
+reg         exc_sr_pend = 0;
+reg  [15:0] shim_sr_q = 0;
+always @(posedge clk) shim_sr_q <= shim_sr;
+always @(posedge clk)
+	if (!nreset) exc_sr_pend <= 0;
+	else if (shim_in_exc) exc_sr_pend <= 1;
+	else if (shim_sr != shim_sr_q) exc_sr_pend <= 0;   // the new mask has landed
+wire        exc_window = shim_in_exc || exc_sr_pend;
+// The exception's OWN accesses must be supervisor data (FC=5): its frame
+// stores and its vector read.  Asserted at the source, where they can be told
+// apart from an older instruction's posted store draining through the same
+// port.
+always @(posedge clk) if (nreset) begin
+	if (dut.core.exe_valid && dut.core.exe_o.exc && dut.core.exe_o.st_v &&
+	    dut.core.exe_o.st_fc !== 3'd5) begin
+		errors = errors + 1;
+		$display("FAIL: exception frame store used FC=%0d, expected 5",
+		         dut.core.exe_o.st_fc);
+		result = 2;
+	end
+	if (shim_in_exc && dut.core.u_eaf.rd_req && dut.core.u_eaf.rd_fc !== 3'd5) begin
+		errors = errors + 1;
+		$display("FAIL: exception vector read used FC=%0d, expected 5",
+		         dut.core.u_eaf.rd_fc);
+		result = 2;
+	end
+end
+
+// the handler address this entry read from the vector table, held until the
+// fetch of its first opcode is seen (the FC check in the bus monitor)
+reg  [31:0] exc_target = 0;
+reg         exc_target_v = 0;
+always @(posedge clk)
+	if (!nreset) exc_target_v <= 1'b0;
+	else if (shim_in_exc && dut.core.u_eaf.x_step == 3'd4) begin
+		exc_target   <= dut.core.u_eaf.x_target;
+		exc_target_v <= 1'b1;
+	end
 wire  [3:0] shim_exc_fmt = 4'd0;
 wire [31:0] shim_pc = debug_status[31:0], shim_exc_spc = 32'd0;
 wire [15:0] shim_ir = 16'd0;
@@ -492,8 +566,8 @@ always @(posedge clk) begin
 	end
 	else
 		ipl_idle_for <= 0;
-	irq_seen_q <= (shim_state == 8'd34) && shim_exc_is_irq;
-	if ((shim_state == 8'd34) && shim_exc_is_irq && !irq_seen_q &&
+	irq_seen_q <= exc_accept && shim_exc_is_irq;
+	if (exc_accept && shim_exc_is_irq &&
 	    ipl_idle_for > 16'd12) begin
 		errors = errors + 1;
 		$display("FAIL: interrupt accepted %0d cycles after IPL went idle (phantom)",
@@ -509,7 +583,7 @@ always @(posedge clk) begin
 	// is a phantom.  State 34 is S_EXC0; sr still holds the pre-exception
 	// mask on its first cycle (the throwaway second pass re-enters at
 	// S_EXC1, so it cannot trip this).
-	if ((shim_state == 8'd34) && shim_exc_is_irq && !irq_seen_q &&
+	if (exc_accept && shim_exc_is_irq &&
 	    shim_irq_lvl_l != 3'd7 &&
 	    shim_irq_lvl_l <= shim_sr[10:8] &&
 	    !tb_qual[shim_irq_lvl_l]) begin
@@ -527,6 +601,12 @@ always @(posedge clk) begin
 	// exception path then fails the suite instead of the hardware.
 	// State 178 is S_EPF_FILL, reachable only from exception_prefetch
 	// and from state 179 (S_EPF_GAP, the word-to-word handshake gap).
+	// (M9.T step 4) This one has NO equivalent here and is left inert on
+	// purpose: it guards the reference core's `exception_prefetch` queue
+	// states (178/179), and this pipeline has no such stage -- IF's
+	// prefetch buffer is flushed by the redirect and re-armed by the
+	// handler's own fetch.  Named in the plan's bench list so that it is
+	// not mistaken for a live check.
 	epf_state_q <= shim_state;
 	if (nreset && shim_state == 8'd178 && epf_state_q != 8'd178 &&
 	    epf_state_q != 8'd179 && shim_epf_pend) begin
@@ -666,15 +746,27 @@ always @(posedge clk) begin
 		// Reset vectors, exception frames and exception vectors are
 		// supervisor-data cycles; the first handler opcode is supervisor
 		// program.  This also catches a leaked MOVES SFC/DFC override.
-		if (shim_in_exc) begin
-			if (busstate == 2'b00 && fc !== 3'd6) begin
+		// (M9.T step 4) The FETCH half of this rule had to be restated for a
+		// pipelined core.  The reference asserted that ANY fetch during its
+		// exception states is the handler's first opcode, which is true of a
+		// microcoded core that stops fetching while it stacks.  Here IF keeps
+		// prefetching the INTERRUPTED stream until the entry's redirect goes
+		// out, and if that stream was user code its FC is 2, correctly.  So
+		// the check is aimed at the fetch it was always about: the one at the
+		// handler's entry address, which `exc_target` captures from the
+		// vector read.
+		// The DATA half had to move off the bus for the same reason: a
+		// posted store from the interrupted (user-mode) instruction can
+		// still be draining while the entry stacks, and FC=1 is right for
+		// it.  The rule is about the EXCEPTION's own cycles, so it is
+		// asserted where they are issued -- see `exc_fc_*` below.
+
+		if (exc_target_v && busstate == 2'b00 && addr_out[31:2] == exc_target[31:2]) begin
+			exc_target_v <= 1'b0;
+			if (fc !== 3'd6) begin
 				errors = errors + 1;
-				$display("FAIL: exception handler fetch used FC=%0d, expected 6", fc);
-				result = 2;
-			end
-			else if ((busstate == 2'b10 || busstate == 2'b11) && fc !== 3'd5) begin
-				errors = errors + 1;
-				$display("FAIL: exception/reset data cycle used FC=%0d, expected 5", fc);
+				$display("FAIL: exception handler fetch at %h used FC=%0d, expected 6",
+				         addr_out, fc);
 				result = 2;
 			end
 		end
