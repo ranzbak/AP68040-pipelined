@@ -31,6 +31,10 @@
 
 module ap040_ea_calc
 	import ap040_pipe_pkg::*;
+#(
+	// 1: the FPU is present, so CL_FPU can occur (plan M10.1)
+	parameter HAS_FPU = 0
+)
 (
 	input             clk,
 	input             nreset,
@@ -138,14 +142,21 @@ endfunction
 // one EA: {ea, add (memory indirect), new An value, update?}
 typedef struct packed { logic [31:0] ea; logic [31:0] add; logic [31:0] nv; logic upd; } eares_t;
 
+// nb != 0 overrides the step with an explicit byte count: a floating-point
+// operand is 1, 2, 4, 8 or 12 bytes and the (An)+/-(An) update is by the
+// WHOLE operand, once (lib/AP68040 S_FPU_AN's fp_nb).  The A7 byte rule still
+// applies to the one-byte form.
 function automatic eares_t eacomp(input ea_t e, input logic [1:0] sz, input logic [4:0] rb,
-                                  input logic [31:0] base_v, input logic [31:0] idx_v);
+                                  input logic [31:0] base_v, input logic [31:0] idx_v,
+                                  input logic [31:0] nb);
 	eares_t r;
-	logic [31:0] base, idx;
+	logic [31:0] base, idx, st;
 	base  = e.base_en ? base_v : 32'd0;
 	idx   = e.idx_en ? scaled(idx_v, e.idx_l, e.scale) : 32'd0;
+	st    = (nb == 32'd0) ? step(sz, rb) :
+	        ((nb == 32'd1) && (rb == R_USP || rb == R_ISP || rb == R_MSP)) ? 32'd2 : nb;
 	r.upd = (e.kind == EK_MEM) && (e.upd != UPD_NONE);
-	r.nv  = (e.upd == UPD_PRE) ? base - step(sz, rb) : base + step(sz, rb);
+	r.nv  = (e.upd == UPD_PRE) ? base - st : base + st;
 	r.add = 32'd0;
 	case (e.mi)
 		MI_PRE:  begin r.ea = base + e.bd + idx; r.add = e.od; end
@@ -155,11 +166,16 @@ function automatic eares_t eacomp(input ea_t e, input logic [1:0] sz, input logi
 	return r;
 endfunction
 
-wire eares_t sres = eacomp(id_i.src, id_i.size, r_sb, f_sb[31:0], f_si[31:0]);
+// (M10.1(b)) With HAS_FPU = 0 nothing decodes to CL_FPU, so this folds to a
+// constant zero and the step is the size rule exactly as before -- the
+// comparison must not survive into the LC040 build, because `nb` becomes a
+// mux in the address computation.
+wire [31:0] fp_step = ((HAS_FPU != 0) && (id_i.cls == CL_FPU)) ? {27'd0, id_i.imm[4:0]} : 32'd0;
+wire eares_t sres = eacomp(id_i.src, id_i.size, r_sb, f_sb[31:0], f_si[31:0], fp_step);
 // the destination sees the source's update of the same register
 wire [31:0]  db_v = (sres.upd && r_sb == r_db) ? sres.nv : f_db[31:0];
 wire [31:0]  di_v = (sres.upd && r_sb == r_di) ? sres.nv : f_di[31:0];
-wire eares_t dres = eacomp(id_i.dst, id_i.size2, r_db, db_v, di_v);   // size2: PACK/UNPK
+wire eares_t dres = eacomp(id_i.dst, id_i.size2, r_db, db_v, di_v, fp_step);   // size2: PACK/UNPK
 
 // the result register this instruction will write (w0), for the stages behind
 function automatic logic w0_of(input id_t i);

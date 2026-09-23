@@ -92,6 +92,22 @@ function automatic logic [3:0] fp_imm_words(input logic [2:0] spec);
 	endcase
 endfunction
 
+// The same operand as it sits in MEMORY, in bytes.  It differs from
+// fp_imm_words above for the byte integer only: in the instruction stream it
+// occupies a whole word (the operand is its low half), in memory one byte.
+function automatic logic [4:0] fp_bytes(input logic [2:0] spec);
+	case (spec)
+		3'b000: return 5'd4;    // long-word integer
+		3'b001: return 5'd4;    // single precision
+		3'b010: return 5'd12;   // extended precision
+		3'b011: return 5'd12;   // packed decimal
+		3'b100: return 5'd2;    // word integer
+		3'b101: return 5'd8;    // double precision
+		3'b110: return 5'd1;    // byte integer
+		default: return 5'd0;   // 111: FMOVECR -- no operand
+	endcase
+endfunction
+
 // An FP opmode that no 68040 implements.  1 = the encoding is not a floating-
 // point instruction at all and takes the ordinary F-line (vector 11, format
 // $0); 2 = $78..$7F, which take the ILLEGAL vector 4; 0 = a real FP opmode.
@@ -727,11 +743,12 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 	int ks, kd; elen_t e;
 	logic fsave_ok, frest_ok;   // the coprocessor-id-1 state instructions' legal EA modes
 	logic fp_ireg;              // (M10.1) an FP format that fits in a data register
+	logic [15:0] fpw0;          // ... and the first word of an FP immediate
 	tot = tot_w;
 	op = vbuf[0];
 	x1 = vbuf[1];
 	d = '0;
-	fp_ireg = 1'b0;
+	fp_ireg = 1'b0; fpw0 = 16'd0;
 	s2set = 1'b0; s2 = SZ_L;
 	d.reg_c = R_NONE;
 	d.reg_d = R_NONE;
@@ -1139,20 +1156,41 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				// an illegal EA on a 68040 and stays the F-line.
 				if (HAS_FPU != 0 && d.cls == CL_EXC && d.exc_fmt == 4'd4 &&
 				    op[8:6] == 3'b000) begin
-					// a source/destination format that fits in a data register
+					// (A memory-INDIRECT effective address is excluded: its
+					// pointer fetch would have to happen before the operand
+					// beats, and EA-fetch's FP phase does not sequence that
+					// yet.  Such an encoding keeps M10.0's format $4 frame,
+					// which is a functional gap with an FPU -- recorded in
+					// PLAN.md M10.1 -- on a form no compiler emits.)
+					// a source/destination format that fits in a data register:
+					// B, W, L and single.  Extended, packed and double in Dn
+					// are illegal effective addresses on a 68040 and stay the
+					// F-line.
 					fp_ireg = (x1[12:10] == 3'b000) || (x1[12:10] == 3'b001) ||
 					          (x1[12:10] == 3'b100) || (x1[12:10] == 3'b110);
 					if (x1[15:13] == 3'b000) begin
 						d.cls = CL_FPU; d.size = SZ_L;
-					end else if (x1[15:13] == 3'b010 && fp_ireg && d.src.kind == EK_DREG) begin
+					end else if (x1[15:13] == 3'b010 &&
+					             ((d.src.kind == EK_DREG && fp_ireg) ||
+					              (d.src.kind == EK_MEM && d.src.mi == MI_NONE) ||
+					              d.src.kind == EK_IMM)) begin
 						d.cls = CL_FPU;
-						d.size = (x1[12:10] == 3'b100) ? SZ_W : (x1[12:10] == 3'b110) ? SZ_B : SZ_L;
-					end else if (x1[15:13] == 3'b011 && fp_ireg && d.src.kind == EK_DREG) begin
+					end else if (x1[15:13] == 3'b011 &&
+					             ((d.src.kind == EK_DREG && fp_ireg) ||
+					              (d.src.kind == EK_MEM && d.src.mi == MI_NONE))) begin
 						// opclass 011's EA is the DESTINATION: the core waits
 						// for `done` and writes the FPU's result into it
 						d.cls = CL_FPU;
-						d.size = (x1[12:10] == 3'b100) ? SZ_W : (x1[12:10] == 3'b110) ? SZ_B : SZ_L;
 						d.dst  = d.src;
+					end
+					if (d.cls == CL_FPU && x1[15:13] != 3'b000) begin
+						// the operand's length, which is also the (An)+/-(An)
+						// step (lib/AP68040 S_FPU_AN: fp_nb, with the A7 byte
+						// rule), and the micro-op size for the 1/2/4-byte forms
+						d.imm[4:0] = fp_bytes(x1[12:10]);
+						d.size = (x1[12:10] == 3'b100) ? SZ_W : (x1[12:10] == 3'b110) ? SZ_B : SZ_L;
+					end else if (d.cls == CL_FPU) begin
+						d.imm[4:0] = 5'd0;
 					end
 				end
 				// The source EA is kept ONLY for a format $4 frame, which
@@ -1162,6 +1200,24 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				// FBcc, FTRAPcc, and an immediate source, NOT the address of
 				// the immediate data), or for a CL_FPU instruction whose
 				// source operand it is.
+				// (M10.1(b)) an immediate source is already in the decoder's
+				// word buffer: the 68040 takes it from its prefetch, never
+				// with a data read (lib/AP68040 S_FPU_IMM).  ks is the index
+				// of the first EA word, and the operand is LEFT aligned in the
+				// unit's 96-bit window -- the byte form's operand is the LOW
+				// half of its one word.
+				if (d.cls == CL_FPU && d.src.kind == EK_IMM) begin
+					fpw0 = vbuf[ks];
+					case (x1[12:10])
+						3'b110:  d.fpimm = {fpw0[7:0], 88'd0};
+						3'b100:  d.fpimm = {vbuf[ks], 80'd0};
+						3'b101:  d.fpimm = {vbuf[ks], vbuf[ks+1], vbuf[ks+2], vbuf[ks+3], 32'd0};
+						3'b010,
+						3'b011:  d.fpimm = {vbuf[ks], vbuf[ks+1], vbuf[ks+2],
+						                    vbuf[ks+3], vbuf[ks+4], vbuf[ks+5]};
+						default: d.fpimm = {vbuf[ks], vbuf[ks+1], 64'd0};
+					endcase
+				end
 				if (d.cls == CL_FPU) begin
 					// An FP instruction SERIALISES: it waits in EA-fetch until
 					// everything older has committed before the request goes

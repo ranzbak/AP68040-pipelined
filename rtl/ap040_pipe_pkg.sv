@@ -148,6 +148,15 @@ typedef struct packed {
 	logic [4:0]  reg_c;        // a third register operand (CAS Du, DIV.L Dr, MUL.L Dh, BF offset)
 	logic [4:0]  reg_d;        // a fourth (bitfield width)
 	logic [15:0] ext2;         // second extension word (CAS2)
+	// (M10.1(b)) a floating-point IMMEDIATE source, left aligned: up to six
+	// extension words, which is more than `imm`, `ext` and `ext2` together
+	// hold.  It is read from the instruction stream, never from the bus --
+	// the 68040 has those words in its prefetch already (lib/AP68040
+	// ap040_core.v S_FPU_IMM), and a data read of them would translate under
+	// the data TTRs and show on the bus as an access the instruction does not
+	// make.  Written only with HAS_FPU = 1; constant zero otherwise, so the
+	// LC040 build synthesises it away.
+	logic [95:0] fpimm;
 } id_t;
 
 typedef struct packed {

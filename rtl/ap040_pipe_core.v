@@ -460,7 +460,7 @@ wire        fw_ccr_v;
 wire  [4:0] fw_ccr;
 wire ex_w0_pend = eaf_valid && (eaf_o.dk == DK_REG || eaf_o.cls == CL_DBCC || eaf_o.cls == CL_SCC);
 
-ap040_ea_calc u_eac
+ap040_ea_calc #(.HAS_FPU(HAS_FPU)) u_eac
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(eaf_stall), .flush(flush_eac),
 	.id_valid(id_valid), .id_i(id_o),
@@ -561,7 +561,7 @@ always @(posedge clk)
 	if (!nreset) smc_pend <= 1'b0;
 	else if (ce && retire) smc_pend <= !exe_o.last && (smc_pend || smc_hit);
 
-ap040_execute u_ex
+ap040_execute #(.HAS_FPU(HAS_FPU)) u_ex
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(wb_hold), .wb_drop(wb_fault), .in_drop(wb_smc),
 	.eaf_valid(eaf_valid), .x(eaf_o),

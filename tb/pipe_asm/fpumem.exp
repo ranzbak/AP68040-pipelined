@@ -1,0 +1,44 @@
+halt 00000476
+# plan M10.1(b).  Hand written: the values are the stub unit's defined
+# semantics (tb/tb_fpu_stub.v) -- the wide formats round-trip byte for byte,
+# the integer formats by value -- and the exception case is a set of DELTAS
+# against the frame lib/AP68040's go_fp_unimp builds, so a correct core
+# writes zeros there and no absolute address appears in that part.
+#
+# an immediate operand comes from the instruction stream, never from a data
+# read: these are the first and last bytes of the two immediates
+noread 00000442
+noread 00000445
+noread 00000450
+noread 0000045b
+# 1, 2: twelve bytes in and twelve out, in order
+m32 00005100 11112222
+m32 00005104 33334444
+m32 00005108 55556666
+# 3: eight
+m32 0000510c aaaabbbb
+m32 00005110 ccccdddd
+# 4: two bytes in, four out -- the word integer converted
+m32 00005114 00001234
+# 6: -(A2), twelve bytes from $5200
+m32 00005118 77778888
+m32 0000511c 9999aaaa
+m32 00005120 bbbbcccc
+# 8: the twelve-byte immediate, written back
+m32 00005124 40018000
+m32 00005128 00000000
+m32 0000512c 00000000
+a1 00005130
+# 6: the one-byte operand on A7 steps by 2
+d5 00000002
+# 7: the immediate long, round-tripped through FP4
+d2 12345678
+# 5, 9: (An)+ stepped by 12 + 8 + 2 + 12, the last one on an instruction the
+# unit could not execute -- the update stands
+a0 00005022
+d6 00005022
+a2 00005200
+# 9: vector 11, format $2, the next instruction's PC, the OPERAND's address
+m32 00007000 00000000
+m32 00007004 00000000
+m32 00007008 00000000

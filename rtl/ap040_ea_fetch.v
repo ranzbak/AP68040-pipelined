@@ -225,9 +225,17 @@ reg        rst_pending;    // reset sequence still to run
 reg        fp_sent;
 reg        fp_acc;         // accepted seen: classification is past
 reg        fp_dn;          // done seen
-reg [95:0] fp_res;         // ... and its result
+reg [95:0] fp_buf;         // the memory operand under assembly, then the result
 reg        fp_bg;          // a RELEASED operation is still running
 wire       fp_live = fp_sent && !fp_req;
+// (M10.1(b)) the operand path: a memory operand is 1, 2, 4, 8 or 12 bytes,
+// so up to three longword beats, assembled LEFT aligned because that is what
+// the unit's din window wants.  fp_addr is the saved EA -- an access error
+// mid-operand is an ordinary one and the restart re-reads from here.
+localparam [1:0] FS_RD = 2'd0, FS_REQ = 2'd1, FS_WR = 2'd2;
+reg  [1:0] fp_stt;
+reg  [1:0] fp_k;           // beat index
+reg [31:0] fp_addr;
 
 // exception parameters (latched when an exception sequence starts)
 reg  [7:0] x_vec;
@@ -1219,12 +1227,28 @@ assign fp_opmode   = i.ext[6:0];
 assign fp_src_fmt  = i.ext[12:10];
 assign fp_src_r    = (i.ext[15:13] == 3'b011) ? i.ext[9:7] : i.ext[12:10];
 assign fp_dst_r    = i.ext[9:7];
-// the integer source operand, LEFT aligned as the unit's din window wants
-assign fp_din      = (i.size == SZ_B) ? {op_a[7:0],  88'd0} :
+// where the operand comes from, always LEFT aligned in the 96-bit window:
+// memory (assembled in fp_buf), the instruction stream (the decoder's
+// fpimm -- never a bus access, lib/AP68040 S_FPU_IMM), or a data register.
+wire        fp_mem_src = (i.ext[15:13] == 3'b010) && (i.src.kind == EK_MEM);
+wire        fp_mem_dst = (i.ext[15:13] == 3'b011) && (i.dst.kind == EK_MEM);
+assign fp_din      = fp_mem_src             ? fp_buf :
+                     (i.src.kind == EK_IMM) ? i.fpimm :
+                     (i.size == SZ_B) ? {op_a[7:0],  88'd0} :
                      (i.size == SZ_W) ? {op_a[15:0], 80'd0} : {op_a[31:0], 64'd0};
 // ... and the result, taken from the left of the dout window by size
-wire [31:0] fp_rv  = (i.size == SZ_B) ? {24'd0, fp_res[95:88]} :
-                     (i.size == SZ_W) ? {16'd0, fp_res[95:80]} : fp_res[95:64];
+wire [31:0] fp_rv  = (i.size == SZ_B) ? {24'd0, fp_buf[95:88]} :
+                     (i.size == SZ_W) ? {16'd0, fp_buf[95:80]} : fp_buf[95:64];
+// the operand's length in bytes, and the beats it takes on the bus
+wire  [4:0] fp_nb    = i.imm[4:0];
+wire  [1:0] fp_beats = (fp_nb <= 5'd4) ? 2'd1 : (fp_nb == 5'd8) ? 2'd2 : 2'd3;
+wire  [1:0] fp_bsz   = (fp_nb == 5'd1) ? SZ_B : (fp_nb == 5'd2) ? SZ_W : SZ_L;
+wire [31:0] fp_baddr = (fp_nb <= 5'd2) ? fp_addr : (fp_addr + {28'd0, fp_k, 2'b00});
+wire [31:0] fp_bdata = (fp_nb == 5'd1) ? {24'd0, fp_buf[95:88]} :
+                       (fp_nb == 5'd2) ? {16'd0, fp_buf[95:80]} :
+                       (fp_k == 2'd0)  ? fp_buf[95:64] :
+                       (fp_k == 2'd1)  ? fp_buf[63:32] : fp_buf[31:0];
+wire        fp_blast = (fp_k == fp_beats - 2'd1);
 // opclass 011 stores the FPU's answer, so it waits for `done`; everything
 // else leaves the unit running and is released at `accepted`
 wire        fp_need_res = (i.ext[15:13] == 3'b011);
@@ -1235,30 +1259,76 @@ function automatic ex_t fpu_uop(input ex_t x0, input logic [31:0] rv);
 	return y;
 endfunction
 wire ex_t fp_x = fpu_uop(x_ord, fp_rv);
+// the (An)+ / -(An) update ALONE.  It is dispatched in front of an unimp or
+// unsupp exception, because the update STANDS on both (lib/AP68040
+// ap040_core.v:4593-4625), and as the trailing micro-op of a memory store, so
+// that an access error on any beat leaves An as it was and the restart
+// recalculates the same effective address.
+function automatic ex_t fp_upd_uop(input ex_t x0, input logic last);
+	ex_t y;
+	y = x0;
+	y.dk = DK_NONE; y.dr = R_NONE; y.st_v = 1'b0; y.redirect = 1'b0;
+	y.wr_ccr = 1'b0; y.cls = CL_NOP; y.last = last;
+	return y;
+endfunction
+// one beat of a memory store, or the trailing update micro-op
+function automatic ex_t fp_st_uop(input ex_t x0, input logic beat, input logic [31:0] a,
+                                  input logic [31:0] d, input logic [1:0] sz);
+	ex_t y;
+	y = fp_upd_uop(x0, !beat);
+	if (beat) begin
+		y.u0_v = 1'b0; y.u1_v = 1'b0;      // they ride the trailing micro-op
+		y.st_v = 1'b1; y.st_addr = a; y.st_data = d; y.st_size = sz;
+	end
+	return y;
+endfunction
+wire ex_t fp_w = (fp_stt == FS_WR) ? fp_st_uop(x_ord, fp_k != fp_beats, fp_baddr, fp_bdata, fp_bsz)
+                                   : fp_x;
 // The unimplemented-instruction and unsupported-data-type faults, with the
 // frames lib/AP68040's go_fp_unimp / go_fp_unsupp use -- both validated on
 // the v24 cputest corpus (PLAN.md D19):
 //   unimp  vector 11, format $2, the NEXT instruction's PC, and the operand
 //          EA, or the faulting instruction's own PC when it has none;
 //   unsupp vector 55, format $3, the next PC, and the EA or zero.
-function automatic stp_t fp_st(input stp_t t0, input logic inph, input logic got, input logic stall,
+function automatic stp_t fp_st(input stp_t t0, input logic inph, input logic stall,
                                input logic live, input logic unimp, input logic unsupp,
-                               input logic [31:0] npc, input logic [31:0] ea_u, input logic [31:0] ea_s);
+                               input logic [31:0] npc, input logic [31:0] ea_u, input logic [31:0] ea_s,
+                               input logic rd_go, input logic [31:0] ra, input logic [1:0] rsz,
+                               input logic wr_go, input logic wr_fin,
+                               input logic got, input logic mem_dst);
 	stp_t t;
 	t = t0;
 	if (inph) begin
 		t = '0;
-		if (live && unimp) begin
-			t.exc_go = 1'b1; t.ev = 8'd11; t.ef = 4'd2; t.epc = npc; t.eaddr = ea_u;
-		end else if (live && unsupp) begin
-			t.exc_go = 1'b1; t.ev = 8'd55; t.ef = 4'd3; t.epc = npc; t.eaddr = ea_s;
-		end else if (got && !stall) begin
+		if (live && (unimp || unsupp)) begin
+			// Both faults are reported AFTER the operand has been fetched, so
+			// the (An)+ / -(An) update stands: it is dispatched here, in front
+			// of the exception, exactly as a trapping CHK's micro-op is
+			// (lib/AP68040 ap040_core.v:4593-4625 and its S_FPU_GO comment).
+			if (!stall) begin
+				t.disp = 1'b1; t.dsel = 3'd6;
+				t.exc_go = 1'b1;
+				t.ev    = unimp ? 8'd11 : 8'd55;
+				t.ef    = unimp ? 4'd2  : 4'd3;
+				t.epc   = npc;
+				t.eaddr = unimp ? ea_u : ea_s;
+			end
+		end else if (rd_go) begin
+			t.issue = 1'b1; t.it = T_SLD; t.ia = ra; t.isz = rsz;
+		end else if (wr_go) begin
+			if (!stall) begin t.disp = 1'b1; t.dsel = 3'd4; t.fin = wr_fin; end
+		end else if (got && !mem_dst && !stall) begin
 			t.disp = 1'b1; t.dsel = 3'd4; t.fin = 1'b1;
 		end
 	end
 	return t;
 endfunction
-wire [31:0] fp_ea = (i.src.kind == EK_MEM) ? s_addr_c : 32'd0;
+// the effective address the two faults report: the operand's, when it has
+// one.  unimp puts the faulting instruction's own PC there instead when it
+// does not (lib/AP68040 go_fp_unimp: `fp_ea_v ? t_a : pc_i`); unsupp puts
+// zero (go_fp_unsupp).  fp_addr is the saved EA, which is also what a
+// restart after a mid-operand access error recalculates.
+wire        fp_ea_v = fp_mem_src || fp_mem_dst;
 
 function automatic stp_t aerr_st(input stp_t t0, input logic go, input id_t i, input logic [31:0] fa);
 	stp_t t;
@@ -1319,8 +1389,11 @@ wire [31:0] irq_take_pc = (ph == P_STOP) ? i.next_pc : i.pc;
 wire irq_go = irq_take && eac_v_use && !rst_pending && !older_busy &&
               ((ph == P_START) || (ph == P_STOP));
 wire stp_t st = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in),
-                                     ph == P_FPU, fp_ok, stall_in, fp_live, fp_unimp, fp_unsupp,
-                                     i.next_pc, (i.src.kind == EK_MEM) ? s_addr_c : i.pc, fp_ea),
+                                     (HAS_FPU != 0) && (ph == P_FPU), stall_in, fp_live, fp_unimp, fp_unsupp,
+                                     i.next_pc, fp_ea_v ? fp_addr : i.pc, fp_ea_v ? fp_addr : 32'd0,
+                                     (fp_stt == FS_RD) && !rd_pend, fp_baddr, fp_bsz,
+                                     (fp_stt == FS_WR), (fp_k == fp_beats),
+                                     fp_ok, fp_mem_dst),
                                irq_go, irq_take_lvl, irq_take_pc), aerr_go, i, rd_a_q);
 
 //--------------------------------------------------------------- PFLUSH / PTEST
@@ -1388,10 +1461,10 @@ wire ex_t disp_x0 = dmux(st.dsel, x_ord,
                         exc_uop(i, x_k, x_sp, x_sr, x_pc, x_fmt, x_vec, x_addr, x7[(x_k < 4'd2) ? 4'd2 : x_k]),
                         exc_final(i, x_bank, x_sp, x_sr, x_target, x_irq, x_lvl),
                         rte_final(i, bank_now, rd_a, r_fv, r_sr, r_pc),
-                        (ph == P_FPU) ? fp_x :
+                        ((HAS_FPU != 0) && (ph == P_FPU)) ? fp_w :
                         (ph == P_PMMU || ph == P_CINV) ? pm_x : reset_final(i, x_sp, r_pc),
                         ccr_only_uop(x_ord),
-                        no_last(x_ord),
+                        ((HAS_FPU != 0) && (ph == P_FPU)) ? fp_upd_uop(x_ord, 1'b0) : no_last(x_ord),
                         mm_x);
 // every store's function code: the frame stores and ordinary stores are
 // data in the current mode (the frame: supervisor), MOVES: DFC
@@ -1487,7 +1560,8 @@ always @(posedge clk) begin
 		pt_req <= 1'b0; pt_write <= 1'b0; pt_addr <= 32'd0; pf_req <= 1'b0; pf_mode <= 2'd0; pf_addr <= 32'd0;
 		pm_sent <= 1'b0; pm_got <= 1'b0; pm_mmusr <= 32'd0;
 		cinv_req <= 1'b0; cinv_ic <= 1'b0; cinv_dc <= 1'b0;
-		fp_req <= 1'b0; fp_sent <= 1'b0; fp_acc <= 1'b0; fp_dn <= 1'b0; fp_res <= 96'd0; fp_bg <= 1'b0;
+		fp_req <= 1'b0; fp_sent <= 1'b0; fp_acc <= 1'b0; fp_dn <= 1'b0; fp_buf <= 96'd0; fp_bg <= 1'b0;
+		fp_stt <= FS_RD; fp_k <= 2'd0; fp_addr <= 32'd0;
 		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
 		irq_take <= 1'b0; irq_take_lvl <= 3'd0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
@@ -1572,8 +1646,14 @@ always @(posedge clk) begin
 							// running, which is also what keeps FBcc/FScc from
 							// reading a live `fpcc`.
 							if (!fp_bg) begin
-								ph <= P_FPU; fp_req <= 1'b1;
-								fp_sent <= 1'b0; fp_acc <= 1'b0; fp_dn <= 1'b0;
+								ph <= P_FPU;
+								fp_sent <= 1'b0; fp_acc <= 1'b0; fp_dn <= 1'b0; fp_k <= 2'd0;
+								// the saved effective address: the operand's,
+								// and what a restart after a mid-operand
+								// access error recalculates
+								fp_addr <= fp_mem_dst ? d_addr_c : s_addr_c;
+								if (fp_mem_src) fp_stt <= FS_RD;             // beats first
+								else begin fp_stt <= FS_REQ; fp_req <= 1'b1; end
 							end
 						end else if (!st.exc_go && i.cls == CL_RTE) begin
 							ph <= P_RTE; r_step <= 3'd0;
@@ -1635,7 +1715,7 @@ always @(posedge clk) begin
 						cinv_req <= 1'b0; pm_got <= 1'b1;
 					end
 				end
-				P_FPU: begin
+				P_FPU: if (HAS_FPU != 0) begin
 					// the request is a one-clock pulse; fp_sent goes up the
 					// clock after it, so a `done` or `unimp` still standing
 					// from the previous operation is never read as this one's
@@ -1643,8 +1723,26 @@ always @(posedge clk) begin
 					if (fp_req) fp_sent <= 1'b1;
 					if (fp_live) begin
 						if (fp_accepted) fp_acc <= 1'b1;
-						if (fp_done) begin fp_dn <= 1'b1; fp_res <= fp_dout; end
+						if (fp_done) begin fp_dn <= 1'b1; fp_buf <= fp_dout; end
 					end
+					// the memory operand, LEFT aligned: one byte, one word, or
+					// one, two or three longwords
+					if (fp_stt == FS_RD && cap && rd_tag == T_SLD) begin
+						case (fp_nb)
+							5'd1: fp_buf[95:88] <= rd_data[7:0];
+							5'd2: fp_buf[95:80] <= rd_data[15:0];
+							default: case (fp_k)
+								2'd0:    fp_buf[95:64] <= rd_data;
+								2'd1:    fp_buf[63:32] <= rd_data;
+								default: fp_buf[31:0]  <= rd_data;
+							endcase
+						endcase
+						if (fp_blast) begin fp_stt <= FS_REQ; fp_req <= 1'b1; fp_k <= 2'd0; end
+						else          fp_k <= fp_k + 2'd1;
+					end
+					// the answer is in and the destination is memory: store it
+					if (fp_stt == FS_REQ && fp_ok && fp_mem_dst) begin fp_stt <= FS_WR; fp_k <= 2'd0; end
+					if (fp_stt == FS_WR && st.disp) fp_k <= fp_k + 2'd1;
 				end
 				P_PMMU: begin
 					if (!pm_sent && bus_idle) begin
@@ -1738,8 +1836,8 @@ always @(posedge clk) begin
 			end
 			// (M10.1(c)) the released operation: `fp_bg` holds the next FP
 			// instruction back until the unit answers, and nothing else does.
-			if (ph == P_FPU && st.disp && st.fin) fp_bg <= !(fp_dn || fp_done);
-			else if (fp_bg && fp_done)            fp_bg <= 1'b0;
+			if (HAS_FPU != 0 && ph == P_FPU && st.disp && st.fin) fp_bg <= !(fp_dn || fp_done);
+			else if (HAS_FPU != 0 && fp_bg && fp_done)            fp_bg <= 1'b0;
 			if (aerr_dbl || wf_dbl) ph <= P_HALT;
 			if (ph != P_RTE && eac_v_use && cm_hit && (st.fin || st.exc_go || st0.mm_go)) cm_v <= 1'b0;
 			if (st.fin) begin

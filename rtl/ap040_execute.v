@@ -18,6 +18,13 @@
 
 module ap040_execute
 	import ap040_pipe_pkg::*;
+#(
+	// 1: the FPU is present, so CL_FPU can occur (plan M10.1).  With 0 it
+	// cannot, and the arm below folds away -- which matters, because this
+	// stage's result mux sits on the EA-fetch -> IF redirect path that M11.1
+	// exists to keep short.
+	parameter HAS_FPU = 0
+)
 (
 	input             clk,
 	input             nreset,
@@ -267,7 +274,7 @@ always @* begin
 		// (M10.1) a floating-point instruction: EA-fetch ran the unit and put
 		// its result, already right-aligned by size, in x.c.  Nothing here
 		// touches the CCR -- the FP condition codes live in the FPSR.
-		CL_FPU: begin
+		CL_FPU: if (HAS_FPU != 0) begin
 			if (x.dk == DK_REG) begin
 				w.w0_v = 1'b1; w.w0_r = x.dr; w.w0_val = merge(x.b, x.c, x.size);
 			end else if (x.dk == DK_MEM) begin
