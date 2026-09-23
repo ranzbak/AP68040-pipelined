@@ -27,7 +27,7 @@ module ap040_pipe_tg68k_compat
 	// gate image; 1 costs one clock on RTS/RTD/RTR, a memory-indirect JMP/JSR
 	// and a wrongly guessed Bcc/DBcc, and takes the memory acknowledge off the
 	// path that fans out into IF's prefetch queue.
-	parameter AP040_REDIR_REG    = 0,
+	parameter AP040_REDIR_REG    = 1,
 	parameter AP040_ENABLE_CACHE = 1,
 	parameter AP040_FAST_SIM     = 0,
 	// X3.3 A2b-1: stores to cacheable pages are acknowledged early and

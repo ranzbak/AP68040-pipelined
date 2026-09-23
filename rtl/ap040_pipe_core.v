@@ -40,7 +40,7 @@ module ap040_pipe_core
 	// plan M11.1: register EA-fetch's redirect (one clock on RTS/RTD/RTR, a
 	// memory-indirect JMP/JSR and a wrongly guessed Bcc/DBcc, in exchange for
 	// taking the memory acknowledge off the path into IF's prefetch queue)
-	parameter         REDIR_REG          = 0,
+	parameter         REDIR_REG          = 1,
 	// 1: the interrupt inputs are live (the wrapper); 0: tied off (the L1
 	// benches leave ipl unconnected)
 	parameter         IRQ                = 0,
