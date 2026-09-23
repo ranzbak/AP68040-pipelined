@@ -1,0 +1,30 @@
+halt 000004aa
+# plan M10.3.  Two enabled arithmetic exceptions are taken, each checked as
+# a DELTA against the rule -- the format/vector word and the stacked PC --
+# so this part holds zeros and no absolute address.
+m32 00007000 00000002
+m32 00007004 00000000
+m32 00007008 00000000
+# the first trap's raw frame, written out once so the expected values are
+# visible and not only implied: format $0, vector 50 (DZ) = $00C8, and the
+# PC of the instruction after the divide ($44C).  Case 2's own delta pins
+# the other shape down: its stacked PC is the LATER floating-point
+# instruction ($482), not the integer work in between, which is the
+# pre-instruction delivery of a released operation's exception.
+m32 0000700c 000000c8
+m32 00007010 0000044c
+# 3: with the enables cleared the same divide runs to 1.0 / 3.0 ...
+m32 00005100 3ffd0000
+m32 00005104 aaaaaaaa
+m32 00005108 aaaaaaab
+# ... FP2 is 2.0, so the instruction the POST-instruction trap returned to
+# ran exactly once ...
+m32 0000510c 40000000
+m32 00005110 80000000
+m32 00005114 00000000
+# ... and FP3 is 7.0, so the instruction the PRE-instruction trap was taken
+# in front of ran after the RTE, exactly once
+m32 00005118 40010000
+m32 0000511c e0000000
+m32 00005120 00000000
+a1 00005124

@@ -154,6 +154,11 @@ module ap040_ea_fetch
 	input             fp_accepted,
 	input             fp_unimp,
 	input             fp_unsupp,
+	// (M10.3) an ENABLED arithmetic exception, vectors 48-54.  It can arrive
+	// while the instruction is still here, or after it was released -- those
+	// are different exceptions to the architecture and are handled apart.
+	input             fp_exc_req,
+	input       [7:0] fp_exc_vec,
 	input      [95:0] fp_dout,
 	// cache maintenance (M8): CINV / CPUSH drive the wrapper's cache port
 	output reg        cinv_req,
@@ -253,6 +258,16 @@ reg [31:0] fp_addr;
 // register and immediate forms that touch no bus -- but nothing is sent to
 // the unit's COMMAND port, so `fp_crd` (all transfers complete) stands in
 // for the interlock's `fp_ok` and FPIAR is not written (ia_we = fp_req).
+// (M10.3) the enabled arithmetic exceptions.  `fp_ae` is this instruction's
+// own, latched the way fp_acc and fp_dn are so that it is seen in the same
+// clock as a release that would otherwise win; `fp_pend` is one a RELEASED
+// operation raised after its instruction had left, which becomes a
+// PRE-instruction exception in front of the next floating-point instruction
+// (lib/AP68040 ap040_core.v:1944 and :3600).
+reg        fp_ae;
+reg  [7:0] fp_avec;
+reg        fp_pend;
+reg  [7:0] fp_pvec;
 reg        fp_cw;          // a control-register write goes out this clock
 reg  [1:0] fp_csel;        // ... to this register: captured with the data, so
                            //     the beat index may advance on the same edge
@@ -1358,12 +1373,39 @@ function automatic stp_t fp_st(input stp_t t0, input logic inph, input logic sta
                                input logic [31:0] npc, input logic [31:0] ea_u, input logic [31:0] ea_s,
                                input logic rd_go, input logic [31:0] ra, input logic [1:0] rsz,
                                input logic wr_go, input logic wr_fin,
-                               input logic got, input logic mem_dst);
+                               input logic got, input logic mem_dst,
+                               input logic pend, input logic [7:0] pvec, input logic [31:0] ipc,
+                               input logic aexc, input logic [7:0] avec, input logic st_dst);
 	stp_t t;
 	t = t0;
 	if (inph) begin
 		t = '0;
-		if (live && (unimp || unsupp)) begin
+		// (M10.3) an enabled arithmetic exception left over from a RELEASED
+		// operation is taken in front of THIS instruction, which has not
+		// started: pre-instruction, format $0, its own PC, and FPIAR still
+		// names the one that faulted (lib/AP68040 ap040_core.v:3600).  It is
+		// raised here, inside P_FPU, and NOT as a term in the dispatch chain:
+		// that chain is the core's longest path and build m9s measured about
+		// 0.9 ns for one term in it.
+		if (pend) begin
+			t.exc_go = 1'b1; t.ev = pvec; t.ef = 4'd0; t.epc = ipc; t.eaddr = 32'd0;
+		end
+		// ... and one THIS instruction raised before it could be released is
+		// post-instruction: format $0 with the NEXT instruction's PC
+		// (ap040_core.v:4217, whose condition is `fpu_exc_req && !fp_st`).
+		// A STORE with an enabled exception is the reference's other three
+		// arms -- format $3, the operand's EA, and the destination written
+		// first or not depending on the class -- and is NOT built here: the
+		// unit pulses `done` on that path (`ap040_fpu.v:2156`), so the store
+		// completes and the trap is dropped rather than hanging.  Recorded as
+		// the remaining gap of M10.3.  No (An)+ / -(An) update rides it: the reference
+		// commits one on every other arm of that state and not on this one,
+		// which in this pipeline happens by itself, because the update rides a
+		// dispatch micro-op that never goes out.
+		else if (live && aexc && !mem_dst && !st_dst) begin
+			t.exc_go = 1'b1; t.ev = avec; t.ef = 4'd0; t.epc = npc; t.eaddr = 32'd0;
+		end
+		else if (live && (unimp || unsupp)) begin
 			// Both faults are reported AFTER the operand has been fetched, so
 			// the (An)+ / -(An) update stands: it is dispatched here, in front
 			// of the exception, exactly as a trapping CHK's micro-op is
@@ -1456,7 +1498,9 @@ wire stp_t st = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm
                                      i.next_pc, fp_ea_v ? fp_addr : i.pc, fp_ea_v ? fp_addr : 32'd0,
                                      (fp_stt == FS_RD) && !rd_pend && !(fp_cr && fp_crd), fp_baddr, fp_bsz,
                                      (fp_stt == FS_WR), (fp_k == fp_beats),
-                                     fp_ok, fp_mem_dst),
+                                     fp_ok, fp_mem_dst,
+                                     (HAS_FPU != 0) && fp_pend, fp_pvec, i.pc,
+                                     (HAS_FPU != 0) && fp_ae, fp_avec, fp_need_res),
                                irq_go, irq_take_lvl, irq_take_pc), aerr_go, i, rd_a_q);
 
 //--------------------------------------------------------------- PFLUSH / PTEST
@@ -1626,6 +1670,7 @@ always @(posedge clk) begin
 		fp_req <= 1'b0; fp_sent <= 1'b0; fp_acc <= 1'b0; fp_dn <= 1'b0; fp_buf <= 96'd0; fp_bg <= 1'b0;
 		fp_stt <= FS_RD; fp_k <= 2'd0; fp_addr <= 32'd0;
 		fp_cw <= 1'b0; fp_csel <= 2'd0; fp_cwd <= 32'd0; fp_crd <= 1'b0;
+		fp_ae <= 1'b0; fp_avec <= 8'd0; fp_pend <= 1'b0; fp_pvec <= 8'd0;
 		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
 		irq_take <= 1'b0; irq_take_lvl <= 3'd0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
@@ -1712,6 +1757,7 @@ always @(posedge clk) begin
 							if (!fp_bg) begin
 								ph <= P_FPU;
 								fp_sent <= 1'b0; fp_acc <= 1'b0; fp_dn <= 1'b0; fp_k <= 2'd0;
+								fp_ae <= 1'b0;
 								// the saved effective address: the operand's,
 								// and what a restart after a mid-operand
 								// access error recalculates
@@ -1727,6 +1773,10 @@ always @(posedge clk) begin
 									else if (fp_mem_dst) fp_stt <= FS_WR;
 									else                 fp_stt <= FS_REQ;
 								end
+								// (M10.3) a PENDING exception is taken in front of this
+								// instruction, so nothing of it starts: no command and
+								// no operand beats
+								else if (fp_pend) ;
 								else if (fp_mem_src) fp_stt <= FS_RD;        // beats first
 								else begin fp_stt <= FS_REQ; fp_req <= 1'b1; end
 							end
@@ -1799,7 +1849,12 @@ always @(posedge clk) begin
 					if (fp_live) begin
 						if (fp_accepted) fp_acc <= 1'b1;
 						if (fp_done) begin fp_dn <= 1'b1; fp_buf <= fp_dout; end
+						// (M10.3) latched like the other two, because the unit can
+						// raise it in the same clock as `accepted` and it must win
+						// over the release that clock would otherwise cause
+						if (fp_exc_req) begin fp_ae <= 1'b1; fp_avec <= fp_exc_vec; end
 					end
+					if (fp_pend && st.exc_go) fp_pend <= 1'b0;
 					// the memory operand, LEFT aligned: one byte, one word, or
 					// one, two or three longwords
 					if (!fp_cr && fp_stt == FS_RD && cap && rd_tag == T_SLD) begin
@@ -1941,6 +1996,20 @@ always @(posedge clk) begin
 			// here would deadlock the next FP instruction at P_START.
 			if (HAS_FPU != 0 && ph == P_FPU && st.disp && st.fin) fp_bg <= !fp_cr && !(fp_dn || fp_done);
 			else if (HAS_FPU != 0 && fp_bg && fp_done)            fp_bg <= 1'b0;
+			// (M10.3) a RELEASED operation's enabled exception: the instruction
+			// has left, so it cannot be reported against it.  It becomes
+			// pending for the next FP dispatch, and clearing fp_bg here is the
+			// part that must not be forgotten -- otherwise the next floating-
+			// point instruction waits at P_START for ever, which is the hang
+			// M10.2 found for a different reason.  The second term catches an
+			// exception that arrives in the very clock of the release, when
+			// fp_bg is not set yet.
+			if (HAS_FPU != 0 && fp_exc_req &&
+			    (fp_bg || (ph == P_FPU && st.disp && st.fin && !fp_cr && !fp_ae))) begin
+				fp_bg   <= 1'b0;
+				fp_pend <= 1'b1;
+				fp_pvec <= fp_exc_vec;
+			end
 			if (aerr_dbl || wf_dbl) ph <= P_HALT;
 			if (ph != P_RTE && eac_v_use && cm_hit && (st.fin || st.exc_go || st0.mm_go)) cm_v <= 1'b0;
 			if (st.fin) begin

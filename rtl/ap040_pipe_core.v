@@ -134,6 +134,8 @@ module ap040_pipe_core
 	input         fp_accepted,
 	input         fp_unimp,
 	input         fp_unsupp,
+	input         fp_exc_req,
+	input   [7:0] fp_exc_vec,
 	input  [95:0] fp_dout
 );
 
@@ -516,6 +518,7 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HA
 	.fp_ia_we(fp_ia_we), .fp_ia_wdata(fp_ia_wdata),
 	.fp_cr_sel(fp_cr_sel), .fp_cr_we(fp_cr_we), .fp_cr_wdata(fp_cr_wdata), .fp_cr_rdata(fp_cr_rdata),
 	.fp_done(fp_done), .fp_accepted(fp_accepted), .fp_unimp(fp_unimp), .fp_unsupp(fp_unsupp),
+	.fp_exc_req(fp_exc_req), .fp_exc_vec(fp_exc_vec),
 	.fp_dout(fp_dout),
 	.wb_fault(ce && wb_fault), .wb_fatm(st_fatc), .wb_fma(st_fma),
 	.wb_st_a(exe_o.st_addr), .wb_st_s(exe_o.st_size), .wb_st_d(exe_o.st_data), .wb_st_f(exe_o.st_fc),

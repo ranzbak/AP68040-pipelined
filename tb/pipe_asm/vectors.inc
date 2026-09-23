@@ -17,6 +17,9 @@ v_trapv	equ	unexp
 	ifnd	v_fpun
 v_fpun	equ	unexp		; 55 FP unsupported data type (plan M10.1)
 	endif
+	ifnd	v_fparith
+v_fparith equ	unexp		; 48-54 the enabled FP arithmetic traps (M10.3)
+	endif
 	org	0
 	dc.l	$1F00
 	dc.l	start
@@ -38,8 +41,11 @@ v_fpun	equ	unexp		; 55 FP unsupported data type (plan M10.1)
 	dc.l	unexp		; 15-31
 	endr
 	dc.l	v_trp0		; 32 TRAP #0
-	rept	22
-	dc.l	unexp		; 33-54
+	rept	15
+	dc.l	unexp		; 33-47
+	endr
+	rept	7
+	dc.l	v_fparith	; 48-54 BSUN, INEX, DZ, UNFL, OPERR, OVFL, SNAN
 	endr
 	dc.l	v_fpun		; 55 FP unsupported data type
 	rept	200
