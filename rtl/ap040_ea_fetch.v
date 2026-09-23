@@ -949,7 +949,7 @@ function automatic stp_t stepf(
 	input logic [31:0] s_addr_c, input logic [31:0] s_val_c, input logic [31:0] d_val_c,
 	input logic [2:0] x_step, input logic [31:0] vbr, input logic [7:0] x_vec, input logic [31:0] x_target,
 	input logic [2:0] r_step, input logic [31:0] sp_now, input logic fmt_ok, input logic rte_goes,
-	input logic rx7, input logic rs_done, input logic has_fpu);
+	input logic rx7, input logic rs_done, input logic has_fpu, input logic tr_arm);
 	stp_t s;
 	s = '0;
 	case (ph)
@@ -978,8 +978,11 @@ function automatic stp_t stepf(
 				// the FPU request runs in P_FPU (M10.1(c)).  With HAS_FPU = 0
 				// this arm folds away: CL_FPU is never decoded.
 			end else if (i.cls == CL_STOP) begin
-				// the SR micro-op, then the stopped state (P_STOP)
-				if (!stall) begin s.disp = 1'b1; s.dsel = 3'd0; end
+				// the SR micro-op, then the stopped state (P_STOP) -- unless
+				// the STOP is TRACED (M9.T), when it loads the SR and ENDS:
+				// the trace is taken in front of the instruction after it and
+				// the stopped state is never entered at all
+				if (!stall) begin s.disp = 1'b1; s.dsel = 3'd0; s.fin = tr_arm; end
 			end else if (i.cls == CL_RSTO) begin
 				// RSTO in P_RSTO
 			end else if (i.cls == CL_NOP && sync) begin
@@ -1085,11 +1088,34 @@ endfunction
 // reads never wait for older stores (store-to-load forwarding, above)
 // a bitfield's read address uses the register file: no read while EX writes one of its registers
 wire bf_rdblk = is_bf && ex_haz;
+wire [15:0] dbc_dec = rd_b[15:0] - 16'd1;
+wire       br_taken = (i.cls == CL_BCC) ? br_cc : (!br_cc && dbc_dec != 16'hFFFF);
+
+// T0 traces only CHANGES OF FLOW: a taken branch or a return, and the
+// instructions the 68040 counts as pipeline synchronisation points, which
+// decode carries in `t0sync` (the reference's `t0_special` list, copied
+// verbatim, plus FDBcc and the FMOVEM store forms).  A conditional branch is
+// known here and nowhere else: ID GUESSED IT TAKEN, so a not-taken one is the
+// one that redirects, and `br_taken` above is the answer either way.
+wire tr_flow = ((i.cls == CL_BCC) || (i.cls == CL_DBCC)) ? br_taken
+             : (i.cls == CL_BSR) || (i.cls == CL_JMP) || (i.cls == CL_JSR) ||
+               (i.cls == CL_RTS) || (i.cls == CL_RTD) || (i.cls == CL_RTR) ||
+               (i.cls == CL_RTE) ||
+               ((HAS_FPU != 0) && (ph == P_FPU) && fp_bcc && fp_ctk);
+// STOP makes its own T0 decision: T1 traces it unconditionally, T0 only when
+// the SR it writes CHANGES T1/T0/S/M or the interrupt mask (WinUAE's
+// MakeFromSR returns before its trace decision when none of those move, and
+// STOP has no check_t0_trace like the MOVE-to-SR family).  A traced STOP does
+// not enter the stopped state at all.
+wire tr_stop_t0 = {i.imm[15:12], i.imm[10:8]} != {sr_in[15:12], sr_in[10:8]};
+wire tr_t0_ev   = (i.cls == CL_STOP) ? tr_stop_t0 : (i.t0sync || tr_flow);
+wire tr_arm     = sr_in[15] || (sr_in[14] && tr_t0_ev);
+
 wire stp_t st0 = stepf(ph, eac_v_use, rst_pending, i, older_busy, !bf_rdblk, rd_pend, rd_ack, cap,
                       s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, trap_n, trap_vec,
                       indexed_mode, two_uop, bf_step, sync_busy, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes,
-                      r_fv[15:12] == 4'd7, rs_cnt == 10'd0, HAS_FPU != 0);
+                      r_fv[15:12] == 4'd7, rs_cnt == 10'd0, HAS_FPU != 0, tr_arm);
 
 //--------------------------------------------------------------- access errors
 // A data read that ends in an access error (M68040UM 8.2.1, p. 8-6): the
@@ -1832,6 +1858,11 @@ function automatic stp_t tr_st(input stp_t s, input logic [3:0] ph, input logic 
 endfunction
 reg         tr_take;      // a trace is due in front of the next instruction
 reg  [31:0] tr_pc;        // the traced instruction's PC (the $2 address field)
+// A T0 change-of-flow trace is resolved only once the TARGET has entered the
+// pipeline, so an illegal instruction at the target wins and cancels it
+// (reference go_pc: `flow_t0_pend`).  A T1 trace is not: it is taken at the
+// boundary before the target is looked at.
+reg         tr_yield;
 // `!older_busy` is the interrupt's rule for the same reason: the traced
 // instruction's writeback must have committed before the frame's SR is
 // latched.  An interrupt at the same boundary WINS (irq_st sits outside this
@@ -1848,9 +1879,6 @@ reg  [2:0] irq_take_lvl;
 wire [31:0] irq_take_pc = (ph == P_STOP) ? i.next_pc : i.pc;
 wire irq_go = irq_take && eac_v_use && !rst_pending && !older_busy &&
               ((ph == P_START) || (ph == P_STOP));
-wire tr_go = tr_take && eac_v_use && !rst_pending && !older_busy &&
-             !irq_go && (ph == P_START);
-
 wire stp_t st_i = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in),
                                      (HAS_FPU != 0) && (ph == P_FPU), stall_in, fp_live, fp_unimp, fp_unsupp,
                                      i.next_pc, fp_ea_v ? fp_addr : i.pc, fp_ea_v ? fp_addr : 32'd0,
@@ -1865,6 +1893,9 @@ wire stp_t st_i = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, 
                                      (HAS_FPU != 0) && fp_bsun_go && (ph == P_FPU) && !fp_crd,
                                      (HAS_FPU != 0) && fp_trapcc && fp_ctk && !fp_bsun_go),
                                irq_go, irq_take_lvl, irq_take_pc), aerr_go, i, rd_a_q);
+wire tr_go = tr_take && eac_v_use && !rst_pending && !older_busy &&
+             !irq_go && (ph == P_START) && !(tr_yield && st_i.exc_go);
+
 // the trace sits INSIDE the interrupt override, so a simultaneous interrupt
 // wins the boundary (M68040UM 8.3; the reference's fetch_next samples the
 // interrupt first and converts the trace to a pending one)
@@ -1984,8 +2015,6 @@ assign halted    = (ph == P_HALT);
 // costs (M68040UM 10.5 p. 10-11: Bcc not taken 3, DBcc 3/4).
 // (the counter from the register file: a DBcc waits while EX writes it --
 // vdep -- so the loop test is off EX's result path, timing)
-wire [15:0] dbc_dec = rd_b[15:0] - 16'd1;
-wire       br_taken = (i.cls == CL_BCC) ? br_cc : (!br_cc && dbc_dec != 16'hFFFF);
 
 wire        redir_now  = st.disp && st.dsel == 3'd0 && !flush &&
                         (i.cls == CL_RTS || i.cls == CL_RTD || i.cls == CL_RTR ||
@@ -2045,7 +2074,7 @@ always @(posedge clk) begin
 		fr_flags <= 3'd0; fr_grs <= 3'd0; fr_wbte15 <= 1'b0; fr_fpt <= 96'd0; fr_et <= 96'd0;
 		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
 		irq_take <= 1'b0; irq_take_lvl <= 3'd0;
-		tr_take <= 1'b0; tr_pc <= 32'd0;
+		tr_take <= 1'b0; tr_pc <= 32'd0; tr_yield <= 1'b0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
 		cm_v <= 1'b0; cm_ea <= 32'd0; cm_pc <= 32'd0; r_ea <= 32'd0; r_ssw <= 16'd0;
 		mm_mask <= 16'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0; mm_tail <= 1'b0;
@@ -2115,6 +2144,14 @@ always @(posedge clk) begin
 						ph <= P_RESET; r_step <= 3'd0;
 					end else if (eac_v_use && !(i.serialize && older_busy) && !irq_take && !tr_take) begin
 						if (!st.exc_go && i.cls == CL_STOP) begin
+							// (M9.T) a TRACED stop loads the SR and carries on:
+							// it never enters the stopped state.  No guard is
+							// needed on this assignment -- stepf gives the
+							// traced STOP its `fin`, and `if (st.fin) ph <=
+							// P_START` at the end of this block is the later
+							// assignment and wins.  A mutant that added
+							// `&& !tr_arm` here SURVIVED, which is how the
+							// redundancy was found.
 							if (st.disp) ph <= P_STOP;
 						end else if (!st.exc_go && i.cls == CL_RSTO) begin
 							ph <= P_RSTO; rs_cnt <= RSTO_CLKS[9:0] - 10'd1;
@@ -2446,8 +2483,9 @@ always @(posedge clk) begin
 			// writeback, one stage later.  Exception entry is not a traced
 			// instruction, so P_EXC/P_RESET do not arm.
 			if (st.fin && ph != P_EXC && ph != P_RESET) begin
-				tr_take <= sr_in[15];
-				tr_pc   <= i.pc;
+				tr_take  <= tr_arm;
+				tr_pc    <= i.pc;
+				tr_yield <= !sr_in[15];   // a T0-only trace yields to the target's exception
 			end
 			// no trace survives the exception its own instruction took: the
 			// TRAP takes the TRAP and nothing else (the reference clears the

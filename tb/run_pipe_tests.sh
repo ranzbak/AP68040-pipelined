@@ -204,8 +204,11 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 	# D13; no interrupts or STOP before M9)
 	python3 mk_tmmu.py "$AP040_REF/tb/asm/t_mmu.s" m9s > "$WORK/t_mmu_m9s.s"
 	# t_exceptions.s through mk_tint.py: every section up to the M9 subset
-	# (interrupts, STOP, the level-sensitive IPL; trace and the M bit are M9)
-	python3 mk_tint.py "$AP040_REF/tb/asm/t_exceptions.s" exc_m9s > "$WORK/texc_m9s.s"
+	# (interrupts, STOP, the level-sensitive IPL) PLUS the trace section,
+	# which M9.T turned on -- T1, T0, the synchronisation list, the traced
+	# STOP and the MOVEC direction rule.  The M bit section joins it when
+	# M9.T's last step lands.
+	python3 mk_tint.py "$AP040_REF/tb/asm/t_exceptions.s" exc_m9t > "$WORK/texc_m9t.s"
 	# apolkosnik/AP68040 main's t_movem_restart.s (MOVEM CM continuation, PLAN
 	# D15) when that clone is next to this one (case 7: an interrupt behind the CM restart)
 	TMR=""
@@ -215,8 +218,8 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 	else
 		echo "  (AP68040-reference not found: t_movem_restart skipped)"
 	fi
-	for t in t_integer t_cache t_bitfield_mmu t_mmu_m9s t_mmu_pipe texc_m9s t_irq_pipe $TMR; do
-		if [ "$t" = t_mmu_m9s ] || [ "$t" = t_movem_restart_m9s ] || [ "$t" = texc_m9s ]; then
+	for t in t_integer t_cache t_bitfield_mmu t_mmu_m9s t_mmu_pipe texc_m9t t_irq_pipe $TMR; do
+		if [ "$t" = t_mmu_m9s ] || [ "$t" = t_movem_restart_m9s ] || [ "$t" = texc_m9t ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "$WORK/$t.s"
 		elif [ "$t" = t_mmu_pipe ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "mmu_asm/$t.s"

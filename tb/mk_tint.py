@@ -47,8 +47,17 @@ KEEP = {
                "address error", "physical bus error",
                "immediate group: destination must be data alterable",
                "interrupts", "level-sensitive IPL: the NetBSD ports shape"},
+    # (plan M9.T) exc_m9s plus the TRACE section: T1 on every instruction, T0
+    # on changes of flow and the synchronisation list, and the traced STOP.
+    # The "M bit throwaway" section joins this set when M9.T's last step lands.
+    "exc_m9t": {"TRAP #0", "illegal / BKPT", "A/F-line", "CHK", "divide by zero", "TRAPV / TRAPcc",
+               "trace",
+               "MOVEC matrix", "MOVE USP", "MOVES", "user mode round trip", "format error",
+               "address error", "physical bus error",
+               "immediate group: destination must be data alterable",
+               "interrupts", "level-sensitive IPL: the NetBSD ports shape"},
 }[ms]
-DROP_BLOCKS = {"m2": [r"^\s*; tas$"], "m3": [], "m4": [], "exc_m4": [], "exc_m6": [r"^\s*; FRESTORE must reject", r"^\s*; A full MC68040 does not recognize"], "exc_m9s": [r"^\s*; FRESTORE must reject", r"^\s*; A full MC68040 does not recognize"]}[ms]   # (FRESTORE and the format-$4 test depend on the FPU: M10)   # blocks (to the next blank line) inside kept sections
+DROP_BLOCKS = {"exc_m9t": [r"^\s*; FRESTORE must reject", r"^\s*; A full MC68040 does not recognize"], "m2": [r"^\s*; tas$"], "m3": [], "m4": [], "exc_m4": [], "exc_m6": [r"^\s*; FRESTORE must reject", r"^\s*; A full MC68040 does not recognize"], "exc_m9s": [r"^\s*; FRESTORE must reject", r"^\s*; A full MC68040 does not recognize"]}[ms]   # (FRESTORE and the format-$4 test depend on the FPU: M10)   # blocks (to the next blank line) inside kept sections
 out = lines[:idx[0]]                        # header: macros, vectors, org, start
 for title, a, b in secs:
     if title == "all done":

@@ -157,6 +157,12 @@ typedef struct packed {
 	// make.  Written only with HAS_FPU = 1; constant zero otherwise, so the
 	// LC040 build synthesises it away.
 	logic [95:0] fpimm;
+	// (M9.T) T0 traces changes of flow AND the instructions the 68040 counts
+	// as pipeline synchronisation points.  The branches and returns are known
+	// from `cls` (and, for the conditional ones, from EA-fetch's `br_taken`);
+	// this bit carries the rest -- the `t0_special` list, copied verbatim from
+	// the reference core, plus the FP forms that set its `t0_force`.
+	logic        t0sync;
 } id_t;
 
 typedef struct packed {

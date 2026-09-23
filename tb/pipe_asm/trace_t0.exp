@@ -1,0 +1,46 @@
+halt 00004da
+# plan M9.T step 2: T0 traces only changes of flow.
+#
+# Nine traces, and every one of them is a case: the NOP at $43C (a
+# synchronisation point), the TAKEN bne at $444, the bsr at $44C, the rts
+# at $476, the MOVE to SR at $450, the STOP at $454 (its mask changes, so
+# it traces -- and it does not stop), the MOVE to SR at $458, the MOVEC
+# WRITE at $460, and the MOVE to SR at $46A.
+#
+# What is NOT here is the point: the two MOVEQs, the TST, the NOT-taken
+# beq at $448, the MOVE FROM SR at $44E, the MOVEC READ at $45C, the final
+# NOP at $46E -- and the BRA at $464, whose trace is CANCELLED by the
+# ILLEGAL at its target.
+m32 00007000 00000009
+# every frame was format $2, vector offset $24
+m32 00007004 00000000
+# the FIRST trace is the NOP's: stacked PC = the next instruction ($43E),
+# address field = the NOP itself ($43C)
+m32 00007008 0000043e
+m32 0000700c 0000043c
+# the LAST is the MOVE to SR at $46A that clears T0, taken in front of the
+# NOP at $46E
+m32 00007010 0000046e
+m32 00007014 0000046a
+# 7: the ILLEGAL at the branch target was taken, exactly once, and it is
+# the reason the count is nine and not ten
+m32 00007018 00000001
+# a sum over EVERY frame, not only the first and the last: the address
+# fields $43C+$444+$44C+$476+$450+$454+$458+$460+$46A = $2708, and the
+# stacked PCs $43E+$448+$474+$44E+$454+$458+$45C+$464+$46E = $2722.
+# Without these two, a mutation that makes the MOVEC READ trace instead of
+# the MOVEC WRITE -- two neighbouring instructions swapping roles -- keeps
+# the count and both ends intact and SURVIVES.  It did.
+m32 0000701c 00002708
+m32 00007020 00002722
+# the program's own work: d1 = 3 proves the beq was NOT taken (it fell
+# through), d4 = 4 that the subroutine ran, d2 the SR read back while T0
+# was set
+d0 00000002
+d1 00000003
+d2 00006700
+d3 00000000
+d4 00000004
+d7 00000001
+sr 00002700
+isp 00001f00

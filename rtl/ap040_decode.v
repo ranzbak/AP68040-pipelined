@@ -774,6 +774,40 @@ function automatic ea_t ea_sp(input logic [1:0] upd, input logic [31:0] disp);
 	return e;
 endfunction
 
+// (M9.T) The non-branch instructions the MC68040 counts as changes of flow
+// for T0 tracing, because they synchronise or refill the instruction
+// pipeline.  COPIED VERBATIM from the reference core's `t0_special`
+// (lib/AP68040 rtl/ap040_core.v), comments and all, for the same reason the
+// FPSP opmode list is copied in D22: two hand-written copies of a list this
+// arbitrary will disagree eventually, and the reference's is the one that was
+// narrowed against hardware.  gencpu marks these with trace_t0_68040_only().
+// Taken branches and returns are NOT here -- they are known from the class --
+// and FDBcc / the FMOVEM store forms set the bit in their own decode arms,
+// the way the reference sets `t0_force`.
+function automatic logic t0_special(input logic [15:0] op);
+	return
+	    op == 16'h007c || op == 16'h027c || op == 16'h0a7c ||  // to SR
+	    op == 16'h4e71 ||                                      // NOP
+	    // STOP is absent: it makes its own T0 decision (the changed-bits
+	    // rule, in EA-fetch).
+	    op == 16'h4e7b ||                                      // MOVEC to CR
+	    (op & 16'hfff8) == 16'h4e60 ||                         // MOVE An,USP
+	    // MOVE USP,An ($4E68-F) does not trace: gencpu marks only
+	    // i_MVR2USP with trace_t0_68040_only, the same on-silicon
+	    // narrowing hardware already proved for MOVEC ($4E7B only).
+	    (op & 16'hffc0) == 16'h46c0 ||                         // MOVE to SR
+	    (op[15:12] == 4'h0 && op[11:8] == 4'he &&
+	     op[7:6] != 2'b11) ||                                  // MOVES
+	    (op[15:12] == 4'h0 && op[11] && !op[8] && op[7:6] == 2'b11 &&
+	     op[10:9] != 2'b00) ||                                 // CAS/CAS2
+	    // op[8] discriminates CAS ($0AC0/$0CC0/$0EC0, clear) from the
+	    // dynamic bit ops BSET Dn,<ea> for D5-D7 ($0Bxx/$0Dxx/$0Fxx,
+	    // set): hardware cputest basic/all failed BSET.B D5,(A6)
+	    // under T0 with a phantom trace before the bit was added.
+	    op[15:8] == 8'hf4 || op[15:8] == 8'hf5 ||              // CINV/CPUSH/PFLUSH/PTEST
+	    op[15:8] == 8'hf3;                                     // FSAVE/FRESTORE
+endfunction
+
 function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] vpc,
                              input shape_t sh, input logic [4:0] tot_w, input logic ea_bad);
 	id_t d;
@@ -1205,6 +1239,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					end else if (op[8:6] == 3'b001) begin
 						if (op[5:3] == 3'b001) begin              // FDBcc Dn,disp
 							d.cls = CL_FPU;
+							d.t0sync = 1'b1;   // (M9.T) every FDBcc is T0-traced on the 040
 							d.imm = {{16{vbuf[2][15]}}, vbuf[2]};
 							d.src = ea_reg(EK_DREG, {2'b00, op[2:0]});
 						end else if (op[5:0] == 6'b111_010 ||
@@ -1309,6 +1344,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					//   PC-relative: a source only, as for every store.
 					// An empty list is FPIAR, not a no-op.
 					else if (x1[15:14] == 2'b10) begin
+						d.t0sync   = x1[13];   // (M9.T) control registers TO memory
 						fp_crsel   = (x1[12:10] == 3'd0) ? 3'b001 : x1[12:10];
 						fp_crn     = fp_cr_n(x1[12:10]);
 						fp_crmulti = (fp_crn != 3'd1);
@@ -1379,6 +1415,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					// The register order and the within-register long order are
 					// EA-fetch's problem, not the decoder's.
 					else if (x1[15:14] == 2'b11) begin
+						d.t0sync = x1[13];     // (M9.T) an FMOVEM STORE
 						fp_mvst  = x1[13];
 						fp_mvn   = {3'd0, x1[7]} + {3'd0, x1[6]} + {3'd0, x1[5]} +
 						           {3'd0, x1[4]} + {3'd0, x1[3]} + {3'd0, x1[2]} +
@@ -1541,6 +1578,11 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 	if (d.cls == CL_EXC && !d.exc_next && d.exc_fmt == 4'd0) d.next_pc = vpc + 32'd2;
 	if (d.cls == CL_EXC) d.serialize = 1'b1;
 	d.size2 = s2set ? s2 : d.size;
+	// (M9.T) the T0 synchronisation list.  An instruction that is not
+	// executed as itself -- an illegal/F-line/privilege entry -- is not a
+	// synchronisation point: it is an exception, and exception entry clears
+	// the trace anyway.
+	if (d.cls != CL_EXC) d.t0sync = d.t0sync || t0_special(d.opcode);
 	return d;
 endfunction
 
