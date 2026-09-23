@@ -1,0 +1,51 @@
+halt 00000786
+# plan M10.2, the control registers.  The two extended values are the SAME
+# divide under two rounding modes, computed outside the design: 1.0 / 3.0 is
+# ...AAAA truncated (FPCR = $10, round to zero) and ...AAAB rounded (FPCR =
+# $00, round to nearest even), so FPCR is proved to have reached the unit and
+# not merely to read back.
+#
+# 3: the immediate list comes from the instruction stream, never from a read
+noread 0000045c
+noread 00000463
+# 1: FPCR reads back what was written
+d0 00000010
+# 2: the divide's INEX2 and accrued INEX, masked out of FPSR
+d1 00000208
+# 1: round to zero, then round to nearest
+m32 00005100 3ffd0000
+m32 00005104 aaaaaaaa
+m32 00005108 aaaaaaaa
+m32 0000510c 3ffd0000
+m32 00005110 aaaaaaaa
+m32 00005114 aaaaaaab
+a1 00005118
+# 3: two registers from one immediate -- and the instruction after it ran
+d3 00000030
+d4 00000208
+# 4: three registers in, three out, FPCR/FPSR/FPIAR at ascending addresses
+a0 0000500c
+m32 00005150 00000030
+m32 00005154 00000200
+m32 00005158 12345678
+a5 0000515c
+# 5: -(An) writes the same three at An-12
+m32 00005204 00000030
+m32 00005208 00000200
+m32 0000520c 12345678
+a2 00005204
+# 6: An, which only FPIAR may use
+a4 abcd0000
+# 7: an empty register list is FPIAR
+d5 abcd0000
+# 8: FPCR still holds what case 4 loaded, and FPIAR still holds the FADD's
+# own PC -- a control-register move does not write FPIAR
+d7 00000030
+d6 00000700
+fpiar 00000700
+# 9, 10, 11: three illegal effective addresses, each the ordinary F-line --
+# the count, then the deltas of the frame's format/vector word and of its
+# stacked PC against what the rule says (so both read zero)
+m32 00007000 00000003
+m32 00007004 00000000
+m32 00007008 00000000

@@ -249,6 +249,9 @@ wire        core_st_err;
 // what the Minimig build uses, nothing decodes to CL_FPU, fp_req stays low
 // and g_nofpu's constants are exact rather than merely safe.
 wire        fp_req, fp_done, fp_accepted, fp_unimp, fp_unsupp, fp_ia_we;
+wire        fp_cr_we;
+wire  [1:0] fp_cr_sel;
+wire [31:0] fp_cr_wdata, fp_cr_rdata;
 wire  [2:0] fp_op_class, fp_src_fmt, fp_src_r, fp_dst_r;
 wire  [6:0] fp_opmode;
 wire [95:0] fp_din, fp_dout;
@@ -307,6 +310,7 @@ ap040_pipe_core #(
 	.fp_req(fp_req), .fp_op_class(fp_op_class), .fp_opmode(fp_opmode),
 	.fp_src_fmt(fp_src_fmt), .fp_src_r(fp_src_r), .fp_dst_r(fp_dst_r), .fp_din(fp_din),
 	.fp_ia_we(fp_ia_we), .fp_ia_wdata(fp_ia_wdata),
+	.fp_cr_sel(fp_cr_sel), .fp_cr_we(fp_cr_we), .fp_cr_wdata(fp_cr_wdata), .fp_cr_rdata(fp_cr_rdata),
 	.fp_done(fp_done), .fp_accepted(fp_accepted), .fp_unimp(fp_unimp), .fp_unsupp(fp_unsupp),
 	.fp_dout(fp_dout)
 );
@@ -321,6 +325,7 @@ generate if (AP040_HAS_FPU != 0) begin : g_fpu
 end else begin : g_nofpu
 	assign fp_done = 1'b0, fp_accepted = 1'b0, fp_unimp = 1'b0, fp_unsupp = 1'b0;
 	assign fp_dout = 96'd0;
+	assign fp_cr_rdata = 32'd0;
 end endgenerate
 
 // the MMU (M7): lifted from the reference as it is, wired as the reference

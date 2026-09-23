@@ -10,12 +10,12 @@
 //                                                                          //
 // The names it expects in scope are the core's own: fp_req, fp_op_class,   //
 // fp_opmode, fp_src_fmt, fp_src_r, fp_dst_r, fp_din, fp_ia_we,             //
-// fp_ia_wdata (driven by the core) and fp_done, fp_accepted, fp_unimp,     //
-// fp_unsupp, fp_dout (driven back), plus clk, nreset and fp_ce.            //
+// fp_ia_wdata, fp_cr_sel, fp_cr_we, fp_cr_wdata (driven by the core) and   //
+// fp_done, fp_accepted, fp_unimp, fp_unsupp, fp_dout, fp_cr_rdata (driven  //
+// back), plus clk, nreset and fp_ce.                                       //
 //                                                                          //
 // TIED OFF, and each one is a recorded gap, not an oversight:              //
-//   cr_* / bsun_*        opclass 100/101 (FPCR/FPSR/FPIAR) is not decoded   //
-//                        yet, so nothing can read or write them.           //
+//   bsun_*               FBcc on an unordered compare is not decoded yet.  //
 //   fm_*                 FMOVEM (opclass 110/111) is not decoded yet.      //
 //   fsave_ack/frestore_* FSAVE/FRESTORE still take M10.0's format $4       //
 //                        frame; the unit's state frame is not consumed.    //
@@ -38,7 +38,7 @@ ap040_fpu u_fpu
 	.exc_req(), .exc_vec(), .dout(fp_dout),
 	.fpcc(),
 
-	.cr_sel(2'd0), .cr_we(1'b0), .cr_wdata(32'd0), .cr_rdata(),
+	.cr_sel(fp_cr_sel), .cr_we(fp_cr_we), .cr_wdata(fp_cr_wdata), .cr_rdata(fp_cr_rdata),
 	.bsun_req(1'b0), .bsun_enable(),
 
 	.ia_we(fp_ia_we), .ia_wdata(fp_ia_wdata),

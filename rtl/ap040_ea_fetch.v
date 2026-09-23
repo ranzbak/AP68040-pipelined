@@ -143,6 +143,13 @@ module ap040_ea_fetch
 	// reads the address of the instruction the unit is holding and not zero.
 	output            fp_ia_we,
 	output     [31:0] fp_ia_wdata,
+	// (M10.2) the control registers: opclass 100/101 moves one longword per
+	// selected register between the effective address and FPCR/FPSR/FPIAR.
+	// cr_sel is 0 FPIAR, 1 FPSR, 2 FPCR and reads combinationally.
+	output      [1:0] fp_cr_sel,
+	output            fp_cr_we,
+	output     [31:0] fp_cr_wdata,
+	input      [31:0] fp_cr_rdata,
 	input             fp_done,
 	input             fp_accepted,
 	input             fp_unimp,
@@ -241,6 +248,16 @@ localparam [1:0] FS_RD = 2'd0, FS_REQ = 2'd1, FS_WR = 2'd2;
 reg  [1:0] fp_stt;
 reg  [1:0] fp_k;           // beat index
 reg [31:0] fp_addr;
+// (M10.2) opclass 100/101, the control registers.  The same three states
+// carry it -- FS_RD reads the longwords, FS_WR writes them, FS_REQ is the
+// register and immediate forms that touch no bus -- but nothing is sent to
+// the unit's COMMAND port, so `fp_crd` (all transfers complete) stands in
+// for the interlock's `fp_ok` and FPIAR is not written (ia_we = fp_req).
+reg        fp_cw;          // a control-register write goes out this clock
+reg  [1:0] fp_csel;        // ... to this register: captured with the data, so
+                           //     the beat index may advance on the same edge
+reg [31:0] fp_cwd;
+reg        fp_crd;         // every selected register has been transferred
 
 // exception parameters (latched when an exception sequence starts)
 reg  [7:0] x_vec;
@@ -1246,21 +1263,48 @@ assign fp_ia_wdata = (HAS_FPU != 0) ? i.pc : 32'd0;
 // where the operand comes from, always LEFT aligned in the 96-bit window:
 // memory (assembled in fp_buf), the instruction stream (the decoder's
 // fpimm -- never a bus access, lib/AP68040 S_FPU_IMM), or a data register.
-wire        fp_mem_src = (i.ext[15:13] == 3'b010) && (i.src.kind == EK_MEM);
-wire        fp_mem_dst = (i.ext[15:13] == 3'b011) && (i.dst.kind == EK_MEM);
+// (M10.2) opclass 100/101: the effective address is the SOURCE when the
+// control registers are the destination (ext[13] = 0) and the destination
+// when they are the source (ext[13] = 1), so it joins the same two wires.
+wire        fp_cr      = (HAS_FPU != 0) && (i.ext[15:14] == 2'b10);
+wire        fp_cr_st   = fp_cr && i.ext[13];        // FPcr -> <ea>
+wire  [2:0] fp_crmask  = (i.ext[12:10] == 3'd0) ? 3'b001 : i.ext[12:10];  // empty = FPIAR
+wire  [1:0] fp_crn     = {1'b0, fp_crmask[2]} + {1'b0, fp_crmask[1]} + {1'b0, fp_crmask[0]};
+// the k-th selected register in FPCR, FPSR, FPIAR order -- which is also
+// ascending address order (PRM FMOVEM, lib/AP68040 S_FPU_CR) -- as cr_sel,
+// whose encoding (2 FPCR, 1 FPSR, 0 FPIAR) is the same bit position.
+function automatic logic [1:0] cr_nth(input logic [2:0] m, input logic [1:0] k);
+	logic [1:0] seen;
+	logic [1:0] r;
+	seen = 2'd0; r = 2'd0;
+	if (m[2]) begin if (seen == k) r = 2'd2; seen = seen + 2'd1; end
+	if (m[1]) begin if (seen == k) r = 2'd1; seen = seen + 2'd1; end
+	if (m[0]) begin if (seen == k) r = 2'd0; seen = seen + 2'd1; end
+	return r;
+endfunction
+assign fp_cr_sel   = fp_cw ? fp_csel : cr_nth(fp_crmask, fp_k);
+assign fp_cr_we    = fp_cw;
+assign fp_cr_wdata = fp_cwd;
+wire        fp_mem_src = ((i.ext[15:13] == 3'b010) && (i.src.kind == EK_MEM)) ||
+                         (fp_cr && !i.ext[13] && (i.src.kind == EK_MEM));
+wire        fp_mem_dst = ((i.ext[15:13] == 3'b011) && (i.dst.kind == EK_MEM)) ||
+                         (fp_cr_st && (i.dst.kind == EK_MEM));
 assign fp_din      = fp_mem_src             ? fp_buf :
                      (i.src.kind == EK_IMM) ? i.fpimm :
                      (i.size == SZ_B) ? {op_a[7:0],  88'd0} :
                      (i.size == SZ_W) ? {op_a[15:0], 80'd0} : {op_a[31:0], 64'd0};
 // ... and the result, taken from the left of the dout window by size
-wire [31:0] fp_rv  = (i.size == SZ_B) ? {24'd0, fp_buf[95:88]} :
+// (a control-register store into Dn or An reads the unit combinationally)
+wire [31:0] fp_rv  = fp_cr             ? fp_cr_rdata :
+                     (i.size == SZ_B) ? {24'd0, fp_buf[95:88]} :
                      (i.size == SZ_W) ? {16'd0, fp_buf[95:80]} : fp_buf[95:64];
 // the operand's length in bytes, and the beats it takes on the bus
 wire  [4:0] fp_nb    = i.imm[4:0];
 wire  [1:0] fp_beats = (fp_nb <= 5'd4) ? 2'd1 : (fp_nb == 5'd8) ? 2'd2 : 2'd3;
 wire  [1:0] fp_bsz   = (fp_nb == 5'd1) ? SZ_B : (fp_nb == 5'd2) ? SZ_W : SZ_L;
 wire [31:0] fp_baddr = (fp_nb <= 5'd2) ? fp_addr : (fp_addr + {28'd0, fp_k, 2'b00});
-wire [31:0] fp_bdata = (fp_nb == 5'd1) ? {24'd0, fp_buf[95:88]} :
+wire [31:0] fp_bdata = fp_cr           ? fp_cr_rdata :
+                       (fp_nb == 5'd1) ? {24'd0, fp_buf[95:88]} :
                        (fp_nb == 5'd2) ? {16'd0, fp_buf[95:80]} :
                        (fp_k == 2'd0)  ? fp_buf[95:64] :
                        (fp_k == 2'd1)  ? fp_buf[63:32] : fp_buf[31:0];
@@ -1268,7 +1312,10 @@ wire        fp_blast = (fp_k == fp_beats - 2'd1);
 // opclass 011 stores the FPU's answer, so it waits for `done`; everything
 // else leaves the unit running and is released at `accepted`
 wire        fp_need_res = (i.ext[15:13] == 3'b011);
-wire        fp_ok  = fp_live && (fp_dn || (fp_acc && !fp_need_res));
+// (M10.2) a control-register move sends the unit no command, so what stands
+// in for the interlock is `every selected register has been transferred`
+wire        fp_ok  = fp_cr ? fp_crd
+                           : (fp_live && (fp_dn || (fp_acc && !fp_need_res)));
 function automatic ex_t fpu_uop(input ex_t x0, input logic [31:0] rv);
 	ex_t y;
 	y = x0; y.c = rv;
@@ -1407,7 +1454,7 @@ wire irq_go = irq_take && eac_v_use && !rst_pending && !older_busy &&
 wire stp_t st = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in),
                                      (HAS_FPU != 0) && (ph == P_FPU), stall_in, fp_live, fp_unimp, fp_unsupp,
                                      i.next_pc, fp_ea_v ? fp_addr : i.pc, fp_ea_v ? fp_addr : 32'd0,
-                                     (fp_stt == FS_RD) && !rd_pend, fp_baddr, fp_bsz,
+                                     (fp_stt == FS_RD) && !rd_pend && !(fp_cr && fp_crd), fp_baddr, fp_bsz,
                                      (fp_stt == FS_WR), (fp_k == fp_beats),
                                      fp_ok, fp_mem_dst),
                                irq_go, irq_take_lvl, irq_take_pc), aerr_go, i, rd_a_q);
@@ -1578,6 +1625,7 @@ always @(posedge clk) begin
 		cinv_req <= 1'b0; cinv_ic <= 1'b0; cinv_dc <= 1'b0;
 		fp_req <= 1'b0; fp_sent <= 1'b0; fp_acc <= 1'b0; fp_dn <= 1'b0; fp_buf <= 96'd0; fp_bg <= 1'b0;
 		fp_stt <= FS_RD; fp_k <= 2'd0; fp_addr <= 32'd0;
+		fp_cw <= 1'b0; fp_csel <= 2'd0; fp_cwd <= 32'd0; fp_crd <= 1'b0;
 		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
 		irq_take <= 1'b0; irq_take_lvl <= 3'd0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
@@ -1668,7 +1716,18 @@ always @(posedge clk) begin
 								// and what a restart after a mid-operand
 								// access error recalculates
 								fp_addr <= fp_mem_dst ? d_addr_c : s_addr_c;
-								if (fp_mem_src) fp_stt <= FS_RD;             // beats first
+								fp_cw <= 1'b0;
+								// (M10.2) a control-register move sends the unit no
+								// command: it is longword transfers and nothing else,
+								// and a store into Dn or An is finished before it
+								// starts -- cr_rdata reads combinationally.
+								fp_crd <= fp_cr_st && !fp_mem_dst;
+								if (fp_cr) begin
+									if (fp_mem_src)      fp_stt <= FS_RD;
+									else if (fp_mem_dst) fp_stt <= FS_WR;
+									else                 fp_stt <= FS_REQ;
+								end
+								else if (fp_mem_src) fp_stt <= FS_RD;        // beats first
 								else begin fp_stt <= FS_REQ; fp_req <= 1'b1; end
 							end
 						end else if (!st.exc_go && i.cls == CL_RTE) begin
@@ -1743,7 +1802,7 @@ always @(posedge clk) begin
 					end
 					// the memory operand, LEFT aligned: one byte, one word, or
 					// one, two or three longwords
-					if (fp_stt == FS_RD && cap && rd_tag == T_SLD) begin
+					if (!fp_cr && fp_stt == FS_RD && cap && rd_tag == T_SLD) begin
 						case (fp_nb)
 							5'd1: fp_buf[95:88] <= rd_data[7:0];
 							5'd2: fp_buf[95:80] <= rd_data[15:0];
@@ -1756,6 +1815,31 @@ always @(posedge clk) begin
 						if (fp_blast) begin fp_stt <= FS_REQ; fp_req <= 1'b1; fp_k <= 2'd0; end
 						else          fp_k <= fp_k + 2'd1;
 					end
+						// (M10.2) a control-register move has no operand window:
+						// each longword goes straight to its register.  The write
+						// is armed here and goes out the next clock with the
+						// register it was armed for, so the beat index may move on
+						// the same edge.
+						fp_cw <= 1'b0;
+						if (fp_cr && !fp_crd && !fp_cw) begin
+							if (fp_stt == FS_RD && cap && rd_tag == T_SLD) begin
+								fp_cw <= 1'b1; fp_csel <= cr_nth(fp_crmask, fp_k); fp_cwd <= rd_data;
+								if (fp_k == fp_crn - 2'd1) fp_crd <= 1'b1;
+								else                       fp_k   <= fp_k + 2'd1;
+							end
+							// no bus at all: an immediate list comes from the
+							// instruction stream (one longword per register, left
+							// aligned in fpimm) and a register source is one long
+							else if (fp_stt == FS_REQ) begin
+								fp_cw <= 1'b1; fp_csel <= cr_nth(fp_crmask, fp_k);
+								fp_cwd <= (i.src.kind == EK_IMM)
+								          ? ((fp_k == 2'd0) ? i.fpimm[95:64] :
+								             (fp_k == 2'd1) ? i.fpimm[63:32] : i.fpimm[31:0])
+								          : op_a;
+								if (fp_k == fp_crn - 2'd1) fp_crd <= 1'b1;
+								else                       fp_k   <= fp_k + 2'd1;
+							end
+						end
 					// the answer is in and the destination is memory: store it
 					if (fp_stt == FS_REQ && fp_ok && fp_mem_dst) begin fp_stt <= FS_WR; fp_k <= 2'd0; end
 					if (fp_stt == FS_WR && st.disp) fp_k <= fp_k + 2'd1;
@@ -1852,7 +1936,10 @@ always @(posedge clk) begin
 			end
 			// (M10.1(c)) the released operation: `fp_bg` holds the next FP
 			// instruction back until the unit answers, and nothing else does.
-			if (HAS_FPU != 0 && ph == P_FPU && st.disp && st.fin) fp_bg <= !(fp_dn || fp_done);
+			// (M10.2) a control-register move releases nothing: it sent no
+			// command, so `done` will never come and a background flag set
+			// here would deadlock the next FP instruction at P_START.
+			if (HAS_FPU != 0 && ph == P_FPU && st.disp && st.fin) fp_bg <= !fp_cr && !(fp_dn || fp_done);
 			else if (HAS_FPU != 0 && fp_bg && fp_done)            fp_bg <= 1'b0;
 			if (aerr_dbl || wf_dbl) ph <= P_HALT;
 			if (ph != P_RTE && eac_v_use && cm_hit && (st.fin || st.exc_go || st0.mm_go)) cm_v <= 1'b0;

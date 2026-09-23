@@ -108,6 +108,19 @@ function automatic logic [4:0] fp_bytes(input logic [2:0] spec);
 	endcase
 endfunction
 
+// (M10.2) The control-register list of opclass 100/101: extension bits 12, 11
+// and 10 select FPCR, FPSR and FPIAR, an EMPTY list means FPIAR alone (WinUAE,
+// and lib/AP68040's fp_crm arm), and the transfer is one longword per selected
+// register in FPCR, FPSR, FPIAR order at ascending addresses.  So the list
+// decides the instruction's LENGTH when the operand is an immediate, and the
+// (An)+ / -(An) step in every case.  This is true whether or not an FPU
+// exists, which is why it is not gated on HAS_FPU: an LC040's format $4 frame
+// stacks the PC of the NEXT instruction.
+function automatic logic [2:0] fp_cr_n(input logic [2:0] sel);
+	if (sel == 3'd0) return 3'd1;     // an empty list is FPIAR
+	return {2'd0, sel[2]} + {2'd0, sel[1]} + {2'd0, sel[0]};
+endfunction
+
 // An FP opmode that no 68040 implements.  1 = the encoding is not a floating-
 // point instruction at all and takes the ordinary F-line (vector 11, format
 // $0); 2 = $78..$7F, which take the ILLEGAL vector 4; 0 = a real FP opmode.
@@ -515,10 +528,17 @@ function automatic shape_t shape(input logic [15:0] op, input logic [15:0] x1, i
 				s.has_src = 1'b1; s.fpw = fp_imm_words(x1[12:10]);   // <ea>{fmt} -> FPn
 			end else if (x1[15:13] == 3'b011) begin
 				s.has_src = 1'b1; s.fpw = fp_imm_words(x1[12:10]);   // FPn -> <ea>{fmt}
+			end else if (x1[15:14] == 2'b10) begin
+				// opclass 100/101: FMOVE(M) to and from the control registers.
+				// An immediate source is one longword PER SELECTED REGISTER
+				// (lib/AP68040 S_FPU_CRI), so the list decides the length --
+				// with fpw left at 0 an `FMOVEM.L #x,FPCR/FPSR` would be sized
+				// as one longword and the next PC would be two words short.
+				s.has_src = 1'b1;
+				s.fpw = {1'b0, fp_cr_n(x1[12:10])} << 1;
 			end else if (x1[15]) begin
-				// opclass 100/101 are FMOVE(M) to and from the control
-				// registers and 110/111 are the FP register lists: all four
-				// have an effective address
+				// opclass 110/111, the FP register lists: an effective address
+				// too (their immediate form is not a legal encoding)
 				s.has_src = 1'b1;
 			end
 			// x1[15:13] = 000 (FPm -> FPn), 001 (undefined opclass) and
@@ -744,11 +764,16 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 	logic fsave_ok, frest_ok;   // the coprocessor-id-1 state instructions' legal EA modes
 	logic fp_ireg;              // (M10.1) an FP format that fits in a data register
 	logic [15:0] fpw0;          // ... and the first word of an FP immediate
+	logic [2:0] fp_crsel;       // (M10.2) the control-register list, FPCR/FPSR/FPIAR
+	logic fp_crmulti;           // ... more than one of them
+	logic [2:0] fp_crn;         // ... how many
+	logic fp_crbad;             // ... and an effective address the rules reject
 	tot = tot_w;
 	op = vbuf[0];
 	x1 = vbuf[1];
 	d = '0;
 	fp_ireg = 1'b0; fpw0 = 16'd0;
+	fp_crsel = 3'd0; fp_crmulti = 1'b0; fp_crn = 3'd0; fp_crbad = 1'b0;
 	s2set = 1'b0; s2 = SZ_L;
 	d.reg_c = R_NONE;
 	d.reg_d = R_NONE;
@@ -1183,7 +1208,52 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						d.cls = CL_FPU;
 						d.dst  = d.src;
 					end
-					if (d.cls == CL_FPU && x1[15:13] != 3'b000) begin
+					// (M10.2) opclass 100/101: FMOVE(M).L between the
+					// effective address and FPCR/FPSR/FPIAR, one longword per
+					// selected register in FPCR, FPSR, FPIAR order at ascending
+					// addresses.  The legality rules are lib/AP68040's fp_crm
+					// arm, which is the rule-2 source here (PLAN.md D20):
+					//   Dn   a single register only;
+					//   An   FPIAR only;
+					//   #imm a SOURCE only (an immediate destination is
+					//        malformed), and it may carry several registers;
+					//   PC-relative: a source only, as for every store.
+					// An empty list is FPIAR, not a no-op.
+					else if (x1[15:14] == 2'b10) begin
+						fp_crsel   = (x1[12:10] == 3'd0) ? 3'b001 : x1[12:10];
+						fp_crn     = fp_cr_n(x1[12:10]);
+						fp_crmulti = (fp_crn != 3'd1);
+						fp_crbad   = (d.src.kind == EK_DREG && fp_crmulti) ||
+						             (d.src.kind == EK_AREG && fp_crsel != 3'b001) ||
+						             (d.src.kind == EK_IMM  && x1[13]) ||
+						             (d.src.kind == EK_MEM  && x1[13] &&
+						              sh.sm == 3'd7 && (sh.sr == 3'd2 || sh.sr == 3'd3));
+						if (!fp_crbad && (d.src.kind == EK_DREG || d.src.kind == EK_AREG ||
+						                  d.src.kind == EK_IMM ||
+						                  (d.src.kind == EK_MEM && d.src.mi == MI_NONE))) begin
+							d.cls  = CL_FPU;
+							d.size = SZ_L;
+							if (x1[13]) d.dst = d.src;   // FPcr -> <ea>
+						end else if (fp_crbad) begin
+							// an ILLEGAL effective address for this form is the
+							// ordinary F-line -- format $0 with the instruction's
+							// own PC, not M10.0's format $4 (lib/AP68040's fp_crm
+							// arm calls go_fp_fline; PLAN.md D20).  Only with an
+							// FPU: with HAS_FPU = 0 nothing has looked at the EA
+							// and WinUAE's LC040 path gives every well-formed
+							// cpid-1 opcode the format $4 frame (D18).
+							d.exc_fmt = 4'd0; d.exc_next = 1'b0;
+						end
+						// ... and a LEGAL one this core does not sequence -- a
+						// memory-indirect EA -- keeps the format $4 frame it has
+						// today, which is M10.1's recorded gap and not this rule.
+					end
+					if (d.cls == CL_FPU && x1[15:14] == 2'b10) begin
+						// the (An)+ / -(An) step and the beat count: one
+						// longword per selected control register
+						d.imm[4:0] = {fp_crn, 2'b00};
+						d.size = SZ_L;
+					end else if (d.cls == CL_FPU && x1[15:13] != 3'b000) begin
 						// the operand's length, which is also the (An)+/-(An)
 						// step (lib/AP68040 S_FPU_AN: fp_nb, with the A7 byte
 						// rule), and the micro-op size for the 1/2/4-byte forms
@@ -1206,7 +1276,13 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				// of the first EA word, and the operand is LEFT aligned in the
 				// unit's 96-bit window -- the byte form's operand is the LOW
 				// half of its one word.
-				if (d.cls == CL_FPU && d.src.kind == EK_IMM) begin
+				if (d.cls == CL_FPU && d.src.kind == EK_IMM && x1[15:14] == 2'b10) begin
+					// (M10.2) an immediate control-register list: one longword
+					// per register, in the same FPCR/FPSR/FPIAR order, taken
+					// from the instruction stream (lib/AP68040 S_FPU_CRI)
+					d.fpimm = {vbuf[ks], vbuf[ks+1], vbuf[ks+2],
+					           vbuf[ks+3], vbuf[ks+4], vbuf[ks+5]};
+				end else if (d.cls == CL_FPU && d.src.kind == EK_IMM) begin
 					fpw0 = vbuf[ks];
 					case (x1[12:10])
 						3'b110:  d.fpimm = {fpw0[7:0], 88'd0};
@@ -1231,7 +1307,11 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					// the instruction leaves and integer work runs on.  M11
 					// can trade it for a flush-aware abort if it is worth it.
 					d.serialize = 1'b1;
-					if (d.ext[15:13] != 3'b010) begin
+					if (!((d.ext[15:13] == 3'b010) ||
+					      (d.ext[15:14] == 2'b10 && !d.ext[13]))) begin
+						// the EA is the SOURCE for opclass 010 and for a move
+						// TO the control registers; everywhere else it is the
+						// destination (or there is none) and src is cleared
 						d.src = '0; d.src.reg_n = R_NONE; d.src.idx_reg = R_NONE;
 					end
 				end else if (d.exc_fmt != 4'd4 || d.src.kind != EK_MEM) begin

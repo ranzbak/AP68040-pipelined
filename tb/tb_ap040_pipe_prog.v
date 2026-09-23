@@ -64,8 +64,9 @@ wire        fp_req, fp_done, fp_accepted, fp_unimp, fp_unsupp, fp_dbl;
 wire  [2:0] fp_op_class, fp_src_fmt, fp_src_r, fp_dst_r;
 wire  [6:0] fp_opmode;
 wire [95:0] fp_din, fp_dout;
-wire        fp_ia_we;
-wire [31:0] fp_ia_wdata;
+wire        fp_ia_we, fp_cr_we;
+wire [31:0] fp_ia_wdata, fp_cr_wdata, fp_cr_rdata;
+wire  [1:0] fp_cr_sel;
 wire        fp_ce = ce;
 `ifdef FPU_REAL
 `include "ap040_fpu_tie.vh"
@@ -82,6 +83,11 @@ tb_fpu_stub u_fpu
 `else
 assign fp_done = 1'b0, fp_accepted = 1'b0, fp_unimp = 1'b0, fp_unsupp = 1'b0;
 assign fp_dout = 96'd0, fp_dbl = 1'b0;
+`endif
+`ifndef FPU_REAL
+// only the real unit has control registers; without it the read side would
+// be an undriven wire, which is X and would poison the whole decode
+assign fp_cr_rdata = 32'd0;
 `endif
 
 ap040_pipe_core #(
@@ -109,6 +115,7 @@ ap040_pipe_core #(
 	.fp_req(fp_req), .fp_op_class(fp_op_class), .fp_opmode(fp_opmode),
 	.fp_src_fmt(fp_src_fmt), .fp_src_r(fp_src_r), .fp_dst_r(fp_dst_r), .fp_din(fp_din),
 	.fp_ia_we(fp_ia_we), .fp_ia_wdata(fp_ia_wdata),
+	.fp_cr_sel(fp_cr_sel), .fp_cr_we(fp_cr_we), .fp_cr_wdata(fp_cr_wdata), .fp_cr_rdata(fp_cr_rdata),
 	.fp_done(fp_done), .fp_accepted(fp_accepted), .fp_unimp(fp_unimp), .fp_unsupp(fp_unsupp),
 	.fp_dout(fp_dout)
 );
