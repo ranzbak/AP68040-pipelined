@@ -1,0 +1,62 @@
+halt 000004a8
+# plan M10.4.  FP0 = 1.0, FP1 = 2.0, FP2 = 3.0 throughout; their extended
+# images are 3FFF/8000.../0, 4000/8000.../0 and 4000/C000.../0.
+#
+# 2: a control-mode store with the POSTINCREMENT convention -- the layout
+# the manual states: FP0, FP1, FP2 at ascending addresses, each register's
+# three longwords in order.
+m32 00005400 3fff0000
+m32 00005404 80000000
+m32 00005408 00000000
+m32 0000540c 40000000
+m32 00005410 80000000
+m32 00005414 00000000
+m32 00005418 40000000
+m32 0000541c c0000000
+m32 00005420 00000000
+# 3: the same three registers, the same control mode, but the PREDECREMENT
+# convention -- the 68040 quirk of D21.  The mask is read the other way
+# round, so the registers come out FP2, FP1, FP0, and because the
+# convention disagrees with the address direction each register's three
+# longwords are written in REVERSED order.  No other rule produces this.
+m32 00005300 00000000
+m32 00005304 c0000000
+m32 00005308 40000000
+m32 0000530c 00000000
+m32 00005310 80000000
+m32 00005314 40000000
+m32 00005318 00000000
+m32 0000531c 80000000
+m32 00005320 3fff0000
+# 1: the save a compiler emits -- -(A1) from $5200, so the block starts at
+# $51DC and the registers land FP0, FP1, FP2 upwards
+m32 000051dc 3fff0000
+m32 000051e0 80000000
+m32 000051e4 00000000
+m32 000051e8 40000000
+m32 000051ec 80000000
+m32 000051f0 00000000
+m32 000051f4 40000000
+m32 000051f8 c0000000
+m32 000051fc 00000000
+# ... and the restore through (A1)+ gives the registers back, which is the
+# property that holds only if the two conventions and the two walk
+# directions agree with each other
+m32 00005100 3fff0000
+m32 00005104 80000000
+m32 00005108 00000000
+m32 0000510c 40000000
+m32 00005110 80000000
+m32 00005114 00000000
+m32 00005118 40000000
+m32 0000511c c0000000
+m32 00005120 00000000
+# the address registers: -(A1) stepped down by 36 and (A1)+ back up again
+a1 00005200
+a3 00005124
+# 4, 5, 6: three effective addresses the rules reject, each the ordinary
+# F-line -- the count, then the deltas of the frame's format/vector word and
+# of its stacked PC against what the rule says
+m32 00007000 00000003
+m32 00007004 00000000
+m32 00007008 00000000

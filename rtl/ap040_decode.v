@@ -768,12 +768,16 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 	logic fp_crmulti;           // ... more than one of them
 	logic [2:0] fp_crn;         // ... how many
 	logic fp_crbad;             // ... and an effective address the rules reject
+	logic fp_mvst;              // (M10.4) FMOVEM: registers -> memory
+	logic fp_mvbad;             // ... an effective address the 68040 rejects
+	logic [3:0] fp_mvn;         // ... how many registers the list selects
 	tot = tot_w;
 	op = vbuf[0];
 	x1 = vbuf[1];
 	d = '0;
 	fp_ireg = 1'b0; fpw0 = 16'd0;
 	fp_crsel = 3'd0; fp_crmulti = 1'b0; fp_crn = 3'd0; fp_crbad = 1'b0;
+	fp_mvst = 1'b0; fp_mvbad = 1'b0; fp_mvn = 4'd0;
 	s2set = 1'b0; s2 = SZ_L;
 	d.reg_c = R_NONE;
 	d.reg_d = R_NONE;
@@ -1248,7 +1252,44 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						// memory-indirect EA -- keeps the format $4 frame it has
 						// today, which is M10.1's recorded gap and not this rule.
 					end
-					if (d.cls == CL_FPU && x1[15:14] == 2'b10) begin
+					// (M10.4) opclass 110/111: FMOVEM of the floating-point
+					// registers, twelve bytes each.  The 68040's effective-
+					// address rules, from lib/AP68040's fp_mvm arm, which cites
+					// WinUAE fmovem2mem for them (PLAN.md D21): Dn, An and an
+					// immediate are F-line in both directions; a STORE rejects
+					// (An)+ and the PC-relative modes; a LOAD rejects -(An).
+					// The register order and the within-register long order are
+					// EA-fetch's problem, not the decoder's.
+					else if (x1[15:14] == 2'b11) begin
+						fp_mvst  = x1[13];
+						fp_mvn   = {3'd0, x1[7]} + {3'd0, x1[6]} + {3'd0, x1[5]} +
+						           {3'd0, x1[4]} + {3'd0, x1[3]} + {3'd0, x1[2]} +
+						           {3'd0, x1[1]} + {3'd0, x1[0]};
+						fp_mvbad = (sh.sm < 3'd2) || (sh.sm == 3'd7 && sh.sr == 3'd4) ||
+						           (fp_mvst && (sh.sm == 3'd3 ||
+						                        (sh.sm == 3'd7 && sh.sr[1]))) ||
+						           (!fp_mvst && sh.sm == 3'd4);
+						if (fp_mvbad) begin
+							d.exc_fmt = 4'd0; d.exc_next = 1'b0;
+						end
+						// A DYNAMIC list (x1[11]) takes its mask from a data
+						// register, which needs a register read before the
+						// transfers and P_FPU does not sequence that: it keeps
+						// M10.0's format $4 frame, the same recorded gap as a
+						// memory-indirect effective address.  Everything a
+						// compiler emits is static.
+						else if (!x1[11] && d.src.kind == EK_MEM && d.src.mi == MI_NONE) begin
+							d.cls  = CL_FPU;
+							d.size = SZ_L;
+							if (fp_mvst) d.dst = d.src;
+						end
+					end
+					if (d.cls == CL_FPU && x1[15:14] == 2'b11) begin
+						// twelve bytes per selected register -- up to 96, which
+						// is why the explicit step is seven bits wide
+						d.imm[6:0] = {fp_mvn, 3'd0} + {1'b0, fp_mvn, 2'd0};   // 8n + 4n
+						d.size = SZ_L;
+					end else if (d.cls == CL_FPU && x1[15:14] == 2'b10) begin
 						// the (An)+ / -(An) step and the beat count: one
 						// longword per selected control register
 						d.imm[4:0] = {fp_crn, 2'b00};
@@ -1308,10 +1349,11 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					// can trade it for a flush-aware abort if it is worth it.
 					d.serialize = 1'b1;
 					if (!((d.ext[15:13] == 3'b010) ||
-					      (d.ext[15:14] == 2'b10 && !d.ext[13]))) begin
+					      (d.ext[15] && !d.ext[13]))) begin
 						// the EA is the SOURCE for opclass 010 and for a move
-						// TO the control registers; everywhere else it is the
-						// destination (or there is none) and src is cleared
+						// INTO the unit -- the control registers (100) and the
+						// FP register list (110); everywhere else it is the
+						// destination, or there is none, and src is cleared
 						d.src = '0; d.src.reg_n = R_NONE; d.src.idx_reg = R_NONE;
 					end
 				end else if (d.exc_fmt != 4'd4 || d.src.kind != EK_MEM) begin

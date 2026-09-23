@@ -12,11 +12,11 @@
 // fp_opmode, fp_src_fmt, fp_src_r, fp_dst_r, fp_din, fp_ia_we,             //
 // fp_ia_wdata, fp_cr_sel, fp_cr_we, fp_cr_wdata (driven by the core) and   //
 // fp_done, fp_accepted, fp_unimp, fp_unsupp, fp_exc_req, fp_exc_vec,       //
-// fp_dout, fp_cr_rdata (driven back), plus clk, nreset and fp_ce.          //
+// fp_dout, fp_cr_rdata, fp_fm_rdata (driven back), plus clk, nreset and    //
+// fp_ce.                                                                   //
 //                                                                          //
 // TIED OFF, and each one is a recorded gap, not an oversight:              //
 //   bsun_*               FBcc on an unordered compare is not decoded yet.  //
-//   fm_*                 FMOVEM (opclass 110/111) is not decoded yet.      //
 //   fsave_ack/frestore_* FSAVE/FRESTORE still take M10.0's format $4       //
 //                        frame; the unit's state frame is not consumed.    //
 //   pend_capture         the FSAVE frame of a DEFERRED exception: M10.3    //
@@ -40,7 +40,7 @@ ap040_fpu u_fpu
 
 	.ia_we(fp_ia_we), .ia_wdata(fp_ia_wdata),
 
-	.fm_sel(3'd0), .fm_we(1'b0), .fm_wdata(96'd0), .fm_rdata(),
+	.fm_sel(fp_fm_sel), .fm_we(fp_fm_we), .fm_wdata(fp_fm_wdata), .fm_rdata(fp_fm_rdata),
 
 	.fpu_used(), .fstate_unimp(),
 	.fstate_cmd1(), .fstate_cmd3(),

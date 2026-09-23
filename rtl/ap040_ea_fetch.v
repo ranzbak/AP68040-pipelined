@@ -150,6 +150,12 @@ module ap040_ea_fetch
 	output            fp_cr_we,
 	output     [31:0] fp_cr_wdata,
 	input      [31:0] fp_cr_rdata,
+	// (M10.4) FMOVEM: the unit's RAW register port -- architecturally exact
+	// bits, no condition codes, no rounding.  fm_rdata reads combinationally.
+	output      [2:0] fp_fm_sel,
+	output            fp_fm_we,
+	output     [95:0] fp_fm_wdata,
+	input      [95:0] fp_fm_rdata,
 	input             fp_done,
 	input             fp_accepted,
 	input             fp_unimp,
@@ -268,6 +274,15 @@ reg        fp_ae;
 reg  [7:0] fp_avec;
 reg        fp_pend;
 reg  [7:0] fp_pvec;
+// (M10.4) FMOVEM: the list being consumed, the register the beats belong to,
+// and the write to the unit's raw port, armed the clock before it goes out
+// for the same reason fp_cw is.
+reg  [7:0] fp_list;
+reg  [2:0] fp_fsel;
+reg        fp_mw;
+reg  [2:0] fp_mwsel;       // the register the armed write belongs to: the
+                           // selector has moved on by the time it goes out
+reg [95:0] fp_mwd;
 reg        fp_cw;          // a control-register write goes out this clock
 reg  [1:0] fp_csel;        // ... to this register: captured with the data, so
                            //     the beat index may advance on the same edge
@@ -1300,10 +1315,48 @@ endfunction
 assign fp_cr_sel   = fp_cw ? fp_csel : cr_nth(fp_crmask, fp_k);
 assign fp_cr_we    = fp_cw;
 assign fp_cr_wdata = fp_cwd;
+// (M10.4) FMOVEM of the FP registers: twelve bytes each, and two ordering
+// quirks the reference takes from WinUAE's fmovem2mem (PLAN.md D21) --
+//   `fp_lsb`  a PREDECREMENT store consumes the mask from its LSB, so the
+//             ascending walk reproduces the hardware's descending layout;
+//   `fp_rev`  a store whose mask convention disagrees with its address
+//             direction writes each register's three longwords in reverse.
+// A load always maps mask bit 7 to FP0, whatever the mode field says.
+wire        fp_mvm   = (HAS_FPU != 0) && (i.ext[15:14] == 2'b11);
+wire        fp_mvst  = fp_mvm && i.ext[13];
+wire        fp_mvpd  = fp_mvst && (i.dst.upd == UPD_PRE);
+wire        fp_lsb   = fp_mvpd;
+wire        fp_rev   = fp_mvst && (i.ext[12] == fp_mvpd);
+// the next register the list selects: the highest bit set, or the lowest for
+// a predecrement store (lib/AP68040 S_FPU_MVM's scan), mapped to a register
+// by the mask convention
+function automatic logic [2:0] mv_bit(input logic [7:0] m, input logic lsb);
+	logic [2:0] b;
+	logic       found;
+	integer     j;
+	b = 3'd0; found = 1'b0;
+	for (j = 7; j >= 0; j = j - 1)
+		if (!found && m[lsb ? (3'd7 - j[2:0]) : j[2:0]]) begin
+			b = lsb ? (3'd7 - j[2:0]) : j[2:0];
+			found = 1'b1;
+		end
+	return b;
+endfunction
+wire  [2:0] fp_mvb  = mv_bit(fp_list, fp_lsb);
+wire  [2:0] fp_mvr  = (!fp_mvst || i.ext[12]) ? (3'd7 - fp_mvb) : fp_mvb;
+assign fp_fm_sel   = fp_mw ? fp_mwsel : fp_fsel;
+assign fp_fm_we    = fp_mw;
+assign fp_fm_wdata = fp_mwd;
+// the longword of the selected register this beat carries, reversed when the
+// conventions disagree
+wire [31:0] fp_mvwv = ((fp_rev ? (2'd2 - fp_k) : fp_k) == 2'd0) ? fp_fm_rdata[95:64] :
+                      ((fp_rev ? (2'd2 - fp_k) : fp_k) == 2'd1) ? fp_fm_rdata[63:32]
+                                                                : fp_fm_rdata[31:0];
 wire        fp_mem_src = ((i.ext[15:13] == 3'b010) && (i.src.kind == EK_MEM)) ||
-                         (fp_cr && !i.ext[13] && (i.src.kind == EK_MEM));
+                         (fp_cr && !i.ext[13] && (i.src.kind == EK_MEM)) ||
+                         (fp_mvm && !i.ext[13]);
 wire        fp_mem_dst = ((i.ext[15:13] == 3'b011) && (i.dst.kind == EK_MEM)) ||
-                         (fp_cr_st && (i.dst.kind == EK_MEM));
+                         (fp_cr_st && (i.dst.kind == EK_MEM)) || fp_mvst;
 assign fp_din      = fp_mem_src             ? fp_buf :
                      (i.src.kind == EK_IMM) ? i.fpimm :
                      (i.size == SZ_B) ? {op_a[7:0],  88'd0} :
@@ -1316,9 +1369,11 @@ wire [31:0] fp_rv  = fp_cr             ? fp_cr_rdata :
 // the operand's length in bytes, and the beats it takes on the bus
 wire  [4:0] fp_nb    = i.imm[4:0];
 wire  [1:0] fp_beats = (fp_nb <= 5'd4) ? 2'd1 : (fp_nb == 5'd8) ? 2'd2 : 2'd3;
-wire  [1:0] fp_bsz   = (fp_nb == 5'd1) ? SZ_B : (fp_nb == 5'd2) ? SZ_W : SZ_L;
-wire [31:0] fp_baddr = (fp_nb <= 5'd2) ? fp_addr : (fp_addr + {28'd0, fp_k, 2'b00});
-wire [31:0] fp_bdata = fp_cr           ? fp_cr_rdata :
+wire  [1:0] fp_bsz   = fp_mvm ? SZ_L : (fp_nb == 5'd1) ? SZ_B : (fp_nb == 5'd2) ? SZ_W : SZ_L;
+wire [31:0] fp_baddr = fp_mvm       ? fp_addr :
+                       (fp_nb <= 5'd2) ? fp_addr : (fp_addr + {28'd0, fp_k, 2'b00});
+wire [31:0] fp_bdata = fp_mvm          ? fp_mvwv :
+                       fp_cr           ? fp_cr_rdata :
                        (fp_nb == 5'd1) ? {24'd0, fp_buf[95:88]} :
                        (fp_nb == 5'd2) ? {16'd0, fp_buf[95:80]} :
                        (fp_k == 2'd0)  ? fp_buf[95:64] :
@@ -1329,8 +1384,8 @@ wire        fp_blast = (fp_k == fp_beats - 2'd1);
 wire        fp_need_res = (i.ext[15:13] == 3'b011);
 // (M10.2) a control-register move sends the unit no command, so what stands
 // in for the interlock is `every selected register has been transferred`
-wire        fp_ok  = fp_cr ? fp_crd
-                           : (fp_live && (fp_dn || (fp_acc && !fp_need_res)));
+wire        fp_ok  = (fp_cr || fp_mvm) ? fp_crd
+                                       : (fp_live && (fp_dn || (fp_acc && !fp_need_res)));
 function automatic ex_t fpu_uop(input ex_t x0, input logic [31:0] rv);
 	ex_t y;
 	y = x0; y.c = rv;
@@ -1360,7 +1415,9 @@ function automatic ex_t fp_st_uop(input ex_t x0, input logic beat, input logic [
 	end
 	return y;
 endfunction
-wire ex_t fp_w = (fp_stt == FS_WR) ? fp_st_uop(x_ord, fp_k != fp_beats, fp_baddr, fp_bdata, fp_bsz)
+wire ex_t fp_w = (fp_stt == FS_WR) ? fp_st_uop(x_ord,
+                                              fp_mvm ? !(fp_crd && fp_k == 2'd3) : (fp_k != fp_beats),
+                                              fp_baddr, fp_bdata, fp_bsz)
                                    : fp_x;
 // The unimplemented-instruction and unsupported-data-type faults, with the
 // frames lib/AP68040's go_fp_unimp / go_fp_unsupp use -- both validated on
@@ -1496,8 +1553,10 @@ wire irq_go = irq_take && eac_v_use && !rst_pending && !older_busy &&
 wire stp_t st = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in),
                                      (HAS_FPU != 0) && (ph == P_FPU), stall_in, fp_live, fp_unimp, fp_unsupp,
                                      i.next_pc, fp_ea_v ? fp_addr : i.pc, fp_ea_v ? fp_addr : 32'd0,
-                                     (fp_stt == FS_RD) && !rd_pend && !(fp_cr && fp_crd), fp_baddr, fp_bsz,
-                                     (fp_stt == FS_WR), (fp_k == fp_beats),
+                                     (fp_stt == FS_RD) && !rd_pend && !((fp_cr || fp_mvm) && fp_crd) && !fp_mw,
+                                     fp_baddr, fp_bsz,
+                                     (fp_stt == FS_WR),
+                                     fp_mvm ? (fp_crd && fp_k == 2'd3) : (fp_k == fp_beats),
                                      fp_ok, fp_mem_dst,
                                      (HAS_FPU != 0) && fp_pend, fp_pvec, i.pc,
                                      (HAS_FPU != 0) && fp_ae, fp_avec, fp_need_res),
@@ -1671,6 +1730,7 @@ always @(posedge clk) begin
 		fp_stt <= FS_RD; fp_k <= 2'd0; fp_addr <= 32'd0;
 		fp_cw <= 1'b0; fp_csel <= 2'd0; fp_cwd <= 32'd0; fp_crd <= 1'b0;
 		fp_ae <= 1'b0; fp_avec <= 8'd0; fp_pend <= 1'b0; fp_pvec <= 8'd0;
+		fp_list <= 8'd0; fp_fsel <= 3'd0; fp_mw <= 1'b0; fp_mwd <= 96'd0; fp_mwsel <= 3'd0;
 		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
 		irq_take <= 1'b0; irq_take_lvl <= 3'd0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
@@ -1768,15 +1828,23 @@ always @(posedge clk) begin
 								// and a store into Dn or An is finished before it
 								// starts -- cr_rdata reads combinationally.
 								fp_crd <= fp_cr_st && !fp_mem_dst;
-								if (fp_cr) begin
+								fp_mw <= 1'b0;
+								// (M10.4) FMOVEM walks a register list, twelve bytes
+								// each: the list is consumed as it goes and the first
+								// register is picked here.
+								fp_list <= i.ext[7:0] & ~(8'd1 << mv_bit(i.ext[7:0], fp_lsb));
+								fp_fsel <= (!fp_mvst || i.ext[12]) ? (3'd7 - mv_bit(i.ext[7:0], fp_lsb))
+								                                   : mv_bit(i.ext[7:0], fp_lsb);
+								// (M10.3) a PENDING exception is taken in front of this
+								// instruction, so nothing of it starts: no command,
+								// no operand beats, no register list
+								if (fp_pend) ;
+								else if (fp_mvm) fp_stt <= fp_mvst ? FS_WR : FS_RD;
+								else if (fp_cr) begin
 									if (fp_mem_src)      fp_stt <= FS_RD;
 									else if (fp_mem_dst) fp_stt <= FS_WR;
 									else                 fp_stt <= FS_REQ;
 								end
-								// (M10.3) a PENDING exception is taken in front of this
-								// instruction, so nothing of it starts: no command and
-								// no operand beats
-								else if (fp_pend) ;
 								else if (fp_mem_src) fp_stt <= FS_RD;        // beats first
 								else begin fp_stt <= FS_REQ; fp_req <= 1'b1; end
 							end
@@ -1857,7 +1925,7 @@ always @(posedge clk) begin
 					if (fp_pend && st.exc_go) fp_pend <= 1'b0;
 					// the memory operand, LEFT aligned: one byte, one word, or
 					// one, two or three longwords
-					if (!fp_cr && fp_stt == FS_RD && cap && rd_tag == T_SLD) begin
+					if (!fp_cr && !fp_mvm && fp_stt == FS_RD && cap && rd_tag == T_SLD) begin
 						case (fp_nb)
 							5'd1: fp_buf[95:88] <= rd_data[7:0];
 							5'd2: fp_buf[95:80] <= rd_data[15:0];
@@ -1876,6 +1944,46 @@ always @(posedge clk) begin
 						// register it was armed for, so the beat index may move on
 						// the same edge.
 						fp_cw <= 1'b0;
+						// (M10.4) FMOVEM: three longwords per register, the list
+						// consumed as it goes.  A load assembles the register in
+						// fp_buf and writes it to the unit's raw port; a store
+						// reads that port and emits one beat per longword.
+						fp_mw <= 1'b0;
+						if (fp_mvm && !fp_crd) begin
+							if (fp_stt == FS_RD && cap && rd_tag == T_SLD) begin
+								case (fp_k)
+									2'd0:    fp_buf[95:64] <= rd_data;
+									2'd1:    fp_buf[63:32] <= rd_data;
+									default: fp_buf[31:0]  <= rd_data;
+								endcase
+								fp_addr <= fp_addr + 32'd4;
+								if (fp_k == 2'd2) begin
+									// the third longword is not in fp_buf yet
+									fp_mw    <= 1'b1;
+									fp_mwsel <= fp_fsel;
+									fp_mwd   <= {fp_buf[95:32], rd_data};
+									fp_k   <= 2'd0;
+									if (fp_list == 8'd0) fp_crd <= 1'b1;
+									else begin
+										fp_list <= fp_list & ~(8'd1 << fp_mvb);
+										fp_fsel <= fp_mvr;
+									end
+								end
+								else fp_k <= fp_k + 2'd1;
+							end
+							if (fp_stt == FS_WR && st.disp) begin
+								fp_addr <= fp_addr + 32'd4;
+								if (fp_k == 2'd2) begin
+									if (fp_list == 8'd0) begin fp_crd <= 1'b1; fp_k <= 2'd3; end
+									else begin
+										fp_list <= fp_list & ~(8'd1 << fp_mvb);
+										fp_fsel <= fp_mvr;
+										fp_k    <= 2'd0;
+									end
+								end
+								else fp_k <= fp_k + 2'd1;
+							end
+						end
 						if (fp_cr && !fp_crd && !fp_cw) begin
 							if (fp_stt == FS_RD && cap && rd_tag == T_SLD) begin
 								fp_cw <= 1'b1; fp_csel <= cr_nth(fp_crmask, fp_k); fp_cwd <= rd_data;
@@ -1896,8 +2004,8 @@ always @(posedge clk) begin
 							end
 						end
 					// the answer is in and the destination is memory: store it
-					if (fp_stt == FS_REQ && fp_ok && fp_mem_dst) begin fp_stt <= FS_WR; fp_k <= 2'd0; end
-					if (fp_stt == FS_WR && st.disp) fp_k <= fp_k + 2'd1;
+					if (!fp_mvm && fp_stt == FS_REQ && fp_ok && fp_mem_dst) begin fp_stt <= FS_WR; fp_k <= 2'd0; end
+					if (!fp_mvm && fp_stt == FS_WR && st.disp) fp_k <= fp_k + 2'd1;
 				end
 				P_PMMU: begin
 					if (!pm_sent && bus_idle) begin
@@ -1994,7 +2102,7 @@ always @(posedge clk) begin
 			// (M10.2) a control-register move releases nothing: it sent no
 			// command, so `done` will never come and a background flag set
 			// here would deadlock the next FP instruction at P_START.
-			if (HAS_FPU != 0 && ph == P_FPU && st.disp && st.fin) fp_bg <= !fp_cr && !(fp_dn || fp_done);
+			if (HAS_FPU != 0 && ph == P_FPU && st.disp && st.fin) fp_bg <= !fp_cr && !fp_mvm && !(fp_dn || fp_done);
 			else if (HAS_FPU != 0 && fp_bg && fp_done)            fp_bg <= 1'b0;
 			// (M10.3) a RELEASED operation's enabled exception: the instruction
 			// has left, so it cannot be reported against it.  It becomes
@@ -2005,7 +2113,7 @@ always @(posedge clk) begin
 			// exception that arrives in the very clock of the release, when
 			// fp_bg is not set yet.
 			if (HAS_FPU != 0 && fp_exc_req &&
-			    (fp_bg || (ph == P_FPU && st.disp && st.fin && !fp_cr && !fp_ae))) begin
+			    (fp_bg || (ph == P_FPU && st.disp && st.fin && !fp_cr && !fp_mvm && !fp_ae))) begin
 				fp_bg   <= 1'b0;
 				fp_pend <= 1'b1;
 				fp_pvec <= fp_exc_vec;

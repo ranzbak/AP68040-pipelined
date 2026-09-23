@@ -145,7 +145,9 @@ typedef struct packed { logic [31:0] ea; logic [31:0] add; logic [31:0] nv; logi
 // nb != 0 overrides the step with an explicit byte count: a floating-point
 // operand is 1, 2, 4, 8 or 12 bytes and the (An)+/-(An) update is by the
 // WHOLE operand, once (lib/AP68040 S_FPU_AN's fp_nb).  The A7 byte rule still
-// applies to the one-byte form.
+// applies to the one-byte form.  (M10.2) a control-register list steps by four
+// per register, (M10.4) an FMOVEM list by twelve -- up to 96, which is why the
+// count is seven bits and not five.
 function automatic eares_t eacomp(input ea_t e, input logic [1:0] sz, input logic [4:0] rb,
                                   input logic [31:0] base_v, input logic [31:0] idx_v,
                                   input logic [31:0] nb);
@@ -170,7 +172,7 @@ endfunction
 // constant zero and the step is the size rule exactly as before -- the
 // comparison must not survive into the LC040 build, because `nb` becomes a
 // mux in the address computation.
-wire [31:0] fp_step = ((HAS_FPU != 0) && (id_i.cls == CL_FPU)) ? {27'd0, id_i.imm[4:0]} : 32'd0;
+wire [31:0] fp_step = ((HAS_FPU != 0) && (id_i.cls == CL_FPU)) ? {25'd0, id_i.imm[6:0]} : 32'd0;
 wire eares_t sres = eacomp(id_i.src, id_i.size, r_sb, f_sb[31:0], f_si[31:0], fp_step);
 // the destination sees the source's update of the same register
 wire [31:0]  db_v = (sres.upd && r_sb == r_db) ? sres.nv : f_db[31:0];
