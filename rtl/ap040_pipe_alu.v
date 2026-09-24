@@ -276,7 +276,11 @@ always @* begin
 			n  = shcnt;
 			r  = 32'd0; c = 1'b0; x2 = f_x; vf = 1'b0;
 			nm = n & (nbits - 6'd1);
-			nx = n % (nbits + 6'd1);
+			// (timing) the same value as n % (nbits + 1), but with a constant
+			// divisor per size: a modulo by a VARIABLE synthesised into a
+			// cascade of compare/subtract carry chains that sat on EX's
+			// flags path (X, then Z through the result) into EA-fetch
+			nx = (size == `AP040_SZ_B) ? (n % 6'd9) : (size == `AP040_SZ_W) ? (n % 6'd17) : (n % 6'd33);
 			ne = (n > nbits) ? nbits : n;
 			cmask = (33'd2 << nbits) - 33'd1;
 			w = ({32'd0, f_x} << nbits) | {1'b0, bm};
