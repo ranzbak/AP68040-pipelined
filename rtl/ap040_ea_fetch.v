@@ -1128,11 +1128,40 @@ wire tr_stop_t0 = {i.imm[15:12], i.imm[10:8]} != {sr_in[15:12], sr_in[10:8]};
 wire tr_t0_ev   = (i.cls == CL_STOP) ? tr_stop_t0 : (i.t0sync || tr_flow);
 wire tr_arm     = sr_in[15] || (sr_in[14] && tr_t0_ev);
 
-wire stp_t st0 = stepf(ph, eac_v_use, rst_pending, i, older_busy, !bf_rdblk, rd_pend, rd_ack, cap,
-                      s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, trap_n, trap_vec,
+// (timing) TRAPcc's decision, br_cc, comes from the CCR EX forwards this
+// clock, and inside stepf it sat at the head of the if-chain that decides
+// `fin` -- so EX's flags reached eaf_stall, and from there EA-calc's
+// redirect, ID's consume and IF's fetch PC.  stepf is therefore evaluated
+// with trap_n = 0 and the TRAPcc arm is applied AFTER it, where br_cc is one
+// term of the last gate.  Exactly equivalent: trap_n implies i.cls ==
+// CL_TRAPCC, so in stepf's P_START/P_OPS arm every class test before the
+// final `else` is false, and so are jmp_odd (JMP/JSR), rts_odd (RTS/RTD) and
+// trap_u (CHK/CHK2/DIV) -- the only arms that could have come first.  With
+// trap_n = 0 that arm reaches the ordinary dispatch instead, which sets only
+// disp/dsel/fin; trapn_ov puts them back to what the trap arm leaves (0) and
+// sets the exception fields the trap arm sets.  The STOP arm's `tr_arm` is
+// likewise given its STOP-only form (tr_t0_ev is tr_stop_t0 when i.cls ==
+// CL_STOP), which is the same value there and has no branch in it.
+function automatic stp_t trapn_ov(input stp_t s0, input logic go, input logic [7:0] vec,
+                                  input logic [31:0] npc, input logic [31:0] pc);
+	stp_t s;
+	s = s0;
+	if (go) begin
+		s.disp = 1'b0; s.dsel = 3'd0; s.fin = 1'b0;
+		s.exc_go = 1'b1; s.ev = vec; s.ef = 4'd2; s.epc = npc; s.eaddr = pc;
+	end
+	return s;
+endfunction
+wire tr_arm_stop = sr_in[15] || (sr_in[14] && tr_stop_t0);
+wire trapn_arm = ((ph == P_START) || (ph == P_OPS)) && eac_v_use && !rst_pending &&
+                 !(i.serialize && older_busy && ph == P_START) && !(i.priv && !s_bit) &&
+                 ops_done && !(rd_pend && !rd_ack);
+wire stp_t st0_nt = stepf(ph, eac_v_use, rst_pending, i, older_busy, !bf_rdblk, rd_pend, rd_ack, cap,
+                      s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, 1'b0, trap_vec,
                       indexed_mode, two_uop, bf_step, sync_busy, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes,
-                      r_fv[15:12] == 4'd7, rs_cnt == 10'd0, HAS_FPU != 0, tr_arm);
+                      r_fv[15:12] == 4'd7, rs_cnt == 10'd0, HAS_FPU != 0, tr_arm_stop);
+wire stp_t st0 = trapn_ov(st0_nt, trap_n && trapn_arm, trap_vec, i.next_pc, i.pc);
 
 //--------------------------------------------------------------- access errors
 // A data read that ends in an access error (M68040UM 8.2.1, p. 8-6): the
@@ -1241,7 +1270,18 @@ function automatic logic [4:0] mm_reg(input logic [3:0] k, input logic pre, inpu
 	j = pre ? 4'd15 - k : k;
 	return (j == 4'd15) ? resolve_sp(R_A7L, s, m) : {1'b0, j};   // 0-7 D0-D7, 8-14 A0-A6
 endfunction
-wire  [3:0] mm_k     = lsb16(mm_mask);
+// (timing) mm_k is a register: lsb16 of the mask is formed the clock before,
+// from the value mm_mask is being given, at every place mm_mask is written
+// (MOVEM start, a load issued, a store dispatched, reset), so mm_k_q always
+// equals lsb16(mm_mask) and the priority encoder is off the path from the
+// mask through the register-file read address (ra_c) into op_c / st_data.
+reg   [3:0] mm_k_q;
+wire  [3:0] mm_k     = mm_k_q;
+`ifndef SYNTHESIS
+always @(posedge clk)
+	if (nreset && mm_k_q !== lsb16(mm_mask))
+		$display("ERROR: ap040_ea_fetch: mm_k_q %0d != lsb16(mm_mask %h) at %0t", mm_k_q, mm_mask, $time);
+`endif
 wire  [4:0] mm_sreg  = mm_p ? mp_reg : mm_reg(mm_k, mm_pre, s_bit, sr_in[12]);
 reg  [23:0] mp_acc;        // MOVEP load: the bytes so far
 wire        mm_one   = (mm_mask & (mm_mask - 16'd1)) == 16'd0;   // at most one register left
@@ -1475,6 +1515,7 @@ wire  [3:0] fp_mvn   = {3'd0, fp_mvmk[7]} + {3'd0, fp_mvmk[6]} + {3'd0, fp_mvmk[
                        {3'd0, fp_mvmk[4]} + {3'd0, fp_mvmk[3]} + {3'd0, fp_mvmk[2]} +
                        {3'd0, fp_mvmk[1]} + {3'd0, fp_mvmk[0]};
 wire  [6:0] fp_mvb12 = {fp_mvn, 3'd0} + {1'b0, fp_mvn, 2'd0};       // 12 x n
+reg   [6:0] fp_mvb12_q;   // fp_mvb12 as it was in the P_FPU entry clock (fp_anv)
 wire        fp_mvpd  = fp_mvst && (i.dst.upd == UPD_PRE);
 wire        fp_lsb   = fp_mvpd;
 wire        fp_rev   = fp_mvst && (i.ext[12] == fp_mvpd);
@@ -1537,9 +1578,15 @@ endfunction
 wire [31:0] fp_fadr = fp_addr + {26'd0, fp_fn, 2'b00};
 // the effective address as EA-calc gave it, before any frame or list walk
 wire [31:0] fp_addr0 = fp_mem_dst ? d_addr_c : s_addr_c;
+// (timing) fp_anv is only used in P_FPU, after the entry clock, and the
+// dynamic list's register cannot change in between: an FP instruction
+// serialises (nothing older is in EX or WB at entry, so op_c is the register
+// file's value), and FMOVEM writes no data register.  So the count latched at
+// entry (fp_mvb12_q) is the same value op_c would give, and EX's forwarded
+// result no longer reaches the An update through the popcount.
 wire [31:0] fp_anv  = fp_mvdy ? ((i.dst.upd == UPD_PRE) || (i.src.upd == UPD_PRE)
-                                ? fp_addr0 - {25'd0, fp_mvb12} + 32'd12
-                                : fp_addr0 + {25'd0, fp_mvb12}) :
+                                ? fp_addr0 - {25'd0, fp_mvb12_q} + 32'd12
+                                : fp_addr0 + {25'd0, fp_mvb12_q}) :
                       fp_sv   ? fp_addr : (fp_addr + 32'd52);
 assign fp_fm_we    = fp_mw;
 assign fp_fm_wdata = fp_mwd;
@@ -2118,7 +2165,7 @@ always @(posedge clk) begin
 		fp_stt <= FS_RD; fp_k <= 2'd0; fp_addr <= 32'd0;
 		fp_cw <= 1'b0; fp_csel <= 2'd0; fp_cwd <= 32'd0; fp_crd <= 1'b0;
 		fp_ae <= 1'b0; fp_avec <= 8'd0; fp_pend <= 1'b0; fp_pvec <= 8'd0;
-		fp_list <= 8'd0; fp_fsel <= 3'd0; fp_mw <= 1'b0; fp_mwd <= 96'd0; fp_mwsel <= 3'd0;
+		fp_list <= 8'd0; fp_mvb12_q <= 7'd0; fp_fsel <= 3'd0; fp_mw <= 1'b0; fp_mwd <= 96'd0; fp_mwsel <= 3'd0;
 		fp_rstp <= 1'b0; fp_idlp <= 1'b0; fp_fmte <= 1'b0;
 		fp_fn <= 4'd0; fp_frm <= 1'b0; fp_svack <= 1'b0; fp_frup <= 1'b0;
 		fr_cmd1 <= 16'd0; fr_cmd3 <= 16'd0; fr_stag <= 3'd0; fr_dtag <= 3'd0;
@@ -2128,7 +2175,7 @@ always @(posedge clk) begin
 		tr_take <= 1'b0; tr_pc <= 32'd0; tr_yield <= 1'b0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
 		cm_v <= 1'b0; cm_ea <= 32'd0; cm_pc <= 32'd0; r_ea <= 32'd0; r_ssw <= 16'd0;
-		mm_mask <= 16'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0; mm_tail <= 1'b0;
+		mm_mask <= 16'd0; mm_k_q <= 4'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0; mm_tail <= 1'b0;
 		mm_have <= 1'b0; mm_hdata <= 32'd0; mm_hreg <= 5'd0; mm_hlast <= 1'b0;
 		mm_bv <= 1'b0; mm_bval <= 32'd0;
 		r_step <= 3'd0; r_sr <= 16'd0; r_pc <= 32'd0; r_fv <= 16'd0;
@@ -2235,6 +2282,7 @@ always @(posedge clk) begin
 								// each: the list is consumed as it goes and the first
 								// register is picked here.
 								fp_list <= fp_mvmk & ~(8'd1 << mv_bit(fp_mvmk, fp_lsb));
+								fp_mvb12_q <= fp_mvb12;
 								fp_fsel <= (!fp_mvst || i.ext[12]) ? (3'd7 - mv_bit(fp_mvmk, fp_lsb))
 								                                   : mv_bit(fp_mvmk, fp_lsb);
 								// (M10.3) a PENDING exception is taken in front of this
@@ -2603,6 +2651,7 @@ always @(posedge clk) begin
 			if (st0.mm_go && ph != P_MOVEM) begin
 				ph       <= P_MOVEM;
 				mm_mask  <= mm_16 ? 16'h000F : i.ext;
+				mm_k_q   <= lsb16(mm_16 ? 16'h000F : i.ext);
 				mm_empty <= !mm_16 && (i.ext == 16'd0);
 				mm_addr  <= mm_16 ? (s_addr_c & ~32'd15) : cm_use ? cm_ea : mm_ld ? s_addr_c : d_addr_c;
 				if (mm_cmi) begin
@@ -2618,6 +2667,7 @@ always @(posedge clk) begin
 				if (mms.issue) begin
 					mm_rreg  <= mm_sreg; mm_rlast <= mm_one; mm_rk <= mm_k[1:0];
 					mm_mask  <= mm_mask & ~(16'd1 << mm_k);
+					mm_k_q   <= lsb16(mm_mask & ~(16'd1 << mm_k));
 					mm_addr  <= mm_addr + mm_sz;
 				end
 				if (mm_16 && cap) begin m16_buf[mm_rk] <= rd_data; m16_have[mm_rk] <= 1'b1; end
@@ -2627,6 +2677,7 @@ always @(posedge clk) begin
 				end
 				if (!mm_lde && mms.disp) begin
 					mm_mask  <= mm_mask & ~(16'd1 << mm_k);
+					mm_k_q   <= lsb16(mm_mask & ~(16'd1 << mm_k));
 					mm_addr  <= mm_pre ? mm_addr - mm_sz : mm_addr + mm_sz;
 				end
 				if (mms.to_buf) begin

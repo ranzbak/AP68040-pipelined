@@ -49,6 +49,9 @@ module ap040_inst_fetch
 
 	input             fetch_hold,   // no new fetch (a PTEST/PFLUSH owns the MMU, M7)
 	input       [1:0] consume,      // words ID takes from the head this clock
+	input       [1:0] consume_nf,   // the same without ID's flush term: equal whenever
+	                                // redirect_valid is low, which is the only time
+	                                // after_c and qpc look at it (timing)
 
 	output            f_req,
 	output     [31:0] f_addr,
@@ -93,8 +96,14 @@ reg        pstop;         // a fetch faulted: no more fetches until a redirect
 
 // PROG_WORDS bounds the words handed to ID (as the milestone-4 IF counted
 // the words it presented), not the words fetched
-assign q_v0  = (qcnt >= 3'd1) && (issued < PROG_WORDS);
-assign q_v1  = (qcnt >= 3'd2) && (issued + 32'd1 < PROG_WORDS);
+// PROG_WORDS >= 32'h7FFF_FFFF means NO bound (the compat wrapper, i.e. every
+// real build): the count would otherwise run out after 2^31 words -- a few
+// minutes of a running Amiga -- and IF would hand ID nothing ever again, a
+// hard freeze with no fault and no halt.  It also kept a 32-bit counter and
+// comparator on the path from IF's queue into ID, EA-calc and the fetch PC.
+localparam PROG_BOUNDED = (PROG_WORDS < 32'h7FFF_FFFF);
+assign q_v0  = (qcnt >= 3'd1) && (!PROG_BOUNDED || (issued < PROG_WORDS));
+assign q_v1  = (qcnt >= 3'd2) && (!PROG_BOUNDED || (issued + 32'd1 < PROG_WORDS));
 assign q_pc0 = qpc;
 assign q_w0  = q[0];
 assign q_w1  = q[1];
@@ -112,7 +121,7 @@ assign f_s = redirect_valid ? redirect_s : fs;
 wire  [1:0] want      = (LONG_ANY != 0 || !fa[1]) ? 2'd2 : 2'd1;
 wire        got       = infl && f_ack;                      // an answer this clock
 wire        use_ans   = got && !fdrop && !redirect_valid;  // ... that goes into the queue
-wire  [2:0] after_c   = redirect_valid ? 3'd0 : (qcnt - {1'b0, consume});
+wire  [2:0] after_c   = redirect_valid ? 3'd0 : (qcnt - {1'b0, consume_nf});
 wire  [2:0] pend      = (!redirect_valid && infl && !fdrop) ? {1'b0, infl_n} : 3'd0;
 assign q_lo = qpc;
 assign q_hi = fpc;
@@ -173,7 +182,7 @@ always @(posedge clk) begin
 			qpc     <= redirect_pc;
 			running <= 1'b1;
 		end else begin
-			qpc <= qpc + {29'd0, consume, 1'b0};
+			qpc <= qpc + {29'd0, consume_nf, 1'b0};
 		end
 		hold   <= redirect_valid && redirect_hold;
 		if (can_issue) begin
