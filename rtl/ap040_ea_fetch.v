@@ -2081,8 +2081,23 @@ wire [2:0] fc_data = s_bit ? 3'd5 : 3'd1;
 // (exception entry's vector read and RTE's pops: supervisor data)
 assign rd_fc     = (st.issue && (ph == P_START || ph == P_OPS) && i.fcsel == 2'd1) ? sfc_in :
                    (ph == P_EXC || ph == P_RTE || ph == P_RESET) ? 3'd5 : fc_data;
+// An early read is issued only for an instruction that is known to be on
+// the executed path.  The instruction finishing here may still redirect --
+// a Bcc (not BRA) or DBcc ID guessed taken, corrected here when not taken; RTS/RTD/RTR;
+// a memory-indirect JMP/JSR -- and then the instruction in EA-calc is on a
+// wrong path and must not read: an Amiga has read-sensitive registers (a
+// CIA's ICR clears on read), and a 68040 reads operands only for the
+// instructions it executes.  The same holds in REDIR_REG's gap clock, when
+// the held redirect is going out.  (Found by the Kickstart bench with the
+// M14 read paths: exec's VHPOSR wait read $DFF006 once more after its DBRA
+// fell through; t_specread_pipe.s.)  `redir_cls` is decoded from this
+// stage's input register, so no term reaches the redirect chain.
+wire   redir_cls = eac_v_use && ((i.cls == CL_BCC && i.cond != 4'h0) || i.cls == CL_DBCC ||
+                                 i.cls == CL_RTS || i.cls == CL_RTD || i.cls == CL_RTR ||
+                                 ((i.cls == CL_JMP || i.cls == CL_JSR) && !eac_i.redirected));
 wire   use_early = early_v && early.v && !st.issue && (!rd_pend || rd_ack) &&
-                   (st.fin || !eac_v_use) && !rst_pending;
+                   (st.fin || !eac_v_use) && !rst_pending &&
+                   !redir_cls && !((REDIR_REG != 0) && rdz_v);
 // An armed interrupt holds back only the reads it can be taken in front of:
 // the instruction still at P_START (irq_go fires only there, or in P_STOP,
 // which reads nothing) and the NEXT instruction's early read.  An
