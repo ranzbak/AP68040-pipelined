@@ -24,6 +24,12 @@
 `include "ap040_defs.svh"
 
 module ap040_mmu
+#(
+	// Plan M14 (AP68040-pipelined): a second, read-only translation port for
+	// the pipelined instruction read path -- see "instruction-side
+	// translation" below.  0 leaves the module exactly as lifted.
+	parameter IFP = 0
+)
 (
 	input             clk,
 	input             nreset,
@@ -93,7 +99,32 @@ module ap040_mmu
 
 	output     [31:0] phys_addr,
 	output            cache_inhibit,
-	output            m_nocache
+	output            m_nocache,
+
+	// instruction-side translation (IFP = 1): launched with the instruction
+	// read path's lookup (ifp_en at an enabled edge, the LOGICAL fetch
+	// address and its S bit); the clock after it ifp_ok says the fetch can be
+	// answered without this module's request port -- translation off, an
+	// ITT0/ITT1 hit, or an ATC hit the S bit may use -- and ifp_pa/ifp_ci are
+	// its physical address and cache-inhibit.  Anything else (a miss that
+	// needs a walk, a supervisor-only page for a user fetch) is ifp_ok = 0:
+	// the fetch goes through c_* as before.
+	input             ifp_en,
+	input      [31:0] ifp_addr,
+	input             ifp_s,
+	output            ifp_ok,
+	output     [31:0] ifp_pa,
+	output            ifp_ci,
+
+	// data-side translation (IFP = 1, plan M14 step 3): the same for the data
+	// read path -- the DATA bank of the ATC, DTT0/DTT1, the read's function
+	// code (only the data spaces 1 and 5 are served: MOVES may name others)
+	input             dfp_en,
+	input      [31:0] dfp_addr,
+	input       [2:0] dfp_fc,
+	output            dfp_ok,
+	output     [31:0] dfp_pa,
+	output            dfp_ci
 );
 
 wire tc_e = tc[15];
@@ -741,5 +772,122 @@ always @(posedge clk) begin
 		endcase
 	end
 end
+
+//---------------------------------------------------------------------------
+// instruction-side translation (plan M14, IFP = 1)
+//---------------------------------------------------------------------------
+// A read-only copy of the ATC's INSTRUCTION bank rows (bank 1 of atc_ram),
+// written by exactly the fill writes the ATC takes for those rows -- the
+// walker's fill is the ATC's only writer -- and read by its own port.
+// Validity is atc_v itself, read in the answer clock, so PFLUSH, the reset
+// clear and a fill's invalidate are seen as they happen.  A fill of the row
+// in the launch edge poisons that lookup (the copy's read and write
+// collide), exactly as the main lookup pipe does.  TTR matching and the
+// translation-off case are the same functions the request port uses.
+generate
+if (IFP != 0) begin : g_ifp
+	reg [ROWW-1:0] iatc [0:15];
+	reg [ROWW-1:0] irow_q;
+	reg     [31:0] i_la;
+	reg            i_sup, i_tce, i_tcp, i_ttr, i_tci, i_col;
+	reg      [3:0] i_set;
+	wire     [3:0] ls_set = tc_p ? ifp_addr[16:13] : ifp_addr[15:12];
+	wire           l_ta   = ttr_match(itt0, ifp_addr, ifp_s);
+	wire           l_tb   = ttr_match(itt1, ifp_addr, ifp_s);
+	always @(posedge clk) begin
+		if (fill_we && fill_row[4]) iatc[fill_row[3:0]] <= fill_wrow;
+		if (ce & ifp_en) begin
+			irow_q <= iatc[ls_set];
+			i_la   <= ifp_addr;
+			i_sup  <= ifp_s;
+			i_tce  <= tc_e;
+			i_tcp  <= tc_p;
+			i_ttr  <= l_ta | l_tb;
+			i_tci  <= l_ta ? itt0[6] : itt1[6];
+			i_set  <= ls_set;
+			i_col  <= fill_we && fill_row == {1'b1, ls_set};
+		end
+	end
+	wire [16:0] i_tag = i_tcp ? {i_sup, i_la[31:17], 1'b0} : {i_sup, i_la[31:16]};
+	wire [EW-1:0] iw0 = irow_q[0*EW +: EW];
+	wire [EW-1:0] iw1 = irow_q[1*EW +: EW];
+	wire [EW-1:0] iw2 = irow_q[2*EW +: EW];
+	wire [EW-1:0] iw3 = irow_q[3*EW +: EW];
+	wire ih0 = atc_v[{1'b1, i_set, 2'd0}] && (iw0[44:28] == i_tag);
+	wire ih1 = atc_v[{1'b1, i_set, 2'd1}] && (iw1[44:28] == i_tag);
+	wire ih2 = atc_v[{1'b1, i_set, 2'd2}] && (iw2[44:28] == i_tag);
+	wire ih3 = atc_v[{1'b1, i_set, 2'd3}] && (iw3[44:28] == i_tag);
+	wire ihit = !i_col && (ih0 | ih1 | ih2 | ih3);
+	wire [EW-1:0] ient = ih0 ? iw0 : ih1 ? iw1 : ih2 ? iw2 : iw3;
+	wire [19:0] ipa   = ient[27:8];
+	wire        is_s  = ient[4];         // supervisor-only page
+	wire        icm1  = ient[3];         // CM[1]: cache-inhibited
+	assign ifp_ok = !i_tce || i_ttr || (ihit && !(!i_sup && is_s));
+	assign ifp_pa = (!i_tce || i_ttr) ? i_la :
+	                i_tcp ? {ipa[19:1], i_la[12], i_la[11:0]} : {ipa, i_la[11:0]};
+	assign ifp_ci = i_ttr ? i_tci : (!i_tce) ? 1'b0 : icm1;
+end else begin : g_noifp
+	assign ifp_ok = 1'b0;
+	assign ifp_pa = 32'd0;
+	assign ifp_ci = 1'b0;
+	wire unused_ifp = ifp_en | ifp_s | (|ifp_addr);
+end
+endgenerate
+
+//---------------------------------------------------------------------------
+// data-side translation (plan M14 step 3, IFP = 1)
+//---------------------------------------------------------------------------
+// The instruction side's copy, for the DATA bank rows (bank 0 of atc_ram).
+// A read of a supervisor-only page by a user access is refused (it must
+// fault through the request port), and so is anything that is not a data
+// space.  Writes never use this port.
+generate
+if (IFP != 0) begin : g_dfp
+	reg [ROWW-1:0] datc [0:15];
+	reg [ROWW-1:0] drow_q;
+	reg     [31:0] d_la;
+	reg            d_sup, d_tce, d_tcp, d_ttr, d_tci, d_col, d_dsp;
+	reg      [3:0] d_set;
+	wire     [3:0] ld_set = tc_p ? dfp_addr[16:13] : dfp_addr[15:12];
+	wire           ld_ta  = ttr_match(dtt0, dfp_addr, dfp_fc[2]);
+	wire           ld_tb  = ttr_match(dtt1, dfp_addr, dfp_fc[2]);
+	always @(posedge clk) begin
+		if (fill_we && !fill_row[4]) datc[fill_row[3:0]] <= fill_wrow;
+		if (ce & dfp_en) begin
+			drow_q <= datc[ld_set];
+			d_la   <= dfp_addr;
+			d_sup  <= dfp_fc[2];
+			d_dsp  <= (dfp_fc == 3'd1) || (dfp_fc == 3'd5);
+			d_tce  <= tc_e;
+			d_tcp  <= tc_p;
+			d_ttr  <= ld_ta | ld_tb;
+			d_tci  <= ld_ta ? dtt0[6] : dtt1[6];
+			d_set  <= ld_set;
+			d_col  <= fill_we && fill_row == {1'b0, ld_set};
+		end
+	end
+	wire [16:0] d_tag = d_tcp ? {d_sup, d_la[31:17], 1'b0} : {d_sup, d_la[31:16]};
+	wire [EW-1:0] dw0 = drow_q[0*EW +: EW];
+	wire [EW-1:0] dw1 = drow_q[1*EW +: EW];
+	wire [EW-1:0] dw2 = drow_q[2*EW +: EW];
+	wire [EW-1:0] dw3 = drow_q[3*EW +: EW];
+	wire dh0 = atc_v[{1'b0, d_set, 2'd0}] && (dw0[44:28] == d_tag);
+	wire dh1 = atc_v[{1'b0, d_set, 2'd1}] && (dw1[44:28] == d_tag);
+	wire dh2 = atc_v[{1'b0, d_set, 2'd2}] && (dw2[44:28] == d_tag);
+	wire dh3 = atc_v[{1'b0, d_set, 2'd3}] && (dw3[44:28] == d_tag);
+	wire dhit = !d_col && (dh0 | dh1 | dh2 | dh3);
+	wire [EW-1:0] dent = dh0 ? dw0 : dh1 ? dw1 : dh2 ? dw2 : dw3;
+	wire [19:0] dpa  = dent[27:8];
+	assign dfp_ok = d_dsp && (!d_tce || d_ttr || (dhit && !(!d_sup && dent[4])));
+	assign dfp_pa = (!d_tce || d_ttr) ? d_la :
+	                d_tcp ? {dpa[19:1], d_la[12], d_la[11:0]} : {dpa, d_la[11:0]};
+	assign dfp_ci = d_ttr ? d_tci : (!d_tce) ? 1'b0 : dent[3];
+end else begin : g_nodfp
+	assign dfp_ok = 1'b0;
+	assign dfp_pa = 32'd0;
+	assign dfp_ci = 1'b0;
+	wire unused_dfp = dfp_en | (|dfp_fc) | (|dfp_addr);
+end
+endgenerate
 
 endmodule

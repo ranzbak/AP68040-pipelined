@@ -46,7 +46,19 @@ module ap040_pipe_core
 	parameter         IRQ                = 0,
 	// 1: the cache maintenance port is live (the wrapper answers cinv_done);
 	// 0: CINV/CPUSH complete at once (the L1 benches have no cache)
-	parameter         CINV               = 0
+	parameter         CINV               = 0,
+	// plan M14 (BUS = 1): IF's fetch is offered to the wrapper's instruction
+	// read path first (ifp_*): a hit is answered the clock after the request,
+	// without the shared port; a miss goes to the BCU's fetch slot as before
+	parameter         IFP                = 0,
+	// plan M14 step 3 (BUS = 1): EA-fetch's data reads are offered to the
+	// wrapper's data read path (dfp_*) as well; a hit is answered the clock
+	// after the request, a miss goes out of the BCU's slot as before
+	parameter         DFP                = 0,
+	// (BUS = 1, STORE_POST = 0) register the synchronous store's completion
+	// (ap040_pipe_bcu DONE_REG): one clock per store, and the memory
+	// acknowledge no longer reaches the stall chain (PLAN M14 / Q23)
+	parameter         STDONE_REG         = 1
 )
 (
 	input  clk,
@@ -167,7 +179,33 @@ module ap040_pipe_core
 	input         fp_unsupp,
 	input         fp_exc_req,
 	input   [7:0] fp_exc_vec,
-	input  [95:0] fp_dout
+	input  [95:0] fp_dout,
+	// the instruction read path (plan M14, IFP = 1): every fetch IF issues at
+	// an enabled clock edge (ifp_req includes ce), its address and S bit.
+	// The wrapper looks each one up; the clock after it ifp_hit says the read
+	// path has the longword (ifp_data).  ifp_try (a REGISTER in the wrapper:
+	// whether the previous fetch's address could be served by the read path)
+	// decides whether a new fetch waits for that answer or goes straight to
+	// the shared port as before.  Tie ifp_hit and ifp_try low with IFP = 0.
+	output        ifp_req,
+	output [31:0] ifp_addr,
+	output        ifp_s,
+	input         ifp_try,
+	input         ifp_hit,
+	input  [31:0] ifp_data,
+	// the data read path (plan M14 step 3, DFP = 1): every read EA-fetch
+	// issues at an enabled edge (dfp_req), its address, size and function
+	// code; the clock after it dfp_hit says the path holds the operand
+	// (dfp_data, right-aligned as a completed read).  The core takes the
+	// answer only if no store older than the read was in flight in either
+	// clock (the BCU's own rule for letting a read go).  Tie dfp_hit low
+	// with DFP = 0.
+	output        dfp_req,
+	output [31:0] dfp_addr,
+	output  [1:0] dfp_size,
+	output  [2:0] dfp_fc,
+	input         dfp_hit,
+	input  [31:0] dfp_data
 );
 
 //--------------------------------------------------------------- stage wires
@@ -434,11 +472,114 @@ generate if (BUS == 0) begin : g_l1
 	assign mem_addr = 32'd0; assign mem_wdata = 32'd0; assign mem_fc = 3'd0; assign bus_st_err = 1'b0;
 	assign d_rd_err = 1'b0; assign d_rd_atc = 1'b0; assign d_rd_ma = 1'b0;
 	assign f_err = 1'b0; assign f_atc = 1'b0;
+	assign ifp_req = 1'b0; assign ifp_addr = 32'd0; assign ifp_s = 1'b0;
+	wire unused_ifp_l1 = ifp_hit | ifp_try | (|ifp_data) | dfp_hit | (|dfp_data);
+	assign dfp_req = 1'b0; assign dfp_addr = 32'd0; assign dfp_size = 2'd0; assign dfp_fc = 3'd0;
 end else begin : g_bus
 
 	assign l1_addr_a = '0;
 	assign l1_en_a   = 1'b0;
-	ap040_pipe_bcu #(.POST(STORE_POST)) u_bcu
+
+	// The data read path (plan M14 step 3).  Every read EA-fetch issues is
+	// looked up (dfp_req); the clock after it the answer is taken -- the
+	// BCU's slot is then answered and never goes on the port -- only if no
+	// store older than the read was in flight in the issuing clock (dfp_q1)
+	// or now: the rule the BCU applies before letting a read go, checked in
+	// both clocks because a store entering EX in the issuing clock is seen
+	// only in the next.  Anything else goes out of the slot as before, with
+	// no clock lost.
+	wire d_rd_fast;
+	wire st_quiet = !(older_store || (exe_valid && exe_o.st_v)) && !(mem_req && mem_write);
+	if (DFP != 0) begin : g_dfp
+		reg dfp_look, dfp_q1;
+		always @(posedge clk)
+			if (!nreset) begin dfp_look <= 1'b0; dfp_q1 <= 1'b0; end
+			else if (ce) begin dfp_look <= d_rd_req; dfp_q1 <= st_quiet; end
+		assign d_rd_fast = dfp_look && dfp_q1 && st_quiet && dfp_hit;
+		assign dfp_req  = d_rd_req && ce;
+		assign dfp_addr = d_rd_addr;
+		assign dfp_size = d_rd_size;
+		assign dfp_fc   = d_rd_fc;
+	end else begin : g_nodfp
+		assign d_rd_fast = 1'b0;
+		assign dfp_req  = 1'b0;
+		assign dfp_addr = 32'd0;
+		assign dfp_size = 2'd0;
+		assign dfp_fc   = 3'd0;
+		wire unused_dfp = dfp_hit | st_quiet;
+	end
+
+	// The BCU's fetch slot (b_f_*): IF's own request with IFP = 0; with
+	// IFP = 1 only the fetches the instruction read path missed.
+	wire        b_f_req, b_f_long, b_f_s, b_f_gnt, b_f_ack, b_f_err, b_f_atc;
+	wire [31:0] b_f_addr, b_f_data;
+	if (IFP != 0) begin : g_ifp
+		// plan M14.  IF keeps its contract -- one fetch outstanding, the
+		// next may issue in the clock the previous one answers.  The wrapper
+		// looks EVERY fetch up (ifp_req is f_req, which includes ce).  When
+		// ifp_try says the stream is in memory the read path serves, the
+		// request is granted at once and answered the next clock by the read
+		// path (ifp_hit); if it misses, it goes to the BCU's fetch slot in
+		// that same clock (or, not granted, from the latched request after
+		// it).  When ifp_try is low -- code the path cannot serve: ROM, chip
+		// RAM, a disabled or inhibited cache -- the request goes to the BCU
+		// directly, exactly as without the path, so that code pays nothing.
+		// A fast answer is never an access error: whatever could fault goes
+		// the slow way.  ifp_try is a register (the previous fetch's
+		// verdict), so no address decode sits on IF's request path.
+		reg        ifp_look;           // a lookup IF waits for answers this clock
+		reg        ifp_mreq;           // a missed fetch waits for the BCU's grant
+		reg        ifp_minfl;          // a fetch is on the BCU
+		reg [31:0] ifp_a;
+		reg        ifp_l, ifp_sv;
+		wire       fast   = ifp_look && ifp_hit;
+		wire       miss   = ifp_look && !ifp_hit;
+		wire       direct = f_req && !ifp_try;           // straight to the port
+		wire       held   = ifp_look || ifp_mreq;        // the latched request
+		assign f_gnt  = direct ? b_f_gnt : f_req;
+		assign f_ack  = fast || (ifp_minfl && b_f_ack);
+		// a word fetch (IF asks for one word only at an address = 2 mod 4)
+		// is answered right-aligned on top, as the BCU does
+		assign f_data = fast ? (ifp_l ? ifp_data : {ifp_data[15:0], 16'h4E71}) : b_f_data;
+		assign f_err  = !fast && b_f_err;
+		assign f_atc  = !fast && b_f_atc;
+		assign b_f_req  = direct || miss || ifp_mreq;
+		assign b_f_addr = held ? ifp_a  : f_addr;
+		assign b_f_long = held ? ifp_l  : f_long;
+		assign b_f_s    = held ? ifp_sv : f_s;
+		assign ifp_req  = f_req;
+		assign ifp_addr = f_addr;
+		assign ifp_s    = f_s;
+		always @(posedge clk) begin
+			if (!nreset) begin
+				ifp_look <= 1'b0; ifp_mreq <= 1'b0; ifp_minfl <= 1'b0;
+				ifp_a <= 32'd0; ifp_l <= 1'b0; ifp_sv <= 1'b1;
+			end else if (ce) begin
+				ifp_look <= f_req && ifp_try;
+				if (f_req && ifp_try) begin ifp_a <= f_addr; ifp_l <= f_long; ifp_sv <= f_s; end
+				// (IF issues nothing while a lookup it waits for misses)
+				if ((miss || ifp_mreq) && b_f_gnt) ifp_mreq <= 1'b0;
+				else if (miss)                      ifp_mreq <= 1'b1;
+				if (b_f_req && b_f_gnt)             ifp_minfl <= 1'b1;
+				else if (ifp_minfl && b_f_ack)      ifp_minfl <= 1'b0;
+			end
+		end
+	end else begin : g_noifp
+		assign b_f_req  = f_req;
+		assign b_f_addr = f_addr;
+		assign b_f_long = f_long;
+		assign b_f_s    = f_s;
+		assign f_gnt    = b_f_gnt;
+		assign f_ack    = b_f_ack;
+		assign f_data   = b_f_data;
+		assign f_err    = b_f_err;
+		assign f_atc    = b_f_atc;
+		assign ifp_req  = 1'b0;
+		assign ifp_addr = 32'd0;
+		assign ifp_s    = 1'b0;
+		wire unused_ifp = ifp_hit | ifp_try | (|ifp_data);
+	end
+	ap040_pipe_bcu #(.POST(STORE_POST), .DONE_REG(STDONE_REG)) u_bcu
 	(
 		.clk(clk), .nreset(nreset), .ce(ce),
 		.st_v(STORE_POST ? (ce && retire && exe_o.st_v) : (exe_valid && exe_o.st_v)),
@@ -448,13 +589,14 @@ end else begin : g_bus
 		.older_st(older_store || (exe_valid && exe_o.st_v)),   // (registered state only: timing)
 		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
 		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(d_rd_err),
-		.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_fc(f_s ? 3'd6 : 3'd2),
-		.f_gnt(f_gnt), .f_ack(f_ack), .f_data(f_data), .f_err(f_err),
+		.rd_fast(d_rd_fast), .rd_fast_data(dfp_data),
+		.f_req(b_f_req), .f_addr(b_f_addr), .f_long(b_f_long), .f_fc(b_f_s ? 3'd6 : 3'd2),
+		.f_gnt(b_f_gnt), .f_ack(b_f_ack), .f_data(b_f_data), .f_err(b_f_err),
 		.st_err(bus_st_err),
 		.mem_req(mem_req), .mem_write(mem_write), .mem_instr(mem_instr), .mem_size(mem_size),
 		.mem_addr(mem_addr), .mem_wdata(mem_wdata), .mem_fc(mem_fc),
 		.mem_ack(mem_ack), .mem_rdata(mem_rdata), .mem_flt(mem_flt), .mem_atc(mem_atc),
-		.rd_atc(d_rd_atc), .rd_ma(d_rd_ma), .f_atc(f_atc),
+		.rd_atc(d_rd_atc), .rd_ma(d_rd_ma), .f_atc(b_f_atc),
 		.tc_e(tc[15]), .tc_p(tc[14])
 	);
 end endgenerate

@@ -38,7 +38,12 @@ module ap040_pipe_tg68k_compat
 	parameter AP040_FILL_CHANNEL = 1,
 	// MinimigAGA_TC64 Stage E2: 0 leaves the 16-bit adapter out and brings the
 	// cache's 32-bit master channel out on m_*, for a wrapper that owns the bus.
-	parameter AP040_BUS16        = 1
+	parameter AP040_BUS16        = 1,
+	// Plan M14 (AP68040-pipelined): the pipelined instruction read path --
+	// IF's fetches are looked up in a read-only copy of the I-cache bank and
+	// answered the clock after they issue, without the shared port.  Needs
+	// AP040_ENABLE_CACHE; 0 is the shared-port A/B reference.
+	parameter AP040_IFP          = 1
 )
 (
 	input         clk,
@@ -271,6 +276,16 @@ wire [31:0] c_dbg_pc, c_dbg_d0, c_dbg_d1, c_dbg_d2, c_dbg_a0, c_dbg_sp, c_dbg_us
 wire [15:0] c_dbg_sr;
 wire        c_dbg_halted;
 
+// the instruction read path (plan M14): see the g_cache block
+localparam IFP_ON = (AP040_IFP != 0) && (AP040_ENABLE_CACHE != 0);
+wire        ifp_req, ifp_s, ifp_hit, ifp_try;
+wire [31:0] ifp_addr, ifp_data;
+// the data read path (plan M14 step 3)
+wire        dfp_req, dfp_hit;
+wire [31:0] dfp_addr, dfp_data;
+wire  [1:0] dfp_size;
+wire  [2:0] dfp_fc;
+
 ap040_pipe_core #(
 	.PC_RESET(32'h0000_0000),
 	.PROG_WORDS(32'h7FFF_FFFF),
@@ -279,7 +294,9 @@ ap040_pipe_core #(
 	.BUS(1),
 	.HAS_FPU(AP040_HAS_FPU), .REDIR_REG(AP040_REDIR_REG),
 	.IRQ(1),
-	.CINV(1)
+	.CINV(1),
+	.IFP(IFP_ON ? 1 : 0),
+	.DFP(IFP_ON ? 1 : 0)
 ) core (
 	.clk(clk),
 	.nreset(nreset),
@@ -336,7 +353,11 @@ ap040_pipe_core #(
 	.fp_fr_fpt(fp_fr_fpt), .fp_fr_et(fp_fr_et),
 	.fp_done(fp_done), .fp_accepted(fp_accepted), .fp_unimp(fp_unimp), .fp_unsupp(fp_unsupp),
 	.fp_exc_req(fp_exc_req), .fp_exc_vec(fp_exc_vec),
-	.fp_dout(fp_dout)
+	.fp_dout(fp_dout),
+	.ifp_req(ifp_req), .ifp_addr(ifp_addr), .ifp_s(ifp_s),
+	.ifp_try(ifp_try), .ifp_hit(ifp_hit), .ifp_data(ifp_data),
+	.dfp_req(dfp_req), .dfp_addr(dfp_addr), .dfp_size(dfp_size), .dfp_fc(dfp_fc),
+	.dfp_hit(dfp_hit), .dfp_data(dfp_data)
 );
 
 // the FPU (M10.1 step 3): lifted from the reference unchanged (02ebcee),
@@ -364,8 +385,14 @@ end endgenerate
 // compat wires it -- the core's request port is its c_* side, the cache
 // its m_* side; PTEST/PFLUSH come from EA-fetch.  AP040_HAS_MMU = 0: a
 // straight connection (physical = logical), PTEST/PFLUSH answered at once.
+// the MMU's instruction-side translation for the read path (plan M14)
+wire        ifp_tok, ifp_tci;
+wire [31:0] ifp_pa;
+wire        dfp_tok, dfp_tci;
+wire [31:0] dfp_pa;
+
 generate if (AP040_HAS_MMU != 0) begin : g_mmu
-ap040_mmu mmu (
+ap040_mmu #(.IFP(IFP_ON ? 1 : 0)) mmu (
 	.clk(clk),
 	.nreset(nreset),
 	.ce(ce_core),
@@ -383,9 +410,28 @@ ap040_mmu mmu (
 	.walker_req(walker_req), .walker_we(walker_we), .walker_addr(walker_addr),
 	.walker_wdat(walker_wdat), .walker_ack(walker_ack), .walker_data(walker_data),
 	.walker_berr(walker_berr),
-	.phys_addr(mmu_addr_phys), .cache_inhibit(mmu_cache_inhibit), .m_nocache(mm_nocache)
+	.phys_addr(mmu_addr_phys), .cache_inhibit(mmu_cache_inhibit), .m_nocache(mm_nocache),
+	.ifp_en(ifp_req), .ifp_addr(ifp_addr), .ifp_s(ifp_s),
+	.ifp_ok(ifp_tok), .ifp_pa(ifp_pa), .ifp_ci(ifp_tci),
+	.dfp_en(dfp_req), .dfp_addr(dfp_addr), .dfp_fc(dfp_fc),
+	.dfp_ok(dfp_tok), .dfp_pa(dfp_pa), .dfp_ci(dfp_tci)
 );
 end else begin : g_nommu
+// no MMU: the read path's translation is the identity
+reg [31:0] ifp_la_q;
+always @(posedge clk) if (ce_core && ifp_req) ifp_la_q <= ifp_addr;
+assign ifp_tok = 1'b1;
+assign ifp_pa  = ifp_la_q;
+assign ifp_tci = 1'b0;
+reg [31:0] dfp_la_q;
+reg        dfp_dsp_q;
+always @(posedge clk) if (ce_core && dfp_req) begin
+	dfp_la_q  <= dfp_addr;
+	dfp_dsp_q <= (dfp_fc == 3'd1) || (dfp_fc == 3'd5);
+end
+assign dfp_tok = dfp_dsp_q;
+assign dfp_pa  = dfp_la_q;
+assign dfp_tci = 1'b0;
 assign mm_req    = mem_req;
 assign mm_write  = mem_write;
 assign mm_instr  = mem_instr;
@@ -481,9 +527,88 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		cache_chip;
 	wire cache_allow = cache_allow_all | cache_win;
 
+	// The instruction read path (plan M14).  The core launches a lookup
+	// with every fetch it issues (ifp_req includes the clock enable): the
+	// cache's read-only copy of the I bank reads the set (virtually indexed:
+	// the index bits lie inside the page offset) and the MMU's copy of the
+	// instruction ATC translates, both in the same edge; the clock after it
+	// the wrapper allows a FAST answer only where the slow path would find
+	// the same line in the same bank and hand it back unchanged:
+	//   * CACR.IE at the launch (the cache's own `ie`);
+	//   * a translation the MMU can give without its request port: TC.E = 0,
+	//     an ITT0/ITT1 hit, or an instruction-ATC hit the fetch's S bit may
+	//     use (ifp_tok), and not cache-inhibited (ifp_tci = CM[1]);
+	//   * the PHYSICAL address in the instruction-cacheable window -- the
+	//     same formula as c_nocache below for an instruction fetch:
+	//     cache_allow_all, or a configured window that is not chip RAM;
+	//   * the cache's tag compare against that physical address.
+	// Everything else goes the slow way and is answered as before.
+	// The windows, as the read paths use them: registered here.  They are
+	// autoconfig state (the chipset clock's domain, set once at boot), and
+	// straight into the data path's hit decision they made a dll_28 ->
+	// clk_38 path of 20 logic levels ending at the BCU's request registers.
+	reg  [4:0] w_z3b0;
+	reg  [3:0] w_z3b1;
+	reg        w_z3e0, w_z3e1, w_z2e;
+	always @(posedge clk) begin
+		w_z3b0 <= cache_z3_base0; w_z3e0 <= cache_z3_ena0;
+		w_z3b1 <= cache_z3_base1; w_z3e1 <= cache_z3_ena1;
+		w_z2e  <= cache_z2_ena;
+	end
+	reg  ifp_ie_q;
+	always @(posedge clk)
+		if (!nreset) ifp_ie_q <= 1'b0;
+		else if (ce_core) ifp_ie_q <= ifp_req && cacr_out[15];
+	wire ia_chip  = (ifp_pa[31:21] == 11'd0);
+	wire ia_win   =
+		((ifp_pa[31:27] == w_z3b0) && w_z3e0) ||
+		((ifp_pa[31:28] == w_z3b1) && w_z3e1) ||
+		(!ifp_pa[31:24] && (ifp_pa[23] ^ |ifp_pa[22:21]) && w_z2e);
+	wire ia_ok    = ifp_ie_q && ifp_tok && !ifp_tci &&
+	                (cache_allow_all || (ia_win && !ia_chip));
+	wire ifp_thit;
+	assign ifp_hit = IFP_ON && ia_ok && ifp_thit;
+	// ifp_try: whether the LAST fetch looked up could have been served here
+	// (everything but the tag compare).  The next fetch waits for the read
+	// path only then; code outside it (ROM, chip RAM, IE off) keeps going
+	// straight to the shared port.  Learned from every fetch, since every
+	// fetch is looked up.
+	reg  ifp_try_q, ifp_launched;
+	always @(posedge clk)
+		if (!nreset) begin ifp_try_q <= 1'b0; ifp_launched <= 1'b0; end
+		else if (ce_core) begin
+			ifp_launched <= ifp_req;
+			if (ifp_launched) ifp_try_q <= ia_ok;
+		end
+	assign ifp_try = IFP_ON && ifp_try_q;
+
+	// The data read path (plan M14 step 3): the same for EA-fetch's reads.
+	// A fast answer is allowed where the slow path would HIT the data bank
+	// and return the same bytes: CACR.DE, a read that fits one aligned
+	// longword (the cache's fits_long), a data space, a translation the MMU
+	// gives without its request port (not cache-inhibited), and the physical
+	// address in the data-cacheable window (chip RAM included: the D side is
+	// snooped).  The core adds the store-order rule.
+	reg  dfp_ok_q;
+	always @(posedge clk)
+		if (!nreset) dfp_ok_q <= 1'b0;
+		else if (ce_core) dfp_ok_q <= dfp_req && cacr_out[31] &&
+			((dfp_size == `AP040_SZ_B) ||
+			 (dfp_size == `AP040_SZ_W && !dfp_addr[0]) ||
+			 (dfp_size == `AP040_SZ_L && dfp_addr[1:0] == 2'b00));
+	wire da_win =
+		((dfp_pa[31:27] == w_z3b0) && w_z3e0) ||
+		((dfp_pa[31:28] == w_z3b1) && w_z3e1) ||
+		(!dfp_pa[31:24] && (dfp_pa[23] ^ |dfp_pa[22:21]) && w_z2e) ||
+		(dfp_pa[31:21] == 11'd0);
+	wire dfp_thit;
+	assign dfp_hit = IFP_ON && dfp_ok_q && dfp_tok && !dfp_tci &&
+	                 (cache_allow_all || da_win) && dfp_thit;
+
 	ap040_cache #(
 		.POST_STORES(AP040_POST_STORES),
-		.FILL_CHANNEL(AP040_FILL_CHANNEL)
+		.FILL_CHANNEL(AP040_FILL_CHANNEL),
+		.IFP(IFP_ON ? 1 : 0)
 	) cache (
 		.clk(clk),
 		.nreset(nreset),
@@ -531,7 +656,18 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.m_rdata(b_rdata),
 		.m_err(berr),
 		.post_busy(post_busy),
-		.post_err(post_err)
+		.post_err(post_err),
+		.ifp_en(ifp_req),
+		.ifp_addr(ifp_addr),
+		.ifp_ptag(ifp_pa[31:10]),
+		.ifp_thit(ifp_thit),
+		.ifp_rdata(ifp_data),
+		.dfp_en(dfp_req),
+		.dfp_addr(dfp_addr),
+		.dfp_size(dfp_size),
+		.dfp_ptag(dfp_pa[31:10]),
+		.dfp_thit(dfp_thit),
+		.dfp_rdata(dfp_data)
 	);
 end
 else begin : g_nocache
@@ -549,6 +685,13 @@ else begin : g_nocache
 	assign mm_ack   = b_ack;
 	assign mm_rdata = b_rdata;
 	assign cinv_done = 1'b1;
+	assign ifp_hit   = 1'b0;    // no cache, no instruction read path
+	assign ifp_try   = 1'b0;
+	assign dfp_hit   = 1'b0;
+	assign dfp_data  = 32'd0;
+	wire unused_dfp = dfp_req | (|dfp_addr) | (|dfp_size) | (|dfp_fc);
+	assign ifp_data  = 32'd0;
+	wire unused_ifp = ifp_req | ifp_s | (|ifp_addr);
 	assign post_busy = 1'b0;    // no cache, no buffer: stores are synchronous
 	assign post_err  = 1'b0;
 	assign fill_req  = 1'b0;    // no cache, no line fills

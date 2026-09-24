@@ -37,7 +37,11 @@ module ap040_cache
 	// channel (fill_ok) takes the whole line as one payload instead of
 	// four longword transactions through the adapter (plan X3.4, A1).
 	// 0 keeps every fill on the adapter path: the A/B reference.
-	parameter FILL_CHANNEL = 1
+	parameter FILL_CHANNEL = 1,
+	// Plan M14 (AP68040-pipelined): a second, pipelined READ port into the
+	// instruction bank -- see "instruction read path" below.  0 leaves the
+	// module exactly as lifted.
+	parameter IFP = 0
 )
 (
 	input             clk,
@@ -78,6 +82,33 @@ module ap040_cache
 	// samples the same signal and builds its format-$7 frame; the cache
 	// must abandon the transfer rather than re-issue it forever.
 	input             m_err,
+
+	// instruction read path (IFP = 1): ifp_en at an enabled edge launches a
+	// lookup of the set and longword ifp_addr[9:2] names -- inside the page
+	// offset, so the LOGICAL address will do (virtually indexed, physically
+	// tagged, as the 68040's caches are); the clock after it ifp_thit says
+	// whether the instruction bank holds the line whose physical tag is
+	// ifp_ptag, and ifp_rdata is that longword.  The requester supplies the
+	// tag (its translation) and qualifies the answer (CACR.IE, cacheability).
+	input             ifp_en,
+	input      [31:0] ifp_addr,
+	input      [21:0] ifp_ptag,    // (answer clock) the PHYSICAL tag, [31:10]
+	output            ifp_thit,
+	output     [31:0] ifp_rdata,
+
+	// data read path (IFP = 1, plan M14 step 3): the same for the DATA
+	// bank.  dfp_en launches a lookup of dfp_addr[9:2] (logical: inside the
+	// page offset); the clock after it dfp_thit says the data bank holds the
+	// line with physical tag dfp_ptag and no write touched that set in the
+	// launch edge or touches it now (a fill, a store's merge or invalidate,
+	// a snoop), and dfp_rdata is the operand, extracted by dfp_size and the
+	// address's low bits as a completed read is.
+	input             dfp_en,
+	input      [31:0] dfp_addr,
+	input       [1:0] dfp_size,
+	input      [21:0] dfp_ptag,
+	output            dfp_thit,
+	output     [31:0] dfp_rdata,
 
 	// Posted store (A2b-1).  post_busy: a store already acknowledged to
 	// the core is still draining to memory; the core's serializing
@@ -930,5 +961,185 @@ always @(posedge clk) begin
 		endcase
 	end
 end
+
+//---------------------------------------------------------------------------
+// instruction read path (plan M14, IFP = 1)
+//---------------------------------------------------------------------------
+// The FSM above serves one request at a time and answers a hit two clocks
+// after accepting it, behind a registered request and ahead of a
+// request-low clock: four clocks a transfer, and the pipelined core's IF
+// needs a longword every clock (PLAN M11.2).  This is a separate read-only
+// copy of the INSTRUCTION bank -- its tags, its data and (in flops) its
+// valid bits -- written by exactly the writes the main arrays take for
+// instruction-bank rows, and read by its own port: the address is taken at
+// the enabled edge the requester launches, the answer is decided on the
+// block-RAM outputs in the following clock.  Nothing the FSM does changes:
+// fills, invalidates, the CINV sweep, the snoop and every store rule are
+// the verified machinery and remain the only writers.  The copy can answer
+// "hit" only for a line the main arrays hold as well, with two exceptions
+// handled here:
+//   * a fill writes the victim way's DATA before its tag, so the way being
+//     filled is masked for the whole fill (C_FILL/C_FILLC/C_FILLW/C_TAGW/
+//     C_FERR) and for the clock after it (the tag copy's read in the edge
+//     that writes it may return either tag);
+//   * a row invalidate (port B) clears the copy's valid bits in the same
+//     edge, and wins over a port-A write to the same row.
+// The instruction bank is never snooped and never written by a store (the
+// 68040 does not snoop its I-cache on CPU writes), so fills and invalidates
+// are its only writers.
+generate
+if (IFP != 0) begin : g_ifp
+	(* ramstyle = "no_rw_check" *) reg [87:0] itag  [0:63];
+	(* ramstyle = "no_rw_check" *) reg [31:0] idat0 [0:255];
+	(* ramstyle = "no_rw_check" *) reg [31:0] idat1 [0:255];
+	(* ramstyle = "no_rw_check" *) reg [31:0] idat2 [0:255];
+	(* ramstyle = "no_rw_check" *) reg [31:0] idat3 [0:255];
+	reg  [87:0] itag_q;
+	reg  [31:0] idat_q0, idat_q1, idat_q2, idat_q3;
+	reg   [3:0] iv [0:63];
+	reg   [5:0] f_set;
+	integer k;
+	always @(posedge clk) begin
+		if (ce & tag_we & tag_widx[6]) itag[tag_widx[5:0]] <= tag_wdat[87:0];
+		if (ce & cd_we[0] & cd_widx[8]) idat0[cd_widx[7:0]] <= cd_wdat;
+		if (ce & cd_we[1] & cd_widx[8]) idat1[cd_widx[7:0]] <= cd_wdat;
+		if (ce & cd_we[2] & cd_widx[8]) idat2[cd_widx[7:0]] <= cd_wdat;
+		if (ce & cd_we[3] & cd_widx[8]) idat3[cd_widx[7:0]] <= cd_wdat;
+		if (ce & ifp_en) begin
+			itag_q  <= itag[ifp_addr[9:4]];
+			idat_q0 <= idat0[ifp_addr[9:2]];
+			idat_q1 <= idat1[ifp_addr[9:2]];
+			idat_q2 <= idat2[ifp_addr[9:2]];
+			idat_q3 <= idat3[ifp_addr[9:2]];
+			f_set   <= ifp_addr[9:4];
+		end
+	end
+	always @(posedge clk) begin
+		if (!nreset) begin
+			for (k = 0; k < 64; k = k + 1) iv[k] <= 4'd0;
+		end else begin
+			if (ce & tag_we & tag_widx[6]) iv[tag_widx[5:0]] <= tag_wdat[91:88];
+			if (inv_wren & inv_idx[6])     iv[inv_idx[5:0]]  <= 4'd0;
+		end
+	end
+	// the way a fill is overwriting, and the clock after the fill ends
+	wire fill_st = (cst == C_FILL) || (cst == C_FILLC) || (cst == C_FILLW) ||
+	               (cst == C_TAGW) || (cst == C_FERR);
+	reg        fm_v;
+	reg  [5:0] fm_set;
+	reg  [1:0] fm_way;
+	always @(posedge clk) begin
+		if (!nreset) fm_v <= 1'b0;
+		else begin
+			fm_v   <= fill_st && r_row[6];
+			fm_set <= r_row[5:0];
+			fm_way <= r_way;
+		end
+	end
+	wire [3:0] mask_now  = (fill_st && r_row[6] && r_row[5:0] == f_set) ? (4'd1 << r_way) : 4'd0;
+	wire [3:0] mask_prev = (fm_v && fm_set == f_set) ? (4'd1 << fm_way) : 4'd0;
+	wire [3:0] vv = iv[f_set] & ~mask_now & ~mask_prev;
+	wire g0 = vv[0] && (itag_q[21:0]  == ifp_ptag);
+	wire g1 = vv[1] && (itag_q[43:22] == ifp_ptag);
+	wire g2 = vv[2] && (itag_q[65:44] == ifp_ptag);
+	wire g3 = vv[3] && (itag_q[87:66] == ifp_ptag);
+	assign ifp_thit  = g0 | g1 | g2 | g3;
+	assign ifp_rdata = g0 ? idat_q0 : g1 ? idat_q1 : g2 ? idat_q2 : idat_q3;
+end else begin : g_noifp
+	assign ifp_thit  = 1'b0;
+	assign ifp_rdata = 32'd0;
+	wire unused_ifp = ifp_en | (|ifp_addr) | (|ifp_ptag);
+end
+endgenerate
+
+//---------------------------------------------------------------------------
+// data read path (plan M14 step 3, IFP = 1)
+//---------------------------------------------------------------------------
+// The instruction path's copy, for the DATA bank.  The data bank has more
+// writers than the instruction bank -- stores merge into it (st_merge) or
+// clear a row (port B), and chipset DMA snoops invalidate rows (port B, not
+// clock-enabled) -- so besides mirroring every one of them, a lookup is
+// refused when any write reaches its SET in the edge that launched it (the
+// copy's read and write collide) or in the answer clock (a snoop landing
+// while the answer is taken).  Store ORDER is the requester's business: the
+// core takes an answer only with no older store in flight.
+generate
+if (IFP != 0) begin : g_dfp
+	(* ramstyle = "no_rw_check" *) reg [87:0] dtag  [0:63];
+	(* ramstyle = "no_rw_check" *) reg [31:0] ddat0 [0:255];
+	(* ramstyle = "no_rw_check" *) reg [31:0] ddat1 [0:255];
+	(* ramstyle = "no_rw_check" *) reg [31:0] ddat2 [0:255];
+	(* ramstyle = "no_rw_check" *) reg [31:0] ddat3 [0:255];
+	reg  [87:0] dtag_q;
+	reg  [31:0] ddat_q0, ddat_q1, ddat_q2, ddat_q3;
+	reg   [3:0] dv [0:63];
+	reg   [5:0] g_set;
+	reg   [1:0] g_size, g_off;
+	reg         g_col;
+	integer k;
+	wire  [5:0] l_set = dfp_addr[9:4];
+	// a write of the data bank's set l_set in this edge
+	wire w_tag = ce & tag_we & !tag_widx[6];
+	wire w_inv = inv_wren & !inv_idx[6];
+	wire w_dat = ce & (|cd_we) & !cd_widx[8];
+	always @(posedge clk) begin
+		if (w_tag) dtag[tag_widx[5:0]] <= tag_wdat[87:0];
+		if (ce & cd_we[0] & !cd_widx[8]) ddat0[cd_widx[7:0]] <= cd_wdat;
+		if (ce & cd_we[1] & !cd_widx[8]) ddat1[cd_widx[7:0]] <= cd_wdat;
+		if (ce & cd_we[2] & !cd_widx[8]) ddat2[cd_widx[7:0]] <= cd_wdat;
+		if (ce & cd_we[3] & !cd_widx[8]) ddat3[cd_widx[7:0]] <= cd_wdat;
+		if (ce & dfp_en) begin
+			dtag_q  <= dtag[l_set];
+			ddat_q0 <= ddat0[dfp_addr[9:2]];
+			ddat_q1 <= ddat1[dfp_addr[9:2]];
+			ddat_q2 <= ddat2[dfp_addr[9:2]];
+			ddat_q3 <= ddat3[dfp_addr[9:2]];
+			g_set   <= l_set;
+			g_size  <= dfp_size;
+			g_off   <= dfp_addr[1:0];
+			g_col   <= (w_tag && tag_widx[5:0] == l_set) ||
+			           (w_inv && inv_idx[5:0] == l_set) ||
+			           (w_dat && cd_widx[7:2] == l_set);
+		end
+	end
+	always @(posedge clk) begin
+		if (!nreset) begin
+			for (k = 0; k < 64; k = k + 1) dv[k] <= 4'd0;
+		end else begin
+			if (w_tag) dv[tag_widx[5:0]] <= tag_wdat[91:88];
+			if (w_inv) dv[inv_idx[5:0]]  <= 4'd0;
+		end
+	end
+	wire fill_d = ((cst == C_FILL) || (cst == C_FILLC) || (cst == C_FILLW) ||
+	               (cst == C_TAGW) || (cst == C_FERR)) && !r_row[6];
+	reg        dm_v;
+	reg  [5:0] dm_set;
+	reg  [1:0] dm_way;
+	always @(posedge clk) begin
+		if (!nreset) dm_v <= 1'b0;
+		else begin
+			dm_v   <= fill_d;
+			dm_set <= r_row[5:0];
+			dm_way <= r_way;
+		end
+	end
+	wire [3:0] dmask_now  = (fill_d && r_row[5:0] == g_set) ? (4'd1 << r_way) : 4'd0;
+	wire [3:0] dmask_prev = (dm_v && dm_set == g_set) ? (4'd1 << dm_way) : 4'd0;
+	wire       d_busy_now = (w_inv && inv_idx[5:0] == g_set) ||
+	                        (w_tag && tag_widx[5:0] == g_set) ||
+	                        (w_dat && cd_widx[7:2] == g_set);
+	wire [3:0] dvv = dv[g_set] & ~dmask_now & ~dmask_prev;
+	wire e0 = dvv[0] && (dtag_q[21:0]  == dfp_ptag);
+	wire e1 = dvv[1] && (dtag_q[43:22] == dfp_ptag);
+	wire e2 = dvv[2] && (dtag_q[65:44] == dfp_ptag);
+	wire e3 = dvv[3] && (dtag_q[87:66] == dfp_ptag);
+	assign dfp_thit  = (e0 | e1 | e2 | e3) && !g_col && !d_busy_now;
+	assign dfp_rdata = lw_extract(e0 ? ddat_q0 : e1 ? ddat_q1 : e2 ? ddat_q2 : ddat_q3, g_size, g_off);
+end else begin : g_nodfp
+	assign dfp_thit  = 1'b0;
+	assign dfp_rdata = 32'd0;
+	wire unused_dfp = dfp_en | (|dfp_addr) | (|dfp_size) | (|dfp_ptag);
+end
+endgenerate
 
 endmodule
