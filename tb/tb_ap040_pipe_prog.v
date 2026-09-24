@@ -18,6 +18,9 @@
 //   m8|m16|m32 <addr> <v>  memory (big-endian)                             //
 //   noread <addr>        no data read may touch this byte (pure writes)     //
 //   fpiar <v>            the FPU's FPIAR, read hierarchically (-DFPU_REAL)  //
+//   x80 <addr> <se> <mant> <n>  an extended value (sign/exponent word,   //
+//                        64-bit mantissa) within n units in the last place //
+//                        (the FPSP's transcendentals: within 1 ulp, plan M10)//
 //   # ...                comment (the # a word of its own)                 //
 // Prints "ALL TESTS PASSED" or one FAIL line per mismatch.                  //
 //                                                                          //
@@ -31,7 +34,8 @@
 module tb_ap040_pipe_prog;
 
 parameter [31:0] PC_RESET = 32'h0000_0400;
-parameter         L1_AW   = 15;     // 64K: the whole image (t_integer uses $3000-$3400 and $F100)
+parameter         L1_AW   = 15;     // 64K: the whole image (t_integer uses $3000-$3400 and $F100);
+                                    // the memory model (-DBUS_MODE) follows it, and the FPSP leg sets 17
 localparam        L1_WORDS = (1 << L1_AW);
 
 reg clk = 0;
@@ -78,6 +82,10 @@ wire [15:0] fp_st_cmd1, fp_st_cmd3, fp_fr_cmd1, fp_fr_cmd3;
 wire  [2:0] fp_st_stag, fp_st_dtag, fp_st_flags, fp_st_grs;
 wire  [2:0] fp_fr_stag, fp_fr_dtag, fp_fr_flags, fp_fr_grs;
 wire [95:0] fp_st_fpt, fp_st_et, fp_fr_fpt, fp_fr_et;
+wire        fp_st_busy, fp_fr_busy, fp_fr_et15, fp_fr_fpt15, fp_fr_resume;
+wire [95:0] fp_st_wbt, fp_fr_wbt;
+wire [31:0] fp_st_fpiar, fp_fr_fpiar;
+wire  [7:0] fp_fr_cusavepc;
 wire        fp_ce = ce;
 `ifdef FPU_REAL
 `include "ap040_fpu_tie.vh"
@@ -107,6 +115,7 @@ assign fp_st_unimp = 1'b0, fp_st_wbte15 = 1'b0;
 assign fp_st_cmd1 = 16'd0, fp_st_cmd3 = 16'd0;
 assign fp_st_stag = 3'd0, fp_st_dtag = 3'd0, fp_st_flags = 3'd0, fp_st_grs = 3'd0;
 assign fp_st_fpt = 96'd0, fp_st_et = 96'd0;
+assign fp_st_busy = 1'b0, fp_st_wbt = 96'd0, fp_st_fpiar = 32'd0, fp_fr_resume = 1'b0;
 `endif
 
 ap040_pipe_core #(
@@ -147,6 +156,10 @@ ap040_pipe_core #(
 	.fp_fr_stag(fp_fr_stag), .fp_fr_dtag(fp_fr_dtag), .fp_fr_flags(fp_fr_flags),
 	.fp_fr_grs(fp_fr_grs), .fp_fr_wbte15(fp_fr_wbte15),
 	.fp_fr_fpt(fp_fr_fpt), .fp_fr_et(fp_fr_et),
+	.fp_st_busy(fp_st_busy), .fp_st_wbt(fp_st_wbt), .fp_st_fpiar(fp_st_fpiar),
+	.fp_fr_busy(fp_fr_busy), .fp_fr_wbt(fp_fr_wbt), .fp_fr_fpiar(fp_fr_fpiar),
+	.fp_fr_cusavepc(fp_fr_cusavepc), .fp_fr_et15(fp_fr_et15), .fp_fr_fpt15(fp_fr_fpt15),
+	.fp_fr_resume(fp_fr_resume),
 	.fp_done(fp_done), .fp_accepted(fp_accepted), .fp_unimp(fp_unimp), .fp_unsupp(fp_unsupp),
 	.fp_exc_req(fp_exc_req), .fp_exc_vec(fp_exc_vec),
 	.fp_dout(fp_dout)
@@ -158,11 +171,11 @@ reg  [7:0] be_kind [0:7];
 reg        be_used [0:7];
 integer    n_be = 0, kbe;
 `ifdef BUS_MODE
-reg [15:0] bmem [0:32767];            // 64K at address 0 (high bits alias, as the L1)
+reg [15:0] bmem [0:L1_WORDS-1];       // 64K at address 0 by default (high bits alias, as the L1)
 function [7:0] mb(input [31:0] a);
 	reg [15:0] w;
 	begin
-		w  = bmem[(a >> 1) & 32'h7FFF];
+		w  = bmem[(a >> 1) & (L1_WORDS - 1)];
 		mb = a[0] ? w[7:0] : w[15:8];
 	end
 endfunction
@@ -205,7 +218,7 @@ function [31:0] mrd(input [31:0] a, input [1:0] sz);
 	endcase
 endfunction
 task mwb(input [31:0] a, input [7:0] b);
-	if (a[0]) bmem[(a >> 1) & 32'h7FFF][7:0] = b; else bmem[(a >> 1) & 32'h7FFF][15:8] = b;
+	if (a[0]) bmem[(a >> 1) & (L1_WORDS - 1)][7:0] = b; else bmem[(a >> 1) & (L1_WORDS - 1)][15:8] = b;
 endtask
 // "berr <addr> <r|w|f>": the first data read / data write / fetch that
 // touches <addr> ends in a bus error instead (one-shot per line), M6
@@ -306,11 +319,19 @@ function [31:0] reg_by_name(input [63:0] n);   // key as a right-justified ASCII
 	endcase
 endfunction
 
-reg [15:0] img [0:32767];
+reg [15:0] img [0:L1_WORDS-1];
 string progf, expf;
 reg [63:0] key;           // (not a string: Icarus crashes comparing string characters)
 integer i, fd, rc, ok, max_cycles, cycles, errors, nchk;
 reg [31:0] halt_pc, a, v, got;
+// "x80": the value's position on the extended-precision number line, in
+// units of the last place.  {exponent, mantissa without the explicit
+// integer bit} is monotonic and continuous across binades (the step from
+// $FFFF.. at exponent e to $8000.. at e+1 is one ulp), denormals included.
+reg [15:0] xse, gse;
+reg [63:0] xman, gman;
+integer    xn;
+reg [77:0] xk_e, xk_g, xk_d;
 reg        done = 0;
 
 // "halted": the program must end in a double fault (the core halts,
@@ -430,11 +451,11 @@ initial begin
 		$finish;
 	end
 	if (!$value$plusargs("cycles=%d", max_cycles)) max_cycles = 20000;
-	for (i = 0; i < 32768; i = i + 1) img[i] = 16'h4E71;
+	for (i = 0; i < L1_WORDS; i = i + 1) img[i] = 16'h4E71;
 	$readmemh(progf, img);
 `ifdef BUS_MODE
 	if (!$value$plusargs("prof=%d", prof)) prof = 0;
-	for (i = 0; i < 32768; i = i + 1) bmem[i] = img[i];
+	for (i = 0; i < L1_WORDS; i = i + 1) bmem[i] = img[i];
 `else
 	for (i = 0; i < L1_WORDS; i = i + 1)
 		dut.u_l1.mem[(i - (PC_RESET >> 1)) & (L1_WORDS - 1)] = img[i];
@@ -468,6 +489,7 @@ initial begin
 			end
 			else if (key == "fc") begin rc = $fscanf(fd, "%h %d", a, v); fc_at[n_fc] = a; fc_want[n_fc] = v[2:0]; n_fc = n_fc + 1; end
 			else if (key == "rb") begin rc = $fscanf(fd, "%h", a); rb_at[n_rbl] = a; n_rbl = n_rbl + 1; end
+			else if (key == "x80") rc = $fscanf(fd, "%h %h %h %d", a, xse, xman, xn);
 			else rc = $fscanf(fd, "%h", v);
 		end
 	end
@@ -517,6 +539,21 @@ initial begin
 			if (got !== v) begin
 				errors = errors + 1;
 				$display("FAIL: fpiar = %h, expected %h", got, v);
+			end
+		end
+		else if (key == "x80") begin
+			rc = $fscanf(fd, "%h %h %h %d", a, xse, xman, xn);
+			nchk = nchk + 1;
+			gse  = {mb(a), mb(a + 1)};
+			gman = {mb(a + 4), mb(a + 5), mb(a + 6), mb(a + 7), mb(a + 8), mb(a + 9), mb(a + 10), mb(a + 11)};
+			xk_e = {xse[14:0], xman[62:0]};
+			xk_g = {gse[14:0], gman[62:0]};
+			xk_d = (xk_g > xk_e) ? xk_g - xk_e : xk_e - xk_g;
+			if (gse[15] !== xse[15] || {mb(a + 2), mb(a + 3)} !== 16'd0 ||
+			    gman[63] !== (gse[14:0] != 15'd0) || xk_d > xn) begin
+				errors = errors + 1;
+				$display("FAIL: x80[%h] = %h_%h, expected %h_%h within %0d ulp (off by %0d)",
+				         a, gse, gman, xse, xman, xn, xk_d);
 			end
 		end
 		else if (key == "#") begin : skipline2

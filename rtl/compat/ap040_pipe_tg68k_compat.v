@@ -268,6 +268,10 @@ wire [15:0] fp_st_cmd1, fp_st_cmd3, fp_fr_cmd1, fp_fr_cmd3;
 wire  [2:0] fp_st_stag, fp_st_dtag, fp_st_flags, fp_st_grs;
 wire  [2:0] fp_fr_stag, fp_fr_dtag, fp_fr_flags, fp_fr_grs;
 wire [95:0] fp_st_fpt, fp_st_et, fp_fr_fpt, fp_fr_et;
+wire        fp_st_busy, fp_fr_busy, fp_fr_et15, fp_fr_fpt15, fp_fr_resume;
+wire [95:0] fp_st_wbt, fp_fr_wbt;
+wire [31:0] fp_st_fpiar, fp_fr_fpiar;
+wire  [7:0] fp_fr_cusavepc;
 wire  [2:0] fp_op_class, fp_src_fmt, fp_src_r, fp_dst_r;
 wire  [6:0] fp_opmode;
 wire [95:0] fp_din, fp_dout;
@@ -351,6 +355,10 @@ ap040_pipe_core #(
 	.fp_fr_stag(fp_fr_stag), .fp_fr_dtag(fp_fr_dtag), .fp_fr_flags(fp_fr_flags),
 	.fp_fr_grs(fp_fr_grs), .fp_fr_wbte15(fp_fr_wbte15),
 	.fp_fr_fpt(fp_fr_fpt), .fp_fr_et(fp_fr_et),
+	.fp_st_busy(fp_st_busy), .fp_st_wbt(fp_st_wbt), .fp_st_fpiar(fp_st_fpiar),
+	.fp_fr_busy(fp_fr_busy), .fp_fr_wbt(fp_fr_wbt), .fp_fr_fpiar(fp_fr_fpiar),
+	.fp_fr_cusavepc(fp_fr_cusavepc), .fp_fr_et15(fp_fr_et15), .fp_fr_fpt15(fp_fr_fpt15),
+	.fp_fr_resume(fp_fr_resume),
 	.fp_done(fp_done), .fp_accepted(fp_accepted), .fp_unimp(fp_unimp), .fp_unsupp(fp_unsupp),
 	.fp_exc_req(fp_exc_req), .fp_exc_vec(fp_exc_vec),
 	.fp_dout(fp_dout),
@@ -379,6 +387,7 @@ assign fp_fpcc = 4'd0, fp_bsun_en = 1'b0;
 	assign fp_st_cmd1 = 16'd0, fp_st_cmd3 = 16'd0;
 	assign fp_st_stag = 3'd0, fp_st_dtag = 3'd0, fp_st_flags = 3'd0, fp_st_grs = 3'd0;
 	assign fp_st_fpt = 96'd0, fp_st_et = 96'd0;
+	assign fp_st_busy = 1'b0, fp_st_wbt = 96'd0, fp_st_fpiar = 32'd0, fp_fr_resume = 1'b0;
 end endgenerate
 
 // the MMU (M7): lifted from the reference as it is, wired as the reference

@@ -15,10 +15,12 @@
 // fp_dout, fp_cr_rdata, fp_fm_rdata (driven back), plus clk, nreset and    //
 // fp_ce.                                                                   //
 //                                                                          //
+// (M10 remainder, 2026-09-24) the $4160 BUSY frame is wired both ways --   //
+// the unit prepares one for every unsupported data type, which is what     //
+// the FPSP's vector-55 handler FSAVEs -- and so is the CU_SAVEPC = $FE     //
+// resume (frestore_cusavepc / _et15 / _fpt15 / frestore_resume).           //
+//                                                                          //
 // TIED OFF, and each one is a recorded gap, not an oversight:              //
-//   frestore_busy /      the $4160 BUSY frame, which needs the deferred    //
-//   fstate_busy          exception path `pend_capture` is tied off for, so  //
-//                        the unit can never be holding one (M10.7).        //
 //   pend_capture         the FSAVE frame of a DEFERRED exception: M10.3    //
 //                        delivers the exception itself, but the e1 state    //
 //                        frame it would leave waits for FSAVE.             //
@@ -48,9 +50,11 @@ ap040_fpu u_fpu
 	.fstate_fpt(fp_st_fpt), .fstate_et(fp_st_et),
 	.fsave_ack(fp_fsave_ack), .frestore_idle(fp_fridle), .frestore_unimp(fp_fr_unimp),
 	.pend_capture(1'b0), .cur_vec(), .frestore_e1_pend(),
-	.fstate_grs(fp_st_grs), .fstate_wbte15(fp_st_wbte15), .fstate_busy(),
-	.fstate_wbt(), .fstate_fpiar_c(),
-	.frestore_wbt(96'd0), .frestore_fpiar(32'd0), .frestore_busy(1'b0),
+	.frestore_cusavepc(fp_fr_cusavepc), .frestore_et15(fp_fr_et15), .frestore_fpt15(fp_fr_fpt15),
+	.frestore_resume(fp_fr_resume),
+	.fstate_grs(fp_st_grs), .fstate_wbte15(fp_st_wbte15), .fstate_busy(fp_st_busy),
+	.fstate_wbt(fp_st_wbt), .fstate_fpiar_c(fp_st_fpiar),
+	.frestore_wbt(fp_fr_wbt), .frestore_fpiar(fp_fr_fpiar), .frestore_busy(fp_fr_busy),
 	.frestore_cmd1(fp_fr_cmd1), .frestore_cmd3(fp_fr_cmd3),
 	.frestore_stag(fp_fr_stag), .frestore_dtag(fp_fr_dtag), .frestore_flags(fp_fr_flags),
 	.frestore_fpt(fp_fr_fpt), .frestore_et(fp_fr_et),
