@@ -75,6 +75,11 @@ module ap040_pipe_bcu
 	output reg        rd_ack,
 	output reg [31:0] rd_data,
 	output reg        rd_err,
+	// plan M14 step 3: the data read path serves the read in the slot this
+	// clock (rd_fast, with its data): it is answered like a completed read
+	// and never goes on the port.  Tie low without the path.
+	input             rd_fast,
+	input      [31:0] rd_fast_data,
 
 	// instruction fetch (IF)
 	input             f_req,
@@ -144,7 +149,7 @@ wire go_st   = POST ? (idle && !sp_on && (sb_cnt != 0)) : (idle && !sp_on && st_
 // A read goes from the slot, never in the clock it is requested: EA-fetch
 // may be sending the older instruction's store to EX in that same clock
 // (an early read), and older_st sees it only once it is there.
-wire go_rd   = idle && !sp_on && (sb_cnt == 0) && !st_v && !older_st && dq_v;
+wire go_rd   = idle && !sp_on && (sb_cnt == 0) && !st_v && !older_st && dq_v && !rd_fast;
 wire go_if   = idle && !sp_on && !go_st && !go_rd && f_req;
 assign f_gnt = go_if;
 
@@ -203,6 +208,12 @@ always @(posedge clk) begin
 		if (POST) sb_cnt <= sb_cnt + (st_v ? 1'b1 : 1'b0) - ((done && kind == K_ST && sp_fin) ? 1'b1 : 1'b0);
 		// a data read request waits in the slot
 		if (rd_req) begin dq_v <= 1'b1; dq_a <= rd_addr; dq_s <= rd_size; dq_f <= rd_fc; end
+		// ... unless the data read path answers it (M14 step 3)
+		if (rd_fast && dq_v) begin
+			dq_v <= 1'b0;
+			rd_ack <= 1'b1; rd_data <= rd_fast_data;
+			rd_err <= 1'b0; rd_atc <= 1'b0; rd_ma <= 1'b0;
+		end
 		// completion
 		if (done && !sp_fin) begin
 			// a byte of a split transfer: on to the next

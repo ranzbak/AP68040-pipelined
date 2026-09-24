@@ -96,6 +96,20 @@ module ap040_cache
 	output            ifp_thit,
 	output     [31:0] ifp_rdata,
 
+	// data read path (IFP = 1, plan M14 step 3): the same for the DATA
+	// bank.  dfp_en launches a lookup of dfp_addr[9:2] (logical: inside the
+	// page offset); the clock after it dfp_thit says the data bank holds the
+	// line with physical tag dfp_ptag and no write touched that set in the
+	// launch edge or touches it now (a fill, a store's merge or invalidate,
+	// a snoop), and dfp_rdata is the operand, extracted by dfp_size and the
+	// address's low bits as a completed read is.
+	input             dfp_en,
+	input      [31:0] dfp_addr,
+	input       [1:0] dfp_size,
+	input      [21:0] dfp_ptag,
+	output            dfp_thit,
+	output     [31:0] dfp_rdata,
+
 	// Posted store (A2b-1).  post_busy: a store already acknowledged to
 	// the core is still draining to memory; the core's serializing
 	// instructions (MOVEC to the MMU, PTEST, PFLUSH) wait for it, and
@@ -1035,6 +1049,96 @@ end else begin : g_noifp
 	assign ifp_thit  = 1'b0;
 	assign ifp_rdata = 32'd0;
 	wire unused_ifp = ifp_en | (|ifp_addr) | (|ifp_ptag);
+end
+endgenerate
+
+//---------------------------------------------------------------------------
+// data read path (plan M14 step 3, IFP = 1)
+//---------------------------------------------------------------------------
+// The instruction path's copy, for the DATA bank.  The data bank has more
+// writers than the instruction bank -- stores merge into it (st_merge) or
+// clear a row (port B), and chipset DMA snoops invalidate rows (port B, not
+// clock-enabled) -- so besides mirroring every one of them, a lookup is
+// refused when any write reaches its SET in the edge that launched it (the
+// copy's read and write collide) or in the answer clock (a snoop landing
+// while the answer is taken).  Store ORDER is the requester's business: the
+// core takes an answer only with no older store in flight.
+generate
+if (IFP != 0) begin : g_dfp
+	(* ramstyle = "no_rw_check" *) reg [87:0] dtag  [0:63];
+	(* ramstyle = "no_rw_check" *) reg [31:0] ddat0 [0:255];
+	(* ramstyle = "no_rw_check" *) reg [31:0] ddat1 [0:255];
+	(* ramstyle = "no_rw_check" *) reg [31:0] ddat2 [0:255];
+	(* ramstyle = "no_rw_check" *) reg [31:0] ddat3 [0:255];
+	reg  [87:0] dtag_q;
+	reg  [31:0] ddat_q0, ddat_q1, ddat_q2, ddat_q3;
+	reg   [3:0] dv [0:63];
+	reg   [5:0] g_set;
+	reg   [1:0] g_size, g_off;
+	reg         g_col;
+	integer k;
+	wire  [5:0] l_set = dfp_addr[9:4];
+	// a write of the data bank's set l_set in this edge
+	wire w_tag = ce & tag_we & !tag_widx[6];
+	wire w_inv = inv_wren & !inv_idx[6];
+	wire w_dat = ce & (|cd_we) & !cd_widx[8];
+	always @(posedge clk) begin
+		if (w_tag) dtag[tag_widx[5:0]] <= tag_wdat[87:0];
+		if (ce & cd_we[0] & !cd_widx[8]) ddat0[cd_widx[7:0]] <= cd_wdat;
+		if (ce & cd_we[1] & !cd_widx[8]) ddat1[cd_widx[7:0]] <= cd_wdat;
+		if (ce & cd_we[2] & !cd_widx[8]) ddat2[cd_widx[7:0]] <= cd_wdat;
+		if (ce & cd_we[3] & !cd_widx[8]) ddat3[cd_widx[7:0]] <= cd_wdat;
+		if (ce & dfp_en) begin
+			dtag_q  <= dtag[l_set];
+			ddat_q0 <= ddat0[dfp_addr[9:2]];
+			ddat_q1 <= ddat1[dfp_addr[9:2]];
+			ddat_q2 <= ddat2[dfp_addr[9:2]];
+			ddat_q3 <= ddat3[dfp_addr[9:2]];
+			g_set   <= l_set;
+			g_size  <= dfp_size;
+			g_off   <= dfp_addr[1:0];
+			g_col   <= (w_tag && tag_widx[5:0] == l_set) ||
+			           (w_inv && inv_idx[5:0] == l_set) ||
+			           (w_dat && cd_widx[7:2] == l_set);
+		end
+	end
+	always @(posedge clk) begin
+		if (!nreset) begin
+			for (k = 0; k < 64; k = k + 1) dv[k] <= 4'd0;
+		end else begin
+			if (w_tag) dv[tag_widx[5:0]] <= tag_wdat[91:88];
+			if (w_inv) dv[inv_idx[5:0]]  <= 4'd0;
+		end
+	end
+	wire fill_d = ((cst == C_FILL) || (cst == C_FILLC) || (cst == C_FILLW) ||
+	               (cst == C_TAGW) || (cst == C_FERR)) && !r_row[6];
+	reg        dm_v;
+	reg  [5:0] dm_set;
+	reg  [1:0] dm_way;
+	always @(posedge clk) begin
+		if (!nreset) dm_v <= 1'b0;
+		else begin
+			dm_v   <= fill_d;
+			dm_set <= r_row[5:0];
+			dm_way <= r_way;
+		end
+	end
+	wire [3:0] dmask_now  = (fill_d && r_row[5:0] == g_set) ? (4'd1 << r_way) : 4'd0;
+	wire [3:0] dmask_prev = (dm_v && dm_set == g_set) ? (4'd1 << dm_way) : 4'd0;
+	wire       d_busy_now = (w_inv && inv_idx[5:0] == g_set) ||
+	                        (w_tag && tag_widx[5:0] == g_set) ||
+	                        (w_dat && cd_widx[7:2] == g_set);
+	wire [3:0] dvv = dv[g_set] & ~dmask_now & ~dmask_prev;
+	wire e0 = dvv[0] && (dtag_q[21:0]  == dfp_ptag);
+	wire e1 = dvv[1] && (dtag_q[43:22] == dfp_ptag);
+	wire e2 = dvv[2] && (dtag_q[65:44] == dfp_ptag);
+	wire e3 = dvv[3] && (dtag_q[87:66] == dfp_ptag);
+	assign dfp_thit  = (e0 | e1 | e2 | e3) && !g_col && !d_busy_now;
+	assign dfp_rdata = lw_extract(e0 ? ddat_q0 : e1 ? ddat_q1 : e2 ? ddat_q2 : ddat_q3, g_size, g_off);
+end else begin : g_nodfp
+	assign dfp_thit  = 1'b0;
+	assign dfp_rdata = 32'd0;
+	wire unused_dfp = dfp_en | (|dfp_addr) | (|dfp_size) | (|dfp_ptag);
 end
 endgenerate
 

@@ -114,7 +114,17 @@ module ap040_mmu
 	input             ifp_s,
 	output            ifp_ok,
 	output     [31:0] ifp_pa,
-	output            ifp_ci
+	output            ifp_ci,
+
+	// data-side translation (IFP = 1, plan M14 step 3): the same for the data
+	// read path -- the DATA bank of the ATC, DTT0/DTT1, the read's function
+	// code (only the data spaces 1 and 5 are served: MOVES may name others)
+	input             dfp_en,
+	input      [31:0] dfp_addr,
+	input       [2:0] dfp_fc,
+	output            dfp_ok,
+	output     [31:0] dfp_pa,
+	output            dfp_ci
 );
 
 wire tc_e = tc[15];
@@ -821,6 +831,62 @@ end else begin : g_noifp
 	assign ifp_pa = 32'd0;
 	assign ifp_ci = 1'b0;
 	wire unused_ifp = ifp_en | ifp_s | (|ifp_addr);
+end
+endgenerate
+
+//---------------------------------------------------------------------------
+// data-side translation (plan M14 step 3, IFP = 1)
+//---------------------------------------------------------------------------
+// The instruction side's copy, for the DATA bank rows (bank 0 of atc_ram).
+// A read of a supervisor-only page by a user access is refused (it must
+// fault through the request port), and so is anything that is not a data
+// space.  Writes never use this port.
+generate
+if (IFP != 0) begin : g_dfp
+	reg [ROWW-1:0] datc [0:15];
+	reg [ROWW-1:0] drow_q;
+	reg     [31:0] d_la;
+	reg            d_sup, d_tce, d_tcp, d_ttr, d_tci, d_col, d_dsp;
+	reg      [3:0] d_set;
+	wire     [3:0] ld_set = tc_p ? dfp_addr[16:13] : dfp_addr[15:12];
+	wire           ld_ta  = ttr_match(dtt0, dfp_addr, dfp_fc[2]);
+	wire           ld_tb  = ttr_match(dtt1, dfp_addr, dfp_fc[2]);
+	always @(posedge clk) begin
+		if (fill_we && !fill_row[4]) datc[fill_row[3:0]] <= fill_wrow;
+		if (ce & dfp_en) begin
+			drow_q <= datc[ld_set];
+			d_la   <= dfp_addr;
+			d_sup  <= dfp_fc[2];
+			d_dsp  <= (dfp_fc == 3'd1) || (dfp_fc == 3'd5);
+			d_tce  <= tc_e;
+			d_tcp  <= tc_p;
+			d_ttr  <= ld_ta | ld_tb;
+			d_tci  <= ld_ta ? dtt0[6] : dtt1[6];
+			d_set  <= ld_set;
+			d_col  <= fill_we && fill_row == {1'b0, ld_set};
+		end
+	end
+	wire [16:0] d_tag = d_tcp ? {d_sup, d_la[31:17], 1'b0} : {d_sup, d_la[31:16]};
+	wire [EW-1:0] dw0 = drow_q[0*EW +: EW];
+	wire [EW-1:0] dw1 = drow_q[1*EW +: EW];
+	wire [EW-1:0] dw2 = drow_q[2*EW +: EW];
+	wire [EW-1:0] dw3 = drow_q[3*EW +: EW];
+	wire dh0 = atc_v[{1'b0, d_set, 2'd0}] && (dw0[44:28] == d_tag);
+	wire dh1 = atc_v[{1'b0, d_set, 2'd1}] && (dw1[44:28] == d_tag);
+	wire dh2 = atc_v[{1'b0, d_set, 2'd2}] && (dw2[44:28] == d_tag);
+	wire dh3 = atc_v[{1'b0, d_set, 2'd3}] && (dw3[44:28] == d_tag);
+	wire dhit = !d_col && (dh0 | dh1 | dh2 | dh3);
+	wire [EW-1:0] dent = dh0 ? dw0 : dh1 ? dw1 : dh2 ? dw2 : dw3;
+	wire [19:0] dpa  = dent[27:8];
+	assign dfp_ok = d_dsp && (!d_tce || d_ttr || (dhit && !(!d_sup && dent[4])));
+	assign dfp_pa = (!d_tce || d_ttr) ? d_la :
+	                d_tcp ? {dpa[19:1], d_la[12], d_la[11:0]} : {dpa, d_la[11:0]};
+	assign dfp_ci = d_ttr ? d_tci : (!d_tce) ? 1'b0 : dent[3];
+end else begin : g_nodfp
+	assign dfp_ok = 1'b0;
+	assign dfp_pa = 32'd0;
+	assign dfp_ci = 1'b0;
+	wire unused_dfp = dfp_en | (|dfp_fc) | (|dfp_addr);
 end
 endgenerate
 

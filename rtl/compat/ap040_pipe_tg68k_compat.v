@@ -280,6 +280,11 @@ wire        c_dbg_halted;
 localparam IFP_ON = (AP040_IFP != 0) && (AP040_ENABLE_CACHE != 0);
 wire        ifp_req, ifp_s, ifp_hit, ifp_try;
 wire [31:0] ifp_addr, ifp_data;
+// the data read path (plan M14 step 3)
+wire        dfp_req, dfp_hit;
+wire [31:0] dfp_addr, dfp_data;
+wire  [1:0] dfp_size;
+wire  [2:0] dfp_fc;
 
 ap040_pipe_core #(
 	.PC_RESET(32'h0000_0000),
@@ -290,7 +295,8 @@ ap040_pipe_core #(
 	.HAS_FPU(AP040_HAS_FPU), .REDIR_REG(AP040_REDIR_REG),
 	.IRQ(1),
 	.CINV(1),
-	.IFP(IFP_ON ? 1 : 0)
+	.IFP(IFP_ON ? 1 : 0),
+	.DFP(IFP_ON ? 1 : 0)
 ) core (
 	.clk(clk),
 	.nreset(nreset),
@@ -349,7 +355,9 @@ ap040_pipe_core #(
 	.fp_exc_req(fp_exc_req), .fp_exc_vec(fp_exc_vec),
 	.fp_dout(fp_dout),
 	.ifp_req(ifp_req), .ifp_addr(ifp_addr), .ifp_s(ifp_s),
-	.ifp_try(ifp_try), .ifp_hit(ifp_hit), .ifp_data(ifp_data)
+	.ifp_try(ifp_try), .ifp_hit(ifp_hit), .ifp_data(ifp_data),
+	.dfp_req(dfp_req), .dfp_addr(dfp_addr), .dfp_size(dfp_size), .dfp_fc(dfp_fc),
+	.dfp_hit(dfp_hit), .dfp_data(dfp_data)
 );
 
 // the FPU (M10.1 step 3): lifted from the reference unchanged (02ebcee),
@@ -380,6 +388,8 @@ end endgenerate
 // the MMU's instruction-side translation for the read path (plan M14)
 wire        ifp_tok, ifp_tci;
 wire [31:0] ifp_pa;
+wire        dfp_tok, dfp_tci;
+wire [31:0] dfp_pa;
 
 generate if (AP040_HAS_MMU != 0) begin : g_mmu
 ap040_mmu #(.IFP(IFP_ON ? 1 : 0)) mmu (
@@ -402,7 +412,9 @@ ap040_mmu #(.IFP(IFP_ON ? 1 : 0)) mmu (
 	.walker_berr(walker_berr),
 	.phys_addr(mmu_addr_phys), .cache_inhibit(mmu_cache_inhibit), .m_nocache(mm_nocache),
 	.ifp_en(ifp_req), .ifp_addr(ifp_addr), .ifp_s(ifp_s),
-	.ifp_ok(ifp_tok), .ifp_pa(ifp_pa), .ifp_ci(ifp_tci)
+	.ifp_ok(ifp_tok), .ifp_pa(ifp_pa), .ifp_ci(ifp_tci),
+	.dfp_en(dfp_req), .dfp_addr(dfp_addr), .dfp_fc(dfp_fc),
+	.dfp_ok(dfp_tok), .dfp_pa(dfp_pa), .dfp_ci(dfp_tci)
 );
 end else begin : g_nommu
 // no MMU: the read path's translation is the identity
@@ -411,6 +423,15 @@ always @(posedge clk) if (ce_core && ifp_req) ifp_la_q <= ifp_addr;
 assign ifp_tok = 1'b1;
 assign ifp_pa  = ifp_la_q;
 assign ifp_tci = 1'b0;
+reg [31:0] dfp_la_q;
+reg        dfp_dsp_q;
+always @(posedge clk) if (ce_core && dfp_req) begin
+	dfp_la_q  <= dfp_addr;
+	dfp_dsp_q <= (dfp_fc == 3'd1) || (dfp_fc == 3'd5);
+end
+assign dfp_tok = dfp_dsp_q;
+assign dfp_pa  = dfp_la_q;
+assign dfp_tci = 1'b0;
 assign mm_req    = mem_req;
 assign mm_write  = mem_write;
 assign mm_instr  = mem_instr;
@@ -549,6 +570,29 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		end
 	assign ifp_try = IFP_ON && ifp_try_q;
 
+	// The data read path (plan M14 step 3): the same for EA-fetch's reads.
+	// A fast answer is allowed where the slow path would HIT the data bank
+	// and return the same bytes: CACR.DE, a read that fits one aligned
+	// longword (the cache's fits_long), a data space, a translation the MMU
+	// gives without its request port (not cache-inhibited), and the physical
+	// address in the data-cacheable window (chip RAM included: the D side is
+	// snooped).  The core adds the store-order rule.
+	reg  dfp_ok_q;
+	always @(posedge clk)
+		if (!nreset) dfp_ok_q <= 1'b0;
+		else if (ce_core) dfp_ok_q <= dfp_req && cacr_out[31] &&
+			((dfp_size == `AP040_SZ_B) ||
+			 (dfp_size == `AP040_SZ_W && !dfp_addr[0]) ||
+			 (dfp_size == `AP040_SZ_L && dfp_addr[1:0] == 2'b00));
+	wire da_win =
+		((dfp_pa[31:27] == cache_z3_base0) && cache_z3_ena0) ||
+		((dfp_pa[31:28] == cache_z3_base1) && cache_z3_ena1) ||
+		(!dfp_pa[31:24] && (dfp_pa[23] ^ |dfp_pa[22:21]) && cache_z2_ena) ||
+		(dfp_pa[31:21] == 11'd0);
+	wire dfp_thit;
+	assign dfp_hit = IFP_ON && dfp_ok_q && dfp_tok && !dfp_tci &&
+	                 (cache_allow_all || da_win) && dfp_thit;
+
 	ap040_cache #(
 		.POST_STORES(AP040_POST_STORES),
 		.FILL_CHANNEL(AP040_FILL_CHANNEL),
@@ -605,7 +649,13 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.ifp_addr(ifp_addr),
 		.ifp_ptag(ifp_pa[31:10]),
 		.ifp_thit(ifp_thit),
-		.ifp_rdata(ifp_data)
+		.ifp_rdata(ifp_data),
+		.dfp_en(dfp_req),
+		.dfp_addr(dfp_addr),
+		.dfp_size(dfp_size),
+		.dfp_ptag(dfp_pa[31:10]),
+		.dfp_thit(dfp_thit),
+		.dfp_rdata(dfp_data)
 	);
 end
 else begin : g_nocache
@@ -625,6 +675,9 @@ else begin : g_nocache
 	assign cinv_done = 1'b1;
 	assign ifp_hit   = 1'b0;    // no cache, no instruction read path
 	assign ifp_try   = 1'b0;
+	assign dfp_hit   = 1'b0;
+	assign dfp_data  = 32'd0;
+	wire unused_dfp = dfp_req | (|dfp_addr) | (|dfp_size) | (|dfp_fc);
 	assign ifp_data  = 32'd0;
 	wire unused_ifp = ifp_req | ifp_s | (|ifp_addr);
 	assign post_busy = 1'b0;    // no cache, no buffer: stores are synchronous

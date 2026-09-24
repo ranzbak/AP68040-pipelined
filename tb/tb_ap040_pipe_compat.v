@@ -48,6 +48,10 @@ reg         walker_berr_r;    // one-shot walker bus error, armed via $F146
 reg         wberr_arm;
 
 reg         mem_ready;
+// the DMA agent's registers (see "A chipset DMA agent" below)
+reg        dma_snp = 1'b0;
+reg [15:0] dma_a = 16'd0, dma_d = 16'd0, dma_n = 16'd0;
+reg        dma_nosnp = 1'b0, dma_arm = 1'b0;
 reg         berr_armed;
 reg   [1:0] irq_exc_armed;
 reg   [2:0] irq_fetch_stall;
@@ -260,7 +264,7 @@ ap040_pipe_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
 	.fill_data(fill_data),
 	.fill_ack(fill_ack),
 	.fill_err(1'b0),
-	.cache_snoop_stb(1'b0), .cache_snoop_addr(32'd0),
+	.cache_snoop_stb(dma_snp), .cache_snoop_addr({16'd0, dma_a}),
 	.cache_z2_ena(1'b0),
 	.cache_z3_base0(5'd0),
 	.cache_z3_ena0(1'b0),
@@ -698,6 +702,33 @@ always @(posedge clk) begin
 	end
 end
 
+// A chipset DMA agent (plan M14 step 3: the data read path's snoop rule).
+// Word writes: $F1E4 = the target address (low 16 bits), $F1E6 = the data
+// word, $F1EA = 1 to suppress the snoop (memory changed behind the caches'
+// backs, as uncached I/O or a disabled cache sees it), and $F1E8 = N arms
+// it: N clocks later the agent writes mem[] directly and, unless
+// suppressed, pulses cache_snoop_stb with the address for one clock -- the
+// shape sdram_ctrl gives the wrapper on hardware.
+// (dma_* are declared ahead of the wrapper instance, which uses them)
+always @(posedge clk) begin
+	dma_snp <= 1'b0;
+	if (!nreset) dma_arm <= 1'b0;
+	else begin
+		if (dut.mem_ack && dut.mem_write && dut.mem_addr[15:0] == 16'hF1E4) dma_a <= dut.mem_wdata[15:0];
+		if (dut.mem_ack && dut.mem_write && dut.mem_addr[15:0] == 16'hF1E6) dma_d <= dut.mem_wdata[15:0];
+		if (dut.mem_ack && dut.mem_write && dut.mem_addr[15:0] == 16'hF1EA) dma_nosnp <= dut.mem_wdata[0];
+		if (dut.mem_ack && dut.mem_write && dut.mem_addr[15:0] == 16'hF1E8) begin
+			dma_arm <= 1'b1; dma_n <= dut.mem_wdata[15:0];
+		end else if (dma_arm) begin
+			if (dma_n == 16'd0) begin
+				dma_arm <= 1'b0;
+				mem[dma_a[15:1]] = dma_d;
+				dma_snp <= !dma_nosnp;
+			end else dma_n <= dma_n - 16'd1;
+		end
+	end
+end
+
 // $F180 (read): a counting register -- every data read of it that the
 // memory port completes adds one to the word at $F182 (a read with a side
 // effect, like a CIA's ICR; t_irq_pipe.s checks that an interrupt never
@@ -707,6 +738,11 @@ always @(posedge clk) begin
 	rdcnt_ack_q <= dut.mem_ack;
 	if (nreset && dut.mem_ack && !rdcnt_ack_q && !dut.mem_write && !dut.mem_instr &&
 	    dut.mem_addr[15:0] == 16'hF180)
+		mem[16'hF182 >> 1] = mem[16'hF182 >> 1] + 1'd1;
+	// (M14 step 3) a read the data read path answers completes the same
+	// read without a mem_ack: count it too
+	if (nreset && dut.ce_core && dut.core.g_bus.d_rd_fast &&
+	    dut.core.g_bus.u_bcu.dq_a[15:0] == 16'hF180)
 		mem[16'hF182 >> 1] = mem[16'hF182 >> 1] + 1'd1;
 end
 

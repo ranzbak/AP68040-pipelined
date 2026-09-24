@@ -10,8 +10,11 @@ T=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-$T/build/m14mut}
 mkdir -p "$OUT"
 PROG=$OUT/t_icache_pipe.hex
+DPROG=$OUT/t_dcache_pipe.hex
 vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OUT/t_icache_pipe.bin" "$T/cache_asm/t_icache_pipe.s" &&
 python3 "$T/bin2hex.py" "$OUT/t_icache_pipe.bin" "$PROG" || exit 1
+vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OUT/t_dcache_pipe.bin" "$T/cache_asm/t_dcache_pipe.s" &&
+python3 "$T/bin2hex.py" "$OUT/t_dcache_pipe.bin" "$DPROG" || exit 1
 
 run_one() {   # name file old new [program hex, default t_icache_pipe]
 	n=$1; f=$2; old=$3; new=$4; prog=${5:-$PROG}
@@ -63,4 +66,27 @@ run_one M9_iatc_valid_ignored compat/ap040_mmu.v \
 #  the same defence the request port's atc_fault keeps)
 run_one M11_iatc_copy_not_filled compat/ap040_mmu.v \
  "if (fill_we && fill_row[4]) iatc" "if (1'b0) iatc" &
+wait
+# step 3: the data read path (t_dcache_pipe.s)
+run_one D1_snoop_not_mirrored compat/ap040_cache.v \
+ "if (w_inv) dv[inv_idx[5:0]]  <= 4'd0;" "" "$DPROG" &
+run_one D2_store_order_ignored ap040_pipe_core.v \
+ "assign d_rd_fast = dfp_look && dfp_q1 && st_quiet && dfp_hit;" "assign d_rd_fast = dfp_look && dfp_hit;" "$DPROG" &
+run_one D3_store_order_launch_clock_only ap040_pipe_core.v \
+ "assign d_rd_fast = dfp_look && dfp_q1 && st_quiet && dfp_hit;" "assign d_rd_fast = dfp_look && dfp_q1 && dfp_hit;" "$DPROG" &
+run_one D4_DE_ignored compat/ap040_pipe_tg68k_compat.v \
+ "else if (ce_core) dfp_ok_q <= dfp_req && cacr_out[31] &&" "else if (ce_core) dfp_ok_q <= dfp_req &&" "$DPROG" &
+run_one D5_CM_inhibit_ignored compat/ap040_pipe_tg68k_compat.v \
+ "dfp_ok_q && dfp_tok && !dfp_tci &&" "dfp_ok_q && dfp_tok &&" "$DPROG" &
+run_one D6_datc_valid_ignored compat/ap040_mmu.v \
+ "ALL:atc_v[{1'b0, d_set, 2'd" "1'b1 | atc_v[{1'b0, d_set, 2'd" "$DPROG" &
+run_one D7_translation_ignored compat/ap040_mmu.v \
+ "assign dfp_pa = (!d_tce || d_ttr) ? d_la :" "assign dfp_pa = 1'b1 ? d_la :" "$DPROG" &
+run_one D8_collision_ignored compat/ap040_cache.v \
+ "&& !g_col && !d_busy_now;" ";" "$DPROG" &
+wait
+run_one D9_merge_not_mirrored compat/ap040_cache.v \
+ "if (ce & cd_we[0] & !cd_widx[8]) ddat0" "if (ce & cd_we[0] & !cd_widx[8] & !st_merge) ddat0" "$DPROG" &
+run_one D10_misaligned_served compat/ap040_pipe_tg68k_compat.v \
+ "(dfp_size == \`AP040_SZ_L && dfp_addr[1:0] == 2'b00));" "(dfp_size == \`AP040_SZ_L));" "$DPROG" &
 wait
