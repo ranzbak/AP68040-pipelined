@@ -93,8 +93,14 @@ reg        pstop;         // a fetch faulted: no more fetches until a redirect
 
 // PROG_WORDS bounds the words handed to ID (as the milestone-4 IF counted
 // the words it presented), not the words fetched
-assign q_v0  = (qcnt >= 3'd1) && (issued < PROG_WORDS);
-assign q_v1  = (qcnt >= 3'd2) && (issued + 32'd1 < PROG_WORDS);
+// PROG_WORDS >= 32'h7FFF_FFFF means NO bound (the compat wrapper, i.e. every
+// real build): the count would otherwise run out after 2^31 words -- a few
+// minutes of a running Amiga -- and IF would hand ID nothing ever again, a
+// hard freeze with no fault and no halt.  It also kept a 32-bit counter and
+// comparator on the path from IF's queue into ID, EA-calc and the fetch PC.
+localparam PROG_BOUNDED = (PROG_WORDS < 32'h7FFF_FFFF);
+assign q_v0  = (qcnt >= 3'd1) && (!PROG_BOUNDED || (issued < PROG_WORDS));
+assign q_v1  = (qcnt >= 3'd2) && (!PROG_BOUNDED || (issued + 32'd1 < PROG_WORDS));
 assign q_pc0 = qpc;
 assign q_w0  = q[0];
 assign q_w1  = q[1];

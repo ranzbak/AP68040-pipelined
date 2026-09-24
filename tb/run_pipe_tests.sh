@@ -242,6 +242,13 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 			fail=1
 		fi
 	done
+	# the 2^31-word freeze: IF's word count preset 256 short of the wrapper's
+	# PROG_WORDS part way into t_integer (tb_issued_wrap.v); it must not wedge
+	iverilog -g2012 -DISSUED_T=200000 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_issued_wrap.vvp" \
+		tb_ap040_pipe_compat.v tb_issued_wrap.v $CSRC > "$WORK/tb_issued_wrap.clog" 2>&1 &&
+	timeout 1800 vvp "$WORK/tb_issued_wrap.vvp" +prog="$WORK/t_integer.hex" +timeout=2000000 > "$WORK/compat_issued_wrap.log" 2>&1 &&
+	grep -q "ALL TESTS PASSED" "$WORK/compat_issued_wrap.log" && grep -q "issued_wrap: IF's word count preset" "$WORK/compat_issued_wrap.log" &&
+		echo "  pass  compat:issued_wrap" || { echo "  FAIL  compat:issued_wrap  (see $WORK/compat_issued_wrap.log)"; fail=1; }
 else
 	echo "  (lib/AP68040 not found: compat bench skipped)"
 fi
