@@ -183,6 +183,9 @@ module ap040_pipe_core
 	output        fp_fr_et15,
 	output        fp_fr_fpt15,
 	input         fp_fr_resume,
+	output        fp_pcap,          // (M10 remainder) the deferred exception's frame
+	input         fp_fr_e1pend,
+	input   [7:0] fp_cur_vec,
 	input         fp_done,
 	input         fp_accepted,
 	input         fp_unimp,
@@ -716,6 +719,7 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HA
 	.fp_fr_busy(fp_fr_busy), .fp_fr_wbt(fp_fr_wbt), .fp_fr_fpiar(fp_fr_fpiar),
 	.fp_fr_cusavepc(fp_fr_cusavepc), .fp_fr_et15(fp_fr_et15), .fp_fr_fpt15(fp_fr_fpt15),
 	.fp_fr_resume(fp_fr_resume),
+	.fp_pcap(fp_pcap), .fp_fr_e1pend(fp_fr_e1pend), .fp_cur_vec(fp_cur_vec),
 	.fp_done(fp_done), .fp_accepted(fp_accepted), .fp_unimp(fp_unimp), .fp_unsupp(fp_unsupp),
 	.fp_exc_req(fp_exc_req), .fp_exc_vec(fp_exc_vec),
 	.fp_dout(fp_dout),

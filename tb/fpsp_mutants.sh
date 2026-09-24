@@ -38,5 +38,11 @@ run BU3 $U 's/sh_cnt <= restore_shift(frestore_et15, frestore_et\[94:80\]);/sh_c
 run BU4 $U 's/{32.d0, din\[63:32\], din\[95:64\]}, 3.d0,$/96'"'"'d0, 3'"'"'d0,/'                     fpr:fpureal_busy
 run BU5 $U 's/{r_din\[95\], 15.h3F80, 16.d0,/{r_din[95], r_din[94:80], 16'"'"'d0,/'                  fpr:fpureal_busy
 run BU6 $U 's/fstate_fpiar_c <= ia_we ? ia_wdata : fpiar;/fstate_fpiar_c <= fpiar;/'                fpr:fpureal_busy
+# the deferred exception's frame (compat: upstream t_fpu_frames.s, whose hex
+# run_pipe_tests.sh leaves in tb/build/)
+run PC1 $E 's/fp_pcap <= 1.b1;     \/\/ the unit/fp_pcap <= 1'"'"'b0;     \/\/ the unit/'                  compat:t_fpu_frames
+run PC2 $E 's/wire        fp_pex     = fp_rs || (fp_sv \&\& fp_st_unimp);/wire        fp_pex     = fp_rs;/'  compat:t_fpu_frames
+run PC3 $E 's/fp_pend <= fp_fr_e1pend \&\& !(fr_busy \&\& fp_fr_resume);/fp_pend <= 1'"'"'b0;/'          compat:t_fpu_frames
+run PC4 $E 's/wire        fp_pex     = fp_rs || (fp_sv \&\& fp_st_unimp);/wire        fp_pex     = fp_sv \&\& fp_st_unimp;/' fpr:fpureal_busy
 wait
 grep -h 'MUTANT\|exit=' "$OUT"/*.log

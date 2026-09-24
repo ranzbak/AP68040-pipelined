@@ -86,6 +86,8 @@ wire        fp_st_busy, fp_fr_busy, fp_fr_et15, fp_fr_fpt15, fp_fr_resume;
 wire [95:0] fp_st_wbt, fp_fr_wbt;
 wire [31:0] fp_st_fpiar, fp_fr_fpiar;
 wire  [7:0] fp_fr_cusavepc;
+wire        fp_pcap, fp_fr_e1pend;
+wire  [7:0] fp_cur_vec;
 wire        fp_ce = ce;
 `ifdef FPU_REAL
 `include "ap040_fpu_tie.vh"
@@ -116,6 +118,7 @@ assign fp_st_cmd1 = 16'd0, fp_st_cmd3 = 16'd0;
 assign fp_st_stag = 3'd0, fp_st_dtag = 3'd0, fp_st_flags = 3'd0, fp_st_grs = 3'd0;
 assign fp_st_fpt = 96'd0, fp_st_et = 96'd0;
 assign fp_st_busy = 1'b0, fp_st_wbt = 96'd0, fp_st_fpiar = 32'd0, fp_fr_resume = 1'b0;
+assign fp_fr_e1pend = 1'b0, fp_cur_vec = 8'd0;
 `endif
 
 ap040_pipe_core #(
@@ -160,6 +163,7 @@ ap040_pipe_core #(
 	.fp_fr_busy(fp_fr_busy), .fp_fr_wbt(fp_fr_wbt), .fp_fr_fpiar(fp_fr_fpiar),
 	.fp_fr_cusavepc(fp_fr_cusavepc), .fp_fr_et15(fp_fr_et15), .fp_fr_fpt15(fp_fr_fpt15),
 	.fp_fr_resume(fp_fr_resume),
+	.fp_pcap(fp_pcap), .fp_fr_e1pend(fp_fr_e1pend), .fp_cur_vec(fp_cur_vec),
 	.fp_done(fp_done), .fp_accepted(fp_accepted), .fp_unimp(fp_unimp), .fp_unsupp(fp_unsupp),
 	.fp_exc_req(fp_exc_req), .fp_exc_vec(fp_exc_vec),
 	.fp_dout(fp_dout)

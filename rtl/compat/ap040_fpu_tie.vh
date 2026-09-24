@@ -20,10 +20,9 @@
 // the FPSP's vector-55 handler FSAVEs -- and so is the CU_SAVEPC = $FE     //
 // resume (frestore_cusavepc / _et15 / _fpt15 / frestore_resume).           //
 //                                                                          //
-// TIED OFF, and each one is a recorded gap, not an oversight:              //
-//   pend_capture         the FSAVE frame of a DEFERRED exception: M10.3    //
-//                        delivers the exception itself, but the e1 state    //
-//                        frame it would leave waits for FSAVE.             //
+// ... and so is the DEFERRED exception's frame: pend_capture, cur_vec and  //
+// frestore_e1_pend (FSAVE extracts it, FRESTORE re-arms it).               //
+// Nothing on the unit is tied off any more.                                //
 //--------------------------------------------------------------------------//
 
 ap040_fpu u_fpu
@@ -49,7 +48,7 @@ ap040_fpu u_fpu
 	.fstate_stag(fp_st_stag), .fstate_dtag(fp_st_dtag), .fstate_flags(fp_st_flags),
 	.fstate_fpt(fp_st_fpt), .fstate_et(fp_st_et),
 	.fsave_ack(fp_fsave_ack), .frestore_idle(fp_fridle), .frestore_unimp(fp_fr_unimp),
-	.pend_capture(1'b0), .cur_vec(), .frestore_e1_pend(),
+	.pend_capture(fp_pcap), .cur_vec(fp_cur_vec), .frestore_e1_pend(fp_fr_e1pend),
 	.frestore_cusavepc(fp_fr_cusavepc), .frestore_et15(fp_fr_et15), .frestore_fpt15(fp_fr_fpt15),
 	.frestore_resume(fp_fr_resume),
 	.fstate_grs(fp_st_grs), .fstate_wbte15(fp_st_wbte15), .fstate_busy(fp_st_busy),

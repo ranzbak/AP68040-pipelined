@@ -1,4 +1,4 @@
-halt 0000058c
+halt 000005bc
 # plan M10 remainder: the $4160 BUSY frame (see the .s for what each case catches)
 # four datatype faults (cases 1, 5, 6, 7); the last one's frame word is vector
 # 55, format $3, with the NEXT instruction's PC -- and an address field of 0,
@@ -134,3 +134,5 @@ m32 000057d4 00000000
 m32 000057d8 bc000000
 m32 000057dc 00000000
 m32 000057e0 00000800
+# 8: the deferred INEX2 went with the NULL FRESTORE: no arithmetic trap at all
+m32 00007020 00000000

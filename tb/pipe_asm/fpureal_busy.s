@@ -43,6 +43,10 @@
 ;      the raw memory image the unit used to leave there lost the single's
 ;      fraction entirely (68040.library found it: 2^-127 came back as a
 ;      negative unnormal).  STAG 5, and the sign stays in ETEMP_EX.
+;   8  a DEFERRED exception (INEX2 enabled, a released FDIV) is pending when
+;      an FRESTORE of the NULL frame arrives: the FRESTORE replaces the state
+;      wholesale and the exception goes with it -- it is not taken in front
+;      of the FRESTORE (lib/AP68040 S_FREST1), nor after it.
 ;
 ; diff: --cycles 150000
 v_flin	equ	unexp
@@ -53,6 +57,7 @@ v_alin	equ	unexp
 v_prv	equ	unexp
 v_fmt	equ	unexp
 v_trp0	equ	unexp
+v_fparith equ	h_arith
 	include	"vectors.inc"
 
 	org	$400
@@ -60,6 +65,7 @@ start:
 	clr.l	$7000			; datatype faults taken
 	clr.l	$7004			; mismatches in the BUSY round trip
 	clr.l	$7008			; the last frame word
+	clr.l	$7020			; arithmetic exceptions taken
 	dc.w	$F23C,$4080,$0000,$0001	; FMOVE.L #1,FP1
 	movea.l	#$5400,a2		; where the handler saves the frame
 	bra.w	c1
@@ -107,6 +113,17 @@ cmpf1:	dbra	d6,cmpf
 	dc.w	$F23C,$44A2,$0040,$0000	; FADD.S #$00400000,FP1  -- 2^-127
 	movea.l	#$5780,a2
 	dc.w	$F23C,$54A3,$8000,$0000,$0000,$0001	; FMUL.D #-2^-1074,FP1
+
+;------------------------------------- 8: FRESTORE discards a pending exception
+	dc.w	$F23C,$9000,$0000,$0200	; FMOVE.L #$0200,FPCR  -- INEX2 enabled
+	dc.w	$F23C,$4000,$0000,$0001	; FMOVE.L #1,FP0
+	dc.w	$F23C,$4080,$0000,$0003	; FMOVE.L #3,FP1
+	dc.w	$F200,$0420		; FDIV    FP1,FP0   -- released, then INEX2
+	moveq	#1,d0
+	add.l	d0,d0			; integer work while it runs
+	movea.l	#$5800,a4
+	dc.w	$F354			; FRESTORE (A4)       -- NULL
+	dc.w	$F23C,$4180,$0000,$0007	; FMOVE.L #7,FP3     -- no trap here either
 halt:
 	bra.s	halt
 
@@ -119,6 +136,10 @@ h_uns:
 	move.l	2(sp),$700C		; the stacked PC
 	move.l	8(sp),$7010		; the effective address
 	dc.w	$F312			; FSAVE (A2)
+	rte
+
+h_arith:
+	addq.l	#1,$7020
 	rte
 
 unexp:
@@ -147,3 +168,6 @@ unexp:
 
 	org	$5300			; 5: 1.25E+2, packed decimal
 	dc.l	$00020001,$25000000,$00000000
+
+	org	$5800			; 8: the NULL frame
+	dc.l	$00000000

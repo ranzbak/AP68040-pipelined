@@ -241,6 +241,11 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 	AP040_MAIN=${AP040_MAIN:-../../AP68040-reference}
 	if [ -f "$AP040_MAIN/tb/asm/t_movem_restart.s" ]; then
 		python3 mk_tmovem.py "$AP040_MAIN/tb/asm/t_movem_restart.s" m9s > "$WORK/t_movem_restart_m9s.s" && TMR=t_movem_restart_m9s
+		# (2026-09-24) the upstream state-frame programs, revision $41: the
+		# BUSY frame's CU_SAVEPC=$FE resume (57 cases) and the frame
+		# lifecycle -- sizes, pointers, format errors, the deferred E1
+		# frame an FSAVE extracts and an FRESTORE re-arms
+		[ -f "$AP040_MAIN/tb/asm/t_fpu_resume.s" ] && TMR="$TMR t_fpu_resume t_fpu_frames"
 	else
 		echo "  (AP68040-reference not found: t_movem_restart skipped)"
 	fi
@@ -258,6 +263,8 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "cache_asm/$t.s"
 		elif [ "$t" = t_irq_pipe ] || [ "$t" = t_mbit_pipe ] || [ "$t" = t_trirq_pipe ] || [ "$t" = t_ipend_pipe ] || [ "$t" = t_irqwedge_pipe ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "irq_asm/$t.s"
+		elif [ "$t" = t_fpu_resume ] || [ "$t" = t_fpu_frames ]; then
+			( cd "$AP040_MAIN/tb/asm" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OLDPWD/$WORK/$t.bin" "$t.s" )
 		else
 			( cd "$AP040_REF/tb/asm" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OLDPWD/$WORK/$t.bin" "$t.s" )
 		fi
