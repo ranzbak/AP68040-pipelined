@@ -57,6 +57,7 @@ module ap040_decode
 	input             pf_atc,
 
 	output      [1:0] consume,    // words taken from the queue this clock
+	output      [1:0] consume_nf, // the same, as if `flush` were low (IF's room check, timing)
 
 	output            id_redirect_valid,
 	output     [31:0] id_redirect_pc,
@@ -1626,6 +1627,13 @@ wire emit = done_i && !flush && !stall_in;
 wire [4:0] need = tot - {1'b0, wcnt};
 assign consume = (flush || stall_in) ? 2'd0 :
                  fbad ? avail : complete ? need[1:0] : avail;
+// (timing) `consume` without the flush term.  ID is flushed only by a
+// redirect (the core's flush_id is a subset of redirect_valid), and IF
+// ignores consume under a redirect wherever it uses this one -- its room
+// check and qpc -- so EA-calc's redirect (and through it the acknowledge ->
+// WB hold -> EA-fetch stall chain) need not reach IF's request through ID.
+assign consume_nf = stall_in ? 2'd0 :
+                    fbad ? avail : complete ? need[1:0] : avail;
 
 // guess taken: Bcc/BRA/BSR redirect IF the clock they are emitted
 assign id_redirect_valid = emit && (d.cls == CL_BCC || d.cls == CL_BSR || d.cls == CL_DBCC);

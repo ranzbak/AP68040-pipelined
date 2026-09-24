@@ -49,6 +49,9 @@ module ap040_inst_fetch
 
 	input             fetch_hold,   // no new fetch (a PTEST/PFLUSH owns the MMU, M7)
 	input       [1:0] consume,      // words ID takes from the head this clock
+	input       [1:0] consume_nf,   // the same without ID's flush term: equal whenever
+	                                // redirect_valid is low, which is the only time
+	                                // after_c and qpc look at it (timing)
 
 	output            f_req,
 	output     [31:0] f_addr,
@@ -118,7 +121,7 @@ assign f_s = redirect_valid ? redirect_s : fs;
 wire  [1:0] want      = (LONG_ANY != 0 || !fa[1]) ? 2'd2 : 2'd1;
 wire        got       = infl && f_ack;                      // an answer this clock
 wire        use_ans   = got && !fdrop && !redirect_valid;  // ... that goes into the queue
-wire  [2:0] after_c   = redirect_valid ? 3'd0 : (qcnt - {1'b0, consume});
+wire  [2:0] after_c   = redirect_valid ? 3'd0 : (qcnt - {1'b0, consume_nf});
 wire  [2:0] pend      = (!redirect_valid && infl && !fdrop) ? {1'b0, infl_n} : 3'd0;
 assign q_lo = qpc;
 assign q_hi = fpc;
@@ -179,7 +182,7 @@ always @(posedge clk) begin
 			qpc     <= redirect_pc;
 			running <= 1'b1;
 		end else begin
-			qpc <= qpc + {29'd0, consume, 1'b0};
+			qpc <= qpc + {29'd0, consume_nf, 1'b0};
 		end
 		hold   <= redirect_valid && redirect_hold;
 		if (can_issue) begin

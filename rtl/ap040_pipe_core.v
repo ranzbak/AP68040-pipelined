@@ -175,7 +175,7 @@ module ap040_pipe_core
 wire        fw_st_v;
 wire [31:0] fw_st_addr, fw_st_data;
 wire  [1:0] fw_st_size;
-wire        q_v0, q_v1;  wire [31:0] q_pc0;  wire [15:0] q_w0, q_w1;  wire [1:0] id_consume;
+wire        q_v0, q_v1;  wire [31:0] q_pc0;  wire [15:0] q_w0, q_w1;  wire [1:0] id_consume, id_consume_nf;
 // self-modifying code: the code the stages younger than EX hold
 wire [31:0] if_q_lo, if_q_hi, id_g_lo, id_g_hi;
 wire        id_g_v, smc_hit, wb_smc;
@@ -469,7 +469,7 @@ ap040_inst_fetch #(
 	.redirect_valid(redirect_valid), .redirect_pc(redirect_pc), .redirect_hold(wb_smc && BUS == 0),
 	.redirect_s((ex_redirect && !wb_smc) ? ex_redirect_s : sr_now[13]), .f_s(f_s),
 	.q_lo(if_q_lo), .q_hi(if_q_hi),
-	.consume(id_consume), .fetch_hold(pmmu_busy || eaf_redir_soon),
+	.consume(id_consume), .consume_nf(id_consume_nf), .fetch_hold(pmmu_busy || eaf_redir_soon),
 	.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_gnt(f_gnt), .f_ack(f_ack), .f_data(f_data),
 	.f_err(f_err), .f_atc(f_atc),
 	.q_e0(q_e0), .q_e1(q_e1), .pf_addr(iff_addr), .pf_long(iff_long), .pf_atc(iff_atc),
@@ -481,7 +481,7 @@ ap040_decode #(.HAS_FPU(HAS_FPU)) u_id
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ea_stall), .flush(flush_id),
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1),
 	.q_e0(q_e0), .q_e1(q_e1), .pf_addr(iff_addr), .pf_long(iff_long), .pf_atc(iff_atc),
-	.consume(id_consume),
+	.consume(id_consume), .consume_nf(id_consume_nf),
 	.id_redirect_valid(id_redirect_valid), .id_redirect_pc(id_redirect_pc),
 	.id_valid(id_valid), .id_o(id_o), .g_lo(id_g_lo), .g_hi(id_g_hi), .g_v(id_g_v)
 );
