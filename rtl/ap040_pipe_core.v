@@ -46,7 +46,11 @@ module ap040_pipe_core
 	parameter         IRQ                = 0,
 	// 1: the cache maintenance port is live (the wrapper answers cinv_done);
 	// 0: CINV/CPUSH complete at once (the L1 benches have no cache)
-	parameter         CINV               = 0
+	parameter         CINV               = 0,
+	// plan M14 (BUS = 1): IF's fetch is offered to the wrapper's instruction
+	// read path first (ifp_*): a hit is answered the clock after the request,
+	// without the shared port; a miss goes to the BCU's fetch slot as before
+	parameter         IFP                = 0
 )
 (
 	input  clk,
@@ -167,7 +171,16 @@ module ap040_pipe_core
 	input         fp_unsupp,
 	input         fp_exc_req,
 	input   [7:0] fp_exc_vec,
-	input  [95:0] fp_dout
+	input  [95:0] fp_dout,
+	// the instruction read path (plan M14, IFP = 1): the fetch IF issues at
+	// an enabled clock edge (ifp_req includes ce), its address and S bit;
+	// the clock after it the wrapper answers ifp_hit with the longword that
+	// contains the fetch.  Tie ifp_hit low with IFP = 0.
+	output        ifp_req,
+	output [31:0] ifp_addr,
+	output        ifp_s,
+	input         ifp_hit,
+	input  [31:0] ifp_data
 );
 
 //--------------------------------------------------------------- stage wires
@@ -434,10 +447,77 @@ generate if (BUS == 0) begin : g_l1
 	assign mem_addr = 32'd0; assign mem_wdata = 32'd0; assign mem_fc = 3'd0; assign bus_st_err = 1'b0;
 	assign d_rd_err = 1'b0; assign d_rd_atc = 1'b0; assign d_rd_ma = 1'b0;
 	assign f_err = 1'b0; assign f_atc = 1'b0;
+	assign ifp_req = 1'b0; assign ifp_addr = 32'd0; assign ifp_s = 1'b0;
+	wire unused_ifp_l1 = ifp_hit | (|ifp_data);
 end else begin : g_bus
 
 	assign l1_addr_a = '0;
 	assign l1_en_a   = 1'b0;
+
+	// The BCU's fetch slot (b_f_*): IF's own request with IFP = 0; with
+	// IFP = 1 only the fetches the instruction read path missed.
+	wire        b_f_req, b_f_long, b_f_s, b_f_gnt, b_f_ack, b_f_err, b_f_atc;
+	wire [31:0] b_f_addr, b_f_data;
+	if (IFP != 0) begin : g_ifp
+		// plan M14.  IF keeps its contract -- one fetch outstanding, the
+		// next may issue in the clock the previous one answers -- and every
+		// request is granted at once.  The wrapper's read path looks the
+		// address up at the edge the request is granted (ifp_req is f_req,
+		// which includes ce) and answers ifp_hit the clock after it.  A miss
+		// (or anything the path will not answer: a disabled or inhibited
+		// cache, translation it cannot do, a fill in progress on that line)
+		// is re-issued on the BCU's fetch slot from the latched request and
+		// answered exactly as before.  A fast answer is never an access
+		// error: whatever could fault goes the slow way.
+		reg        ifp_look;           // a lookup answers this clock
+		reg        ifp_mreq;           // a missed fetch waits for the BCU's grant
+		reg        ifp_minfl;          // ... and is on the port
+		reg [31:0] ifp_a;
+		reg        ifp_l, ifp_sv;
+		wire       fast = ifp_look && ifp_hit;
+		assign f_gnt  = f_req;
+		assign f_ack  = fast || (ifp_minfl && b_f_ack);
+		// a word fetch (IF asks for one word only at an address = 2 mod 4)
+		// is answered right-aligned on top, as the BCU does
+		assign f_data = fast ? (ifp_l ? ifp_data : {ifp_data[15:0], 16'h4E71}) : b_f_data;
+		assign f_err  = !fast && b_f_err;
+		assign f_atc  = !fast && b_f_atc;
+		assign b_f_req  = ifp_mreq;
+		assign b_f_addr = ifp_a;
+		assign b_f_long = ifp_l;
+		assign b_f_s    = ifp_sv;
+		assign ifp_req  = f_req;
+		assign ifp_addr = f_addr;
+		assign ifp_s    = f_s;
+		always @(posedge clk) begin
+			if (!nreset) begin
+				ifp_look <= 1'b0; ifp_mreq <= 1'b0; ifp_minfl <= 1'b0;
+				ifp_a <= 32'd0; ifp_l <= 1'b0; ifp_sv <= 1'b1;
+			end else if (ce) begin
+				if (f_req) begin
+					ifp_look <= 1'b1; ifp_a <= f_addr; ifp_l <= f_long; ifp_sv <= f_s;
+				end else
+					ifp_look <= 1'b0;
+				if (ifp_look && !ifp_hit) ifp_mreq <= 1'b1;
+				if (ifp_mreq && b_f_gnt) begin ifp_mreq <= 1'b0; ifp_minfl <= 1'b1; end
+				if (ifp_minfl && b_f_ack) ifp_minfl <= 1'b0;
+			end
+		end
+	end else begin : g_noifp
+		assign b_f_req  = f_req;
+		assign b_f_addr = f_addr;
+		assign b_f_long = f_long;
+		assign b_f_s    = f_s;
+		assign f_gnt    = b_f_gnt;
+		assign f_ack    = b_f_ack;
+		assign f_data   = b_f_data;
+		assign f_err    = b_f_err;
+		assign f_atc    = b_f_atc;
+		assign ifp_req  = 1'b0;
+		assign ifp_addr = 32'd0;
+		assign ifp_s    = 1'b0;
+		wire unused_ifp = ifp_hit | (|ifp_data);
+	end
 	ap040_pipe_bcu #(.POST(STORE_POST)) u_bcu
 	(
 		.clk(clk), .nreset(nreset), .ce(ce),
@@ -448,13 +528,13 @@ end else begin : g_bus
 		.older_st(older_store || (exe_valid && exe_o.st_v)),   // (registered state only: timing)
 		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
 		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(d_rd_err),
-		.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_fc(f_s ? 3'd6 : 3'd2),
-		.f_gnt(f_gnt), .f_ack(f_ack), .f_data(f_data), .f_err(f_err),
+		.f_req(b_f_req), .f_addr(b_f_addr), .f_long(b_f_long), .f_fc(b_f_s ? 3'd6 : 3'd2),
+		.f_gnt(b_f_gnt), .f_ack(b_f_ack), .f_data(b_f_data), .f_err(b_f_err),
 		.st_err(bus_st_err),
 		.mem_req(mem_req), .mem_write(mem_write), .mem_instr(mem_instr), .mem_size(mem_size),
 		.mem_addr(mem_addr), .mem_wdata(mem_wdata), .mem_fc(mem_fc),
 		.mem_ack(mem_ack), .mem_rdata(mem_rdata), .mem_flt(mem_flt), .mem_atc(mem_atc),
-		.rd_atc(d_rd_atc), .rd_ma(d_rd_ma), .f_atc(f_atc),
+		.rd_atc(d_rd_atc), .rd_ma(d_rd_ma), .f_atc(b_f_atc),
 		.tc_e(tc[15]), .tc_p(tc[14])
 	);
 end endgenerate
