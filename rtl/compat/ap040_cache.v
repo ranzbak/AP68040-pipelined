@@ -84,11 +84,15 @@ module ap040_cache
 	input             m_err,
 
 	// instruction read path (IFP = 1): ifp_en at an enabled edge launches a
-	// lookup of ifp_addr (PHYSICAL); the clock after it ifp_thit says whether
-	// the instruction bank holds that longword, and ifp_rdata is it.  The
-	// requester qualifies the answer (CACR.IE, cacheability, translation).
+	// lookup of the set and longword ifp_addr[9:2] names -- inside the page
+	// offset, so the LOGICAL address will do (virtually indexed, physically
+	// tagged, as the 68040's caches are); the clock after it ifp_thit says
+	// whether the instruction bank holds the line whose physical tag is
+	// ifp_ptag, and ifp_rdata is that longword.  The requester supplies the
+	// tag (its translation) and qualifies the answer (CACR.IE, cacheability).
 	input             ifp_en,
 	input      [31:0] ifp_addr,
+	input      [21:0] ifp_ptag,    // (answer clock) the PHYSICAL tag, [31:10]
 	output            ifp_thit,
 	output     [31:0] ifp_rdata,
 
@@ -979,7 +983,6 @@ if (IFP != 0) begin : g_ifp
 	reg  [87:0] itag_q;
 	reg  [31:0] idat_q0, idat_q1, idat_q2, idat_q3;
 	reg   [3:0] iv [0:63];
-	reg  [21:0] f_tag;
 	reg   [5:0] f_set;
 	integer k;
 	always @(posedge clk) begin
@@ -994,7 +997,6 @@ if (IFP != 0) begin : g_ifp
 			idat_q1 <= idat1[ifp_addr[9:2]];
 			idat_q2 <= idat2[ifp_addr[9:2]];
 			idat_q3 <= idat3[ifp_addr[9:2]];
-			f_tag   <= ifp_addr[31:10];
 			f_set   <= ifp_addr[9:4];
 		end
 	end
@@ -1023,16 +1025,16 @@ if (IFP != 0) begin : g_ifp
 	wire [3:0] mask_now  = (fill_st && r_row[6] && r_row[5:0] == f_set) ? (4'd1 << r_way) : 4'd0;
 	wire [3:0] mask_prev = (fm_v && fm_set == f_set) ? (4'd1 << fm_way) : 4'd0;
 	wire [3:0] vv = iv[f_set] & ~mask_now & ~mask_prev;
-	wire g0 = vv[0] && (itag_q[21:0]  == f_tag);
-	wire g1 = vv[1] && (itag_q[43:22] == f_tag);
-	wire g2 = vv[2] && (itag_q[65:44] == f_tag);
-	wire g3 = vv[3] && (itag_q[87:66] == f_tag);
+	wire g0 = vv[0] && (itag_q[21:0]  == ifp_ptag);
+	wire g1 = vv[1] && (itag_q[43:22] == ifp_ptag);
+	wire g2 = vv[2] && (itag_q[65:44] == ifp_ptag);
+	wire g3 = vv[3] && (itag_q[87:66] == ifp_ptag);
 	assign ifp_thit  = g0 | g1 | g2 | g3;
 	assign ifp_rdata = g0 ? idat_q0 : g1 ? idat_q1 : g2 ? idat_q2 : idat_q3;
 end else begin : g_noifp
 	assign ifp_thit  = 1'b0;
 	assign ifp_rdata = 32'd0;
-	wire unused_ifp = ifp_en | (|ifp_addr);
+	wire unused_ifp = ifp_en | (|ifp_addr) | (|ifp_ptag);
 end
 endgenerate
 

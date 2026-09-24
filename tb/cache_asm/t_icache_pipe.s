@@ -18,6 +18,9 @@
 ;      copy's tags too, so only a tag-0 line shows a stale valid bit)
 ;   3  CACR.IE cleared: fetches bypass the cache, the new code runs
 ;   4  an ITT0 with CM = cache-inhibited over the code: the new code runs
+;  17  the same fetch again, now through the read path's instruction-ATC copy
+;  10  logical page 3 remapped to physical $6000 and PFLUSHA: the ATC copy
+;      must follow atc_v, not keep the old translation
 ;   8  the inhibited fetch in 4 hit a resident line and invalidated it (the
 ;      cache's CI-hit rule, a port-B row write): with the ITT gone and no
 ;      CINV, the next fetch misses and refills -- the new code runs
@@ -34,6 +37,7 @@ R	equ	$23C0		; the rewritten routine: set $3C, which no code of this program sha
 R0	equ	$03C0		; set $3C with physical tag 0 (vector 240: unused)
 R3	equ	$3000		; logical page 3 (physical $3000 with TC off)
 R4	equ	$4000		; physical page 4
+R6	equ	$6000		; physical page 6
 ROOT	equ	$5000
 PTR	equ	$5200
 PAGE	equ	$5400
@@ -118,6 +122,7 @@ start:	move.l	#CACR_ON,d0
 ; 5: TC.E = 1, logical $3000 -> physical $4000
 	move.l	#$70064e75,R3		; physical $3000: moveq #6
 	move.l	#$70074e75,R4		; physical $4000: moveq #7
+	move.l	#$70084e75,R6		; physical $6000: moveq #8
 	cpusha	bc
 	jsr	R3			; TC off: caches the line at physical $3000
 	chkd0	6,15
@@ -142,6 +147,12 @@ start:	move.l	#CACR_ON,d0
 	movec	d0,tc
 	jsr	R3			; logical $3000 = physical $4000
 	chkd0	7,5
+	jsr	R3			; again: the read path's ATC copy translates it
+	chkd0	7,17
+	move.l	#R6|1,PAGE+3*4		; remap logical page 3 -> physical $6000
+	pflusha				; (the ATC copy must follow atc_v)
+	jsr	R3
+	chkd0	8,10
 	moveq	#0,d0
 	movec	d0,tc
 	pflusha

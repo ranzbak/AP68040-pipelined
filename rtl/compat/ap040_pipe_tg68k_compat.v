@@ -278,7 +278,7 @@ wire        c_dbg_halted;
 
 // the instruction read path (plan M14): see the g_cache block
 localparam IFP_ON = (AP040_IFP != 0) && (AP040_ENABLE_CACHE != 0);
-wire        ifp_req, ifp_s, ifp_hit;
+wire        ifp_req, ifp_s, ifp_hit, ifp_try;
 wire [31:0] ifp_addr, ifp_data;
 
 ap040_pipe_core #(
@@ -349,7 +349,7 @@ ap040_pipe_core #(
 	.fp_exc_req(fp_exc_req), .fp_exc_vec(fp_exc_vec),
 	.fp_dout(fp_dout),
 	.ifp_req(ifp_req), .ifp_addr(ifp_addr), .ifp_s(ifp_s),
-	.ifp_hit(ifp_hit), .ifp_data(ifp_data)
+	.ifp_try(ifp_try), .ifp_hit(ifp_hit), .ifp_data(ifp_data)
 );
 
 // the FPU (M10.1 step 3): lifted from the reference unchanged (02ebcee),
@@ -377,8 +377,12 @@ end endgenerate
 // compat wires it -- the core's request port is its c_* side, the cache
 // its m_* side; PTEST/PFLUSH come from EA-fetch.  AP040_HAS_MMU = 0: a
 // straight connection (physical = logical), PTEST/PFLUSH answered at once.
+// the MMU's instruction-side translation for the read path (plan M14)
+wire        ifp_tok, ifp_tci;
+wire [31:0] ifp_pa;
+
 generate if (AP040_HAS_MMU != 0) begin : g_mmu
-ap040_mmu mmu (
+ap040_mmu #(.IFP(IFP_ON ? 1 : 0)) mmu (
 	.clk(clk),
 	.nreset(nreset),
 	.ce(ce_core),
@@ -396,9 +400,17 @@ ap040_mmu mmu (
 	.walker_req(walker_req), .walker_we(walker_we), .walker_addr(walker_addr),
 	.walker_wdat(walker_wdat), .walker_ack(walker_ack), .walker_data(walker_data),
 	.walker_berr(walker_berr),
-	.phys_addr(mmu_addr_phys), .cache_inhibit(mmu_cache_inhibit), .m_nocache(mm_nocache)
+	.phys_addr(mmu_addr_phys), .cache_inhibit(mmu_cache_inhibit), .m_nocache(mm_nocache),
+	.ifp_en(ifp_req), .ifp_addr(ifp_addr), .ifp_s(ifp_s),
+	.ifp_ok(ifp_tok), .ifp_pa(ifp_pa), .ifp_ci(ifp_tci)
 );
 end else begin : g_nommu
+// no MMU: the read path's translation is the identity
+reg [31:0] ifp_la_q;
+always @(posedge clk) if (ce_core && ifp_req) ifp_la_q <= ifp_addr;
+assign ifp_tok = 1'b1;
+assign ifp_pa  = ifp_la_q;
+assign ifp_tci = 1'b0;
 assign mm_req    = mem_req;
 assign mm_write  = mem_write;
 assign mm_instr  = mem_instr;
@@ -495,49 +507,47 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 	wire cache_allow = cache_allow_all | cache_win;
 
 	// The instruction read path (plan M14).  The core launches a lookup
-	// with every fetch it issues (ifp_req includes the clock enable); the
-	// cache's read-only copy of the I bank answers ifp_thit the next clock.
-	// Here the wrapper says whether a FAST answer is allowed for that
-	// address -- exactly the cases in which the slow path would find the
-	// line in the same bank and hand it back unchanged:
-	//   * CACR.IE (the cache's own `ie`);
-	//   * the instruction-cacheable window: the same formula as c_nocache
-	//     below for an instruction fetch -- cache_allow_all, or a configured
-	//     window that is not chip RAM (fetches from chip RAM bypass);
-	//   * translation that is the identity: TC.E = 0, or an ITT0/ITT1
-	//     transparent hit for this fetch's S bit whose CM is cacheable
-	//     (the MMU's ttr_match, cache_inhibit = CM[1]).  With TC.E = 1 and
-	//     no ITT hit the fetch takes the slow path (step 1; the I-side ATC
-	//     read port is step 2).
+	// with every fetch it issues (ifp_req includes the clock enable): the
+	// cache's read-only copy of the I bank reads the set (virtually indexed:
+	// the index bits lie inside the page offset) and the MMU's copy of the
+	// instruction ATC translates, both in the same edge; the clock after it
+	// the wrapper allows a FAST answer only where the slow path would find
+	// the same line in the same bank and hand it back unchanged:
+	//   * CACR.IE at the launch (the cache's own `ie`);
+	//   * a translation the MMU can give without its request port: TC.E = 0,
+	//     an ITT0/ITT1 hit, or an instruction-ATC hit the fetch's S bit may
+	//     use (ifp_tok), and not cache-inhibited (ifp_tci = CM[1]);
+	//   * the PHYSICAL address in the instruction-cacheable window -- the
+	//     same formula as c_nocache below for an instruction fetch:
+	//     cache_allow_all, or a configured window that is not chip RAM;
+	//   * the cache's tag compare against that physical address.
 	// Everything else goes the slow way and is answered as before.
-	function ifp_ttr;
-		input [31:0] ttr;
-		input [31:0] la;
-		input        sup;
-		begin
-			ifp_ttr = ttr[15] &&
-			          (&((la[31:24] ~^ ttr[31:24]) | ttr[23:16])) &&
-			          (ttr[14] || (ttr[13] == sup));
-		end
-	endfunction
-	wire ia_ttr_a = (AP040_HAS_MMU != 0) && ifp_ttr(w_itt0, ifp_addr, ifp_s);
-	wire ia_ttr_b = (AP040_HAS_MMU != 0) && ifp_ttr(w_itt1, ifp_addr, ifp_s);
-	wire ia_ttr   = ia_ttr_a | ia_ttr_b;
-	wire ia_ci    = ia_ttr_a ? w_itt0[6] : w_itt1[6];      // CM[1]: inhibited
-	wire ia_tc    = (AP040_HAS_MMU != 0) && w_tc[15];
-	wire ia_chip  = (ifp_addr[31:21] == 11'd0);
-	wire ia_win   =
-		((ifp_addr[31:27] == cache_z3_base0) && cache_z3_ena0) ||
-		((ifp_addr[31:28] == cache_z3_base1) && cache_z3_ena1) ||
-		(!ifp_addr[31:24] && (ifp_addr[23] ^ |ifp_addr[22:21]) && cache_z2_ena);
-	wire ia_ok    = cacr_out[15] && (!ia_tc || ia_ttr) && !(ia_ttr && ia_ci) &&
-	                (cache_allow_all || (ia_win && !ia_chip));
-	reg  ifp_ok_q;
-	wire ifp_thit;
+	reg  ifp_ie_q;
 	always @(posedge clk)
-		if (!nreset) ifp_ok_q <= 1'b0;
-		else if (ce_core) ifp_ok_q <= ifp_req && ia_ok;
-	assign ifp_hit = IFP_ON && ifp_ok_q && ifp_thit;
+		if (!nreset) ifp_ie_q <= 1'b0;
+		else if (ce_core) ifp_ie_q <= ifp_req && cacr_out[15];
+	wire ia_chip  = (ifp_pa[31:21] == 11'd0);
+	wire ia_win   =
+		((ifp_pa[31:27] == cache_z3_base0) && cache_z3_ena0) ||
+		((ifp_pa[31:28] == cache_z3_base1) && cache_z3_ena1) ||
+		(!ifp_pa[31:24] && (ifp_pa[23] ^ |ifp_pa[22:21]) && cache_z2_ena);
+	wire ia_ok    = ifp_ie_q && ifp_tok && !ifp_tci &&
+	                (cache_allow_all || (ia_win && !ia_chip));
+	wire ifp_thit;
+	assign ifp_hit = IFP_ON && ia_ok && ifp_thit;
+	// ifp_try: whether the LAST fetch looked up could have been served here
+	// (everything but the tag compare).  The next fetch waits for the read
+	// path only then; code outside it (ROM, chip RAM, IE off) keeps going
+	// straight to the shared port.  Learned from every fetch, since every
+	// fetch is looked up.
+	reg  ifp_try_q, ifp_launched;
+	always @(posedge clk)
+		if (!nreset) begin ifp_try_q <= 1'b0; ifp_launched <= 1'b0; end
+		else if (ce_core) begin
+			ifp_launched <= ifp_req;
+			if (ifp_launched) ifp_try_q <= ia_ok;
+		end
+	assign ifp_try = IFP_ON && ifp_try_q;
 
 	ap040_cache #(
 		.POST_STORES(AP040_POST_STORES),
@@ -593,6 +603,7 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.post_err(post_err),
 		.ifp_en(ifp_req),
 		.ifp_addr(ifp_addr),
+		.ifp_ptag(ifp_pa[31:10]),
 		.ifp_thit(ifp_thit),
 		.ifp_rdata(ifp_data)
 	);
@@ -613,6 +624,7 @@ else begin : g_nocache
 	assign mm_rdata = b_rdata;
 	assign cinv_done = 1'b1;
 	assign ifp_hit   = 1'b0;    // no cache, no instruction read path
+	assign ifp_try   = 1'b0;
 	assign ifp_data  = 32'd0;
 	wire unused_ifp = ifp_req | ifp_s | (|ifp_addr);
 	assign post_busy = 1'b0;    // no cache, no buffer: stores are synchronous
