@@ -15,6 +15,8 @@
 ;      many times: every load sees the store before it
 ;  15  a store with nothing else in flight, then a load of it (0..7 ALU
 ;      instructions in front; (An) and d16(An)): the load sees the store
+;  16  every store happens once: 50 stores to the bench's store-counting
+;      register count 50 (the registered store completion must not re-send)
 ;   5  CACR.DE clear: a read goes to memory (a DMA write without a snoop
 ;      changed it), not to the cached copy
 ;   6  a misaligned longword (not served by the path) reads right
@@ -263,6 +265,23 @@ start:	move.l	#CACR_ON,d0
 	moveq	#0,d0
 	movec	d0,dtt0
 	cpusha	dc
+
+; 16: every store happens once: 50 stores to the bench's store-counting
+;     register $F1F4, back to back and interleaved with loads, count 50
+	move.l	#$00008000,d0		; IE only: $F1F6 is read from memory
+	movec	d0,cacr
+	clr.w	$f1f6
+	moveq	#24,d1
+.l16:	move.w	d1,$f1f4
+	move.w	d1,$f1f4
+	move.l	X,d0
+	dbra	d1,.l16
+	move.w	$f1f6,d0
+	cmp.w	#50,d0
+	beq.s	.c16
+	failt	16
+.c16:	move.l	#CACR_ON,d0
+	movec	d0,cacr
 
 	move.w	#$600d,DONEREG
 .h:	bra.s	.h

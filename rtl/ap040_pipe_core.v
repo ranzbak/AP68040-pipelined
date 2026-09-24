@@ -54,7 +54,11 @@ module ap040_pipe_core
 	// plan M14 step 3 (BUS = 1): EA-fetch's data reads are offered to the
 	// wrapper's data read path (dfp_*) as well; a hit is answered the clock
 	// after the request, a miss goes out of the BCU's slot as before
-	parameter         DFP                = 0
+	parameter         DFP                = 0,
+	// (BUS = 1, STORE_POST = 0) register the synchronous store's completion
+	// (ap040_pipe_bcu DONE_REG): one clock per store, and the memory
+	// acknowledge no longer reaches the stall chain (PLAN M14 / Q23)
+	parameter         STDONE_REG         = 1
 )
 (
 	input  clk,
@@ -575,7 +579,7 @@ end else begin : g_bus
 		assign ifp_s    = 1'b0;
 		wire unused_ifp = ifp_hit | ifp_try | (|ifp_data);
 	end
-	ap040_pipe_bcu #(.POST(STORE_POST)) u_bcu
+	ap040_pipe_bcu #(.POST(STORE_POST), .DONE_REG(STDONE_REG)) u_bcu
 	(
 		.clk(clk), .nreset(nreset), .ce(ce),
 		.st_v(STORE_POST ? (ce && retire && exe_o.st_v) : (exe_valid && exe_o.st_v)),

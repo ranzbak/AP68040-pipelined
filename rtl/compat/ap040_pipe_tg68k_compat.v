@@ -543,15 +543,27 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 	//     cache_allow_all, or a configured window that is not chip RAM;
 	//   * the cache's tag compare against that physical address.
 	// Everything else goes the slow way and is answered as before.
+	// The windows, as the read paths use them: registered here.  They are
+	// autoconfig state (the chipset clock's domain, set once at boot), and
+	// straight into the data path's hit decision they made a dll_28 ->
+	// clk_38 path of 20 logic levels ending at the BCU's request registers.
+	reg  [4:0] w_z3b0;
+	reg  [3:0] w_z3b1;
+	reg        w_z3e0, w_z3e1, w_z2e;
+	always @(posedge clk) begin
+		w_z3b0 <= cache_z3_base0; w_z3e0 <= cache_z3_ena0;
+		w_z3b1 <= cache_z3_base1; w_z3e1 <= cache_z3_ena1;
+		w_z2e  <= cache_z2_ena;
+	end
 	reg  ifp_ie_q;
 	always @(posedge clk)
 		if (!nreset) ifp_ie_q <= 1'b0;
 		else if (ce_core) ifp_ie_q <= ifp_req && cacr_out[15];
 	wire ia_chip  = (ifp_pa[31:21] == 11'd0);
 	wire ia_win   =
-		((ifp_pa[31:27] == cache_z3_base0) && cache_z3_ena0) ||
-		((ifp_pa[31:28] == cache_z3_base1) && cache_z3_ena1) ||
-		(!ifp_pa[31:24] && (ifp_pa[23] ^ |ifp_pa[22:21]) && cache_z2_ena);
+		((ifp_pa[31:27] == w_z3b0) && w_z3e0) ||
+		((ifp_pa[31:28] == w_z3b1) && w_z3e1) ||
+		(!ifp_pa[31:24] && (ifp_pa[23] ^ |ifp_pa[22:21]) && w_z2e);
 	wire ia_ok    = ifp_ie_q && ifp_tok && !ifp_tci &&
 	                (cache_allow_all || (ia_win && !ia_chip));
 	wire ifp_thit;
@@ -585,9 +597,9 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 			 (dfp_size == `AP040_SZ_W && !dfp_addr[0]) ||
 			 (dfp_size == `AP040_SZ_L && dfp_addr[1:0] == 2'b00));
 	wire da_win =
-		((dfp_pa[31:27] == cache_z3_base0) && cache_z3_ena0) ||
-		((dfp_pa[31:28] == cache_z3_base1) && cache_z3_ena1) ||
-		(!dfp_pa[31:24] && (dfp_pa[23] ^ |dfp_pa[22:21]) && cache_z2_ena) ||
+		((dfp_pa[31:27] == w_z3b0) && w_z3e0) ||
+		((dfp_pa[31:28] == w_z3b1) && w_z3e1) ||
+		(!dfp_pa[31:24] && (dfp_pa[23] ^ |dfp_pa[22:21]) && w_z2e) ||
 		(dfp_pa[31:21] == 11'd0);
 	wire dfp_thit;
 	assign dfp_hit = IFP_ON && dfp_ok_q && dfp_tok && !dfp_tci &&

@@ -729,6 +729,17 @@ always @(posedge clk) begin
 	end
 end
 
+// $F1F4 (write): a counting register for stores -- every store to it that
+// the core completes adds one to the word at $F1F6 (a strobe register, like
+// COPJMP: a store issued twice fires twice).  Pipelined bench only.
+reg wrcnt_ack_q = 0;
+always @(posedge clk) begin
+	wrcnt_ack_q <= dut.mem_ack;
+	if (nreset && dut.mem_ack && !wrcnt_ack_q && dut.mem_write &&
+	    dut.mem_addr[15:0] == 16'hF1F4)
+		mem[16'hF1F6 >> 1] = mem[16'hF1F6 >> 1] + 1'd1;
+end
+
 // $F180 (read): a counting register -- every data read of it that the
 // memory port completes adds one to the word at $F182 (a read with a side
 // effect, like a CIA's ICR; t_irq_pipe.s checks that an interrupt never

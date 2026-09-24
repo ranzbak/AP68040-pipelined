@@ -46,7 +46,15 @@ module ap040_pipe_bcu
 	//    an access error on it is precise (M6; the reference core's stores are
 	//    synchronous at the core too).  1: posted through the SB_N FIFO; an
 	//    error on a posted store is fatal (st_err, the reference's post_err).
-	parameter POST = 0
+	parameter POST = 0,
+	// (POST = 0) 1: WB's synchronous store completes the clock AFTER memory
+	// acknowledges it (st_done & co. are registered).  The acknowledge is a
+	// clk_114 signal registered on the edge right before the core's clk_38
+	// edge (TG68K.vhd x_ack_r), and through st_done it reached WB's hold, EX's
+	// stall and the whole stall chain back to IF's request -- 8.8 ns, the
+	// design's one structural timing family (PLAN M11.1).  Registering it
+	// ends that family at this module's flip-flops, for one clock per store.
+	parameter DONE_REG = 0
 )
 (
 	input             clk,
@@ -145,7 +153,8 @@ reg [31:0] sp_a;           // ... its address
 reg [31:0] sp_d;           // ... its store data
 reg [23:0] sp_acc;         // the bytes read so far
 wire idle    = !mem_req;         // (a new request never starts in the ack clock: one low enabled edge)
-wire go_st   = POST ? (idle && !sp_on && (sb_cnt != 0)) : (idle && !sp_on && st_v);
+wire go_st   = POST ? (idle && !sp_on && (sb_cnt != 0)) :
+                      (idle && !sp_on && st_v && !((DONE_REG != 0) && st_done_q));
 // A read goes from the slot, never in the clock it is requested: EA-fetch
 // may be sending the older instruction's store to EX in that same clock
 // (an early read), and older_st sees it only once it is there.
@@ -176,12 +185,23 @@ wire       sp_fin = !sp_on || mem_flt || (sp_i == sp_nm1);   // the transfer end
 wire       go_sp  = idle && sp_on;                           // the next byte (first priority)
 wire [31:0] sp_rd = (sp_s == SZ_L) ? {sp_acc, mem_rdata[7:0]} : {16'd0, sp_acc[7:0], mem_rdata[7:0]};
 
-assign st_done = !POST && done && (kind == K_ST) && sp_fin;
+wire   st_done_c = !POST && done && (kind == K_ST) && sp_fin;
+wire   st_fma_c, st_ferr_c, st_fatc_c;
+reg    st_done_q, st_ferr_q, st_fatc_q, st_fma_q;
+assign st_done = (DONE_REG != 0) ? st_done_q : st_done_c;
 // SSW.MA: the fault is on the far side of the page boundary (the reference's aer_ma)
 wire   sp_ma   = sp_on && (tc_p ? (mem_addr[31:13] != sp_a[31:13]) : (mem_addr[31:12] != sp_a[31:12]));
-assign st_fma  = sp_ma;
-assign st_ferr = st_done && mem_flt;
-assign st_fatc = st_ferr && mem_atc;
+assign st_fma_c  = sp_ma;
+assign st_ferr_c = st_done_c && mem_flt;
+assign st_fatc_c = st_ferr_c && mem_atc;
+assign st_fma  = (DONE_REG != 0) ? st_fma_q  : st_fma_c;
+assign st_ferr = (DONE_REG != 0) ? st_ferr_q : st_ferr_c;
+assign st_fatc = (DONE_REG != 0) ? st_fatc_q : st_fatc_c;
+always @(posedge clk)
+	if (!nreset) begin st_done_q <= 1'b0; st_ferr_q <= 1'b0; st_fatc_q <= 1'b0; st_fma_q <= 1'b0; end
+	else if (ce) begin
+		st_done_q <= st_done_c; st_ferr_q <= st_ferr_c; st_fatc_q <= st_fatc_c; st_fma_q <= st_fma_c;
+	end
 
 integer k;
 always @(posedge clk) begin
