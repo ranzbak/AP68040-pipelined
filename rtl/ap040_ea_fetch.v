@@ -1270,7 +1270,18 @@ function automatic logic [4:0] mm_reg(input logic [3:0] k, input logic pre, inpu
 	j = pre ? 4'd15 - k : k;
 	return (j == 4'd15) ? resolve_sp(R_A7L, s, m) : {1'b0, j};   // 0-7 D0-D7, 8-14 A0-A6
 endfunction
-wire  [3:0] mm_k     = lsb16(mm_mask);
+// (timing) mm_k is a register: lsb16 of the mask is formed the clock before,
+// from the value mm_mask is being given, at every place mm_mask is written
+// (MOVEM start, a load issued, a store dispatched, reset), so mm_k_q always
+// equals lsb16(mm_mask) and the priority encoder is off the path from the
+// mask through the register-file read address (ra_c) into op_c / st_data.
+reg   [3:0] mm_k_q;
+wire  [3:0] mm_k     = mm_k_q;
+`ifndef SYNTHESIS
+always @(posedge clk)
+	if (nreset && mm_k_q !== lsb16(mm_mask))
+		$display("ERROR: ap040_ea_fetch: mm_k_q %0d != lsb16(mm_mask %h) at %0t", mm_k_q, mm_mask, $time);
+`endif
 wire  [4:0] mm_sreg  = mm_p ? mp_reg : mm_reg(mm_k, mm_pre, s_bit, sr_in[12]);
 reg  [23:0] mp_acc;        // MOVEP load: the bytes so far
 wire        mm_one   = (mm_mask & (mm_mask - 16'd1)) == 16'd0;   // at most one register left
@@ -2164,7 +2175,7 @@ always @(posedge clk) begin
 		tr_take <= 1'b0; tr_pc <= 32'd0; tr_yield <= 1'b0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
 		cm_v <= 1'b0; cm_ea <= 32'd0; cm_pc <= 32'd0; r_ea <= 32'd0; r_ssw <= 16'd0;
-		mm_mask <= 16'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0; mm_tail <= 1'b0;
+		mm_mask <= 16'd0; mm_k_q <= 4'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0; mm_tail <= 1'b0;
 		mm_have <= 1'b0; mm_hdata <= 32'd0; mm_hreg <= 5'd0; mm_hlast <= 1'b0;
 		mm_bv <= 1'b0; mm_bval <= 32'd0;
 		r_step <= 3'd0; r_sr <= 16'd0; r_pc <= 32'd0; r_fv <= 16'd0;
@@ -2640,6 +2651,7 @@ always @(posedge clk) begin
 			if (st0.mm_go && ph != P_MOVEM) begin
 				ph       <= P_MOVEM;
 				mm_mask  <= mm_16 ? 16'h000F : i.ext;
+				mm_k_q   <= lsb16(mm_16 ? 16'h000F : i.ext);
 				mm_empty <= !mm_16 && (i.ext == 16'd0);
 				mm_addr  <= mm_16 ? (s_addr_c & ~32'd15) : cm_use ? cm_ea : mm_ld ? s_addr_c : d_addr_c;
 				if (mm_cmi) begin
@@ -2655,6 +2667,7 @@ always @(posedge clk) begin
 				if (mms.issue) begin
 					mm_rreg  <= mm_sreg; mm_rlast <= mm_one; mm_rk <= mm_k[1:0];
 					mm_mask  <= mm_mask & ~(16'd1 << mm_k);
+					mm_k_q   <= lsb16(mm_mask & ~(16'd1 << mm_k));
 					mm_addr  <= mm_addr + mm_sz;
 				end
 				if (mm_16 && cap) begin m16_buf[mm_rk] <= rd_data; m16_have[mm_rk] <= 1'b1; end
@@ -2664,6 +2677,7 @@ always @(posedge clk) begin
 				end
 				if (!mm_lde && mms.disp) begin
 					mm_mask  <= mm_mask & ~(16'd1 << mm_k);
+					mm_k_q   <= lsb16(mm_mask & ~(16'd1 << mm_k));
 					mm_addr  <= mm_pre ? mm_addr - mm_sz : mm_addr + mm_sz;
 				end
 				if (mms.to_buf) begin
