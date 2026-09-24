@@ -166,6 +166,32 @@ if command -v vasmm68k_mot > /dev/null; then
 			done
 		fi
 	done
+	# the FPSP (2026-09-24, plan M10): Motorola's M68040 FPSP exactly as
+	# Thomas Richter's 68040.library 40.2 carries it, installed by the
+	# library's own code, runs every floating-point instruction the 68040
+	# does not implement (tb/mk_fpsp.py wrote the program and its expected
+	# values).  The library is read by path and never copied into this tree
+	# (FPSP_LIB); without it the leg says so and is skipped.  256 KB of
+	# memory (L1_AW=17); the L1 leg and the three bus profiles run in
+	# parallel (vvp is single threaded).
+	FPSP_LIB=${FPSP_LIB:-/home/paul/work/amiga/adc/Contributions/Thomas_Richter/Tools/Debugging/MMULib/Libs/68040.library}
+	if [ -f "$FPSP_LIB" ] && python3 mk_fpsplib.py "$FPSP_LIB" "$WORK/fpsp040lib.bin" "$WORK/fpsp040lib.inc" > "$WORK/fpsplib.log" 2>&1; then
+		( cd fpsp_asm && vasmm68k_mot -Fbin -m68040 -m68882 -no-opt -quiet -o "../$WORK/fpsp_lib.bin" fpsp_lib.s ) &&
+		python3 bin2hex.py "$WORK/fpsp_lib.bin" "$WORK/fpsp_lib.hex" || { echo "  FAIL  fpsp:fpsp_lib (assembler)"; fail=1; }
+		iverilog -g2012 -DFPU_REAL -Ptb_ap040_pipe_prog.L1_AW=17 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_fpsp.vvp" tb_ap040_pipe_prog.v $FSRC > "$WORK/tb_fpsp.clog" 2>&1 &&
+		iverilog -g2012 -DFPU_REAL -DBUS_MODE -Ptb_ap040_pipe_prog.L1_AW=17 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_fpsp_bus.vvp" tb_ap040_pipe_prog.v $FSRC > "$WORK/tb_fpsp_bus.clog" 2>&1 || {
+			echo "  COMPILE-ERROR fpsp bench"; grep -v "constant selects" "$WORK/tb_fpsp.clog" "$WORK/tb_fpsp_bus.clog" | head -5; exit 1; }
+		timeout 1800 vvp "$WORK/tb_fpsp.vvp" +prog="$WORK/fpsp_lib.hex" +expect=fpsp_asm/fpsp_lib.exp +cycles=4000000 > "$WORK/fpsp_lib.log" 2>&1 &
+		for p in 0 1 2; do
+			timeout 1800 vvp "$WORK/tb_fpsp_bus.vvp" +prog="$WORK/fpsp_lib.hex" +expect=fpsp_asm/fpsp_lib.exp +prof=$p +cycles=32000000 > "$WORK/fpspbus_$p.log" 2>&1 &
+		done
+		wait
+		for l in fpsp_lib fpspbus_0 fpspbus_1 fpspbus_2; do
+			if grep -q "ALL TESTS PASSED" "$WORK/$l.log"; then echo "  pass  fpsp:$l"; else echo "  FAIL  fpsp:$l  (see $WORK/$l.log)"; fail=1; fi
+		done
+	else
+		echo "  (68040.library not found at $FPSP_LIB, or not version 40.2: FPSP legs skipped)"
+	fi
 	# the background-release bench (plan M10.1(c)): the one property a program
 	# cannot see, because it is invisible to the architecture
 	for t in fpu_bg; do
@@ -215,6 +241,11 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 	AP040_MAIN=${AP040_MAIN:-../../AP68040-reference}
 	if [ -f "$AP040_MAIN/tb/asm/t_movem_restart.s" ]; then
 		python3 mk_tmovem.py "$AP040_MAIN/tb/asm/t_movem_restart.s" m9s > "$WORK/t_movem_restart_m9s.s" && TMR=t_movem_restart_m9s
+		# (2026-09-24) the upstream state-frame programs, revision $41: the
+		# BUSY frame's CU_SAVEPC=$FE resume (57 cases) and the frame
+		# lifecycle -- sizes, pointers, format errors, the deferred E1
+		# frame an FSAVE extracts and an FRESTORE re-arms
+		[ -f "$AP040_MAIN/tb/asm/t_fpu_resume.s" ] && TMR="$TMR t_fpu_resume t_fpu_frames"
 	else
 		echo "  (AP68040-reference not found: t_movem_restart skipped)"
 	fi
@@ -232,6 +263,8 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "cache_asm/$t.s"
 		elif [ "$t" = t_irq_pipe ] || [ "$t" = t_mbit_pipe ] || [ "$t" = t_trirq_pipe ] || [ "$t" = t_ipend_pipe ] || [ "$t" = t_irqwedge_pipe ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "irq_asm/$t.s"
+		elif [ "$t" = t_fpu_resume ] || [ "$t" = t_fpu_frames ]; then
+			( cd "$AP040_MAIN/tb/asm" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OLDPWD/$WORK/$t.bin" "$t.s" )
 		else
 			( cd "$AP040_REF/tb/asm" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OLDPWD/$WORK/$t.bin" "$t.s" )
 		fi

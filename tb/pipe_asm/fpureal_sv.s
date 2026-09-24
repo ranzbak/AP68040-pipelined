@@ -73,8 +73,9 @@ start:
 ; (M10.7): FRESTORE accepts it and A0 steps by the whole 52 bytes, not 4.
 	dc.w	$F358			; FRESTORE (A0)+      -- $41300000
 
-;------------------------------------- 7: a frame this core still cannot
-; install -- the $4160 BUSY frame, which needs the deferred-exception path
+;------------------------------------- 7: the $4160 BUSY frame is installed
+; too since the M10 remainder (2026-09-24): no format error, and A0 steps by
+; the whole 100 bytes (fpureal_busy.s tests its contents and the resume)
 	movea.l	#c7e,a6
 	movea.l	#c7,a5
 c7:	dc.w	$F358			; FRESTORE (A0)+      -- $41600000
@@ -146,4 +147,5 @@ unexp:
 	dc.l	$41000000		; IDLE
 	dc.l	$41300000		; the 52-byte unimplemented-state frame
 	dcb.l	12,0			; ... and its payload
-	dc.l	$41600000		; the BUSY frame, which is still refused
+	dc.l	$41600000		; the 100-byte BUSY frame
+	dcb.l	24,0			; ... and its payload (CU_SAVEPC 0: no resume)

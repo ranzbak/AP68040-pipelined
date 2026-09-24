@@ -16,17 +16,15 @@ a1 00005110
 d3 00001f00
 d4 00001efc
 d5 00001f00
-# 6, 7: the $4130 frame is INSTALLED now (M10.7) and A0 steps by the whole 52
-# bytes; the $4160 BUSY frame is still refused, so exactly ONE format error is
-# taken -- and the deltas say it was vector 14, format $0, the own PC.  A0 ends
-# at $5008 + 52 for the accepted frame and does not move for the refused one:
-# its (An)+ update rides a dispatch that never happens, which is this core's
-# restart model and is recorded in PLAN.md M10.5 rather than claimed as the
-# 68040's
-m32 00007000 00000001
+# 6, 7: the $4130 frame is INSTALLED (M10.7) and A0 steps by the whole 52
+# bytes; since the M10 remainder (2026-09-24) the $4160 BUSY frame is too, and
+# A0 steps by 100 more: $5008 + 52 + 100.  No format error is taken.  (What a
+# REFUSED frame does to An -- nothing, its update rides a dispatch that never
+# happens -- is still this core's restart model, recorded in PLAN.md M10.5.)
+m32 00007000 00000000
 m32 00007004 00000000
 m32 00007008 00000000
-a0 0000503c
+a0 000050a0
 # 8: one unimplemented instruction (the FSIN), and the frame round trip is an
 # identity -- thirteen longwords saved, restored and saved again with no
 # mismatch.  The program does the comparison, so nothing here depends on what

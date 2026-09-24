@@ -1,0 +1,455 @@
+halt 00000404
+# the installer ran: AttnFlags gained AFF_68881|AFF_68882, and the
+# vectors are the library's handlers (fpsp_fline, fpsp_unsupp, inex)
+m8 00007010 0000007f
+m32 00007014 000107c4
+m32 00007018 000115c4
+m32 0000701c 00010690
+# nothing unexpected: no stray vector, no Alert() from the FPSP
+m32 00007000 00000000
+m32 00007008 00000000
+m32 00007020 000282dc
+m32 00007024 000282dc
+# A0 fsin(0.5)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020000 3ffd f57743a2582f7f44 0
+m8 0002000c 00000000
+# A1 fsin(1.0)
+#   the FPSP model's value, 1 ulp from the exactly rounded one
+x80 00020010 3ffe d76aa47848677020 0
+m8 0002001c 00000000
+# A2 fsin(-2.5)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020020 bffe 9935786e7e558405 0
+m8 0002002c 00000008
+# A3 fsin(100.0)
+#   the FPSP model's value, 2 ulp from the exactly rounded one
+x80 00020030 bffe 81a12dbc626dc036 0
+m8 0002003c 00000008
+# A4 fsin(1e-5)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020040 3fee a7c5ac470f4512eb 0
+m8 0002004c 00000000
+# A5 fcos(0.5)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020050 3ffe e0a94032dbea7cee 0
+m8 0002005c 00000000
+# A6 fcos(2.0)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020060 bffd d51132ba9b902522 0
+m8 0002006c 00000008
+# A7 fcos(1000.0)
+#   the FPSP model's value, 19 ulp from the exactly rounded one
+x80 00020070 3ffe 8ff8133c9f8ddba5 0
+m8 0002007c 00000000
+# A8 ftan(0.5)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020080 3ffe 8bda7adf9a3a5219 0
+m8 0002008c 00000000
+# A9 ftan(1.2)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020090 4000 a49e21d658b26513 0
+m8 0002009c 00000000
+# A10 fasin(0.5)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 000200a0 3ffe 860a91c16b9b2c23 0
+m8 000200ac 00000000
+# A11 facos(0.3)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 000200b0 3fff a20faf65f77ac532 0
+m8 000200bc 00000000
+# A12 fatan(2.0)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 000200c0 3fff 8db70c975df22363 0
+m8 000200cc 00000000
+# A13 fatan(-0.5)
+#   the FPSP model's value, 1 ulp from the exactly rounded one
+x80 000200d0 bffd ed63382b0dda7b46 0
+m8 000200dc 00000008
+# A14 fsinh(1.5)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 000200e0 4000 88461d55eb530366 0
+m8 000200ec 00000000
+# A15 fcosh(1.5)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 000200f0 4000 968de10f11011218 0
+m8 000200fc 00000000
+# A16 ftanh(0.8)
+#   the FPSP model's value, 1 ulp from the exactly rounded one
+x80 00020100 3ffe a9fe5053a45205ca 0
+m8 0002010c 00000000
+# A17 fatanh(0.5)
+#   the FPSP model's value, 1 ulp from the exactly rounded one
+x80 00020110 3ffe 8c9f53d5681854bc 0
+m8 0002011c 00000000
+# A18 fetox(1.0)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020120 4000 adf85458a2bb4a9b 0
+m8 0002012c 00000000
+# A19 fetox(-3.5)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020130 3ff9 f76080c727fb2fb5 0
+m8 0002013c 00000000
+# A20 fetox(10.0)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020140 400d ac14ee7ca82afcf8 0
+m8 0002014c 00000000
+# A21 fetoxm1(1e-3)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020150 3ff5 832336fdc679d0f5 0
+m8 0002015c 00000000
+# A22 fetoxm1(0.5)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020160 3ffe a61298e1e069bc97 0
+m8 0002016c 00000000
+# A23 ftwotox(3.3)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020170 4002 9d9623dffc194198 0
+m8 0002017c 00000000
+# A24 ftentox(2.5)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020180 4007 9e1d276fd4bac411 0
+m8 0002018c 00000000
+# A25 flogn(2.0)
+#   the FPSP model's value, 1 ulp from the exactly rounded one
+x80 00020190 3ffe b17217f7d1cf79ad 0
+m8 0002019c 00000000
+# A26 flogn(10.0)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 000201a0 4000 935d8dddaaa8ac17 0
+m8 000201ac 00000000
+# A27 flogn(0.3)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 000201b0 bfff 9a1bc7e5ed3904c8 0
+m8 000201bc 00000008
+# A28 flognp1(1e-4)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 000201c0 3ff1 d1b46832c0000860 0
+m8 000201cc 00000000
+# A29 flognp1(1.5)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 000201d0 3ffe ea9207870703bd04 0
+m8 000201dc 00000000
+# A30 flog10(1000.0)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 000201e0 4000 c000000000000000 0
+m8 000201ec 00000000
+# A31 flog10(7.0)
+#   the FPSP model's value, 1 ulp from the exactly rounded one
+x80 000201f0 3ffe d858585bc661f94c 0
+m8 000201fc 00000000
+# A32 flog2(8.0)
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020200 4000 c000000000000000 0
+m8 0002020c 00000000
+# A33 flog2(3.0)
+#   the FPSP model's value, 1 ulp from the exactly rounded one
+x80 00020210 3fff cae00d1cfdeb43d1 0
+m8 0002021c 00000000
+# A34 fgetexp(1000.0)
+x80 00020220 4002 9000000000000000 0
+m8 0002022c 00000000
+# A35 fgetman(1000.0)
+x80 00020230 3fff fa00000000000000 0
+m8 0002023c 00000000
+# A36 fgetexp(-0.1)
+x80 00020240 c001 8000000000000000 0
+m8 0002024c 00000008
+# A37 fgetman(-0.1)
+x80 00020250 bfff ccccccccccccd000 0
+m8 0002025c 00000008
+# A38 fint(2.5)
+x80 00020260 4000 8000000000000000 0
+m32 0002026c 00000208
+# A39 fint(-3.7)
+x80 00020270 c001 8000000000000000 0
+m32 0002027c 08000208
+# A40 fint(3.5)
+x80 00020280 4001 8000000000000000 0
+m32 0002028c 00000208
+# A41 fintrz(-3.7)
+x80 00020290 c000 c000000000000000 0
+m32 0002029c 08000208
+# A42 fintrz(5.99)
+x80 000202a0 4001 a000000000000000 0
+m32 000202ac 00000208
+# A43 fsincos(0.7) sin
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 000202b0 3ffe a4eb734a30cdc035 0
+m8 000202bc 00000000
+# A44 fsincos(0.7) cos
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 000202c0 3ffe c3ccb294fcec951c 0
+# A45 fmod(10.0, 3.0)
+x80 000202d0 3fff 8000000000000000 0
+m32 000202dc 00030000
+# A46 fmod(-7.5, 2.0)
+x80 000202e0 bfff c000000000000000 0
+m32 000202ec 08830000
+# A47 fmod(100.25, 0.75)
+x80 000202f0 3ffe 8000000000000000 0
+m32 000202fc 00050000
+# A48 frem(10.0, 3.0)
+x80 00020300 3fff 8000000000000000 0
+m32 0002030c 00030000
+# A49 frem(11.0, 3.0)
+x80 00020310 bfff 8000000000000000 0
+m32 0002031c 08040000
+# A50 frem(-7.5, 2.0)
+x80 00020320 3ffe 8000000000000000 0
+m32 0002032c 00840000
+# A51 fscale(1.5, 3.0)
+x80 00020330 4002 c000000000000000 0
+m32 0002033c 00000000
+# A52 fscale(-5.0, -2.0)
+x80 00020340 bfff a000000000000000 0
+m32 0002034c 08000000
+# A53 fmovecr #$00
+#   Motorola's table entry (0 ulp from the exactly rounded value)
+x80 00020350 4000 c90fdaa22168c235 0
+m8 0002035c 00000000
+# A54 fmovecr #$0b
+#   Motorola's table entry (1 ulp from the exactly rounded value)
+x80 00020360 3ffd 9a209a84fbcff798 0
+m8 0002036c 00000000
+# A55 fmovecr #$0c
+#   Motorola's table entry (1 ulp from the exactly rounded value)
+x80 00020370 4000 adf85458a2bb4a9a 0
+m8 0002037c 00000000
+# A56 fmovecr #$0d
+#   Motorola's table entry (0 ulp from the exactly rounded value)
+x80 00020380 3fff b8aa3b295c17f0bc 0
+m8 0002038c 00000000
+# A57 fmovecr #$0e
+#   Motorola's table entry (0 ulp from the exactly rounded value)
+x80 00020390 3ffd de5bd8a937287195 0
+m8 0002039c 00000000
+# A58 fmovecr #$0f
+#   Motorola's table entry (0 ulp from the exactly rounded value)
+x80 000203a0 0000 0000000000000000 0
+m8 000203ac 00000004
+# A59 fmovecr #$30
+#   Motorola's table entry (0 ulp from the exactly rounded value)
+x80 000203b0 3ffe b17217f7d1cf79ac 0
+m8 000203bc 00000000
+# A60 fmovecr #$31
+#   Motorola's table entry (0 ulp from the exactly rounded value)
+x80 000203c0 4000 935d8dddaaa8ac17 0
+m8 000203cc 00000000
+# A61 fmovecr #$32
+#   Motorola's table entry (0 ulp from the exactly rounded value)
+x80 000203d0 3fff 8000000000000000 0
+m8 000203dc 00000000
+# A62 fmovecr #$33
+#   Motorola's table entry (0 ulp from the exactly rounded value)
+x80 000203e0 4002 a000000000000000 0
+m8 000203ec 00000000
+# A63 fmovecr #$3a
+#   Motorola's table entry (0 ulp from the exactly rounded value)
+x80 000203f0 41a8 93ba47c980e98ce0 0
+m8 000203fc 00000000
+# A64 fmovecr #$3b
+#   Motorola's table entry (0 ulp from the exactly rounded value)
+x80 00020400 4351 aa7eebfb9df9de8e 0
+m8 0002040c 00000000
+# A65 fetox (a2)+
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020410 3fff a45af1e1f40c333b 0
+m8 0002041c 00000000
+# A66 flogn -(a3)
+#   the FPSP model's value, 1 ulp from the exactly rounded one
+x80 00020420 bffd 934b1089a6dc93c1 0
+m8 0002042c 00000008
+# A67 flog10.l #100000
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020430 4001 a000000000000000 0
+m8 0002043c 00000000
+# A68 fetox.s #0.5
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020440 3fff d3094c70f034de4c 0
+m8 0002044c 00000000
+# A69 ftwotox.w #-3
+#   the FPSP model's value, 0 ulp from the exactly rounded one
+x80 00020450 3ffc 8000000000000000 0
+m8 0002045c 00000000
+# A70 fmove.p #1.25E+2
+x80 00020460 4005 fa00000000000000 0
+m8 0002046c 00000000
+# A71 fmove.p #-3.75E-1
+x80 00020470 bffd c000000000000000 0
+m8 0002047c 00000008
+# A72 fmove.p #1.5E+10
+x80 00020480 4020 df84758000000000 0
+m8 0002048c 00000000
+# A73 fmove.p 3.1415926535897932E+0
+#   within 1 ulp of the exactly rounded value
+x80 00020490 4000 c90fdaa22168c183 1
+m8 0002049c 00000000
+# A74 fmove.x denormal (2^-16438)
+#   the operand's own image
+x80 000204a0 0000 0000000000000100 0
+m8 000204ac 00000000
+# A75 denormal * 2^108
+x80 000204b0 0035 8000000000000000 0
+m8 000204bc 00000000
+# A76 2^1000 * double denormal 2^-1074
+x80 000204c0 3fb5 8000000000000000 0
+m8 000204cc 00000000
+# A77 fmove.s single denormal 2^-127
+x80 000204d0 3f80 8000000000000000 0
+m8 000204dc 00000000
+# A78 denormal + 0
+#   the operand's own image
+x80 000204e0 0000 0000000000000100 0
+m8 000204ec 00000000
+# P0 fmove.p 125.0{#3}
+m32 0002c000 00020001
+m32 0002c004 25000000
+m32 0002c008 00000000
+# P1 fmove.p -0.375{#2}
+m32 0002c00c c0010003
+m32 0002c010 80000000
+m32 0002c014 00000000
+# P2 fmove.p 1.0{#1}
+m32 0002c018 00000001
+m32 0002c01c 00000000
+m32 0002c020 00000000
+# B0 fsin(0.5), exactly rounded to double
+m32 00024000 3fdeaee8
+m32 00024004 744b05f0
+m8 00024008 00000000
+# B1 fsin(1.0), exactly rounded to double
+m32 0002400c 3feaed54
+m32 00024010 8f090cee
+m8 00024014 00000000
+# B2 fsin(-2.5), exactly rounded to double
+m32 00024018 bfe326af
+m32 0002401c 0dcfcab1
+m8 00024020 00000008
+# B3 fsin(100.0), exactly rounded to double
+m32 00024024 bfe03425
+m32 00024028 b78c4db8
+m8 0002402c 00000008
+# B4 fsin(1e-5), exactly rounded to double
+m32 00024030 3ee4f8b5
+m32 00024034 88e1e8a2
+m8 00024038 00000000
+# B5 fcos(0.5), exactly rounded to double
+m32 0002403c 3fec1528
+m32 00024040 065b7d50
+m8 00024044 00000000
+# B6 fcos(2.0), exactly rounded to double
+m32 00024048 bfdaa226
+m32 0002404c 57537205
+m8 00024050 00000008
+# B7 fcos(1000.0), exactly rounded to double
+m32 00024054 3fe1ff02
+m32 00024058 6793f1bb
+m8 0002405c 00000000
+# B8 ftan(0.5), exactly rounded to double
+m32 00024060 3fe17b4f
+m32 00024064 5bf3474a
+m8 00024068 00000000
+# B9 ftan(1.2), exactly rounded to double
+m32 0002406c 400493c4
+m32 00024070 3acb164d
+m8 00024074 00000000
+# B10 fasin(0.5), exactly rounded to double
+m32 00024078 3fe0c152
+m32 0002407c 382d7366
+m8 00024080 00000000
+# B11 facos(0.3), exactly rounded to double
+m32 00024084 3ff441f5
+m32 00024088 ecbeef59
+m8 0002408c 00000000
+# B12 fatan(2.0), exactly rounded to double
+m32 00024090 3ff1b6e1
+m32 00024094 92ebbe44
+m8 00024098 00000000
+# B13 fatan(-0.5), exactly rounded to double
+m32 0002409c bfddac67
+m32 000240a0 0561bb4f
+m8 000240a4 00000008
+# B14 fsinh(1.5), exactly rounded to double
+m32 000240a8 400108c3
+m32 000240ac aabd6a60
+m8 000240b0 00000000
+# B15 fcosh(1.5), exactly rounded to double
+m32 000240b4 4002d1bc
+m32 000240b8 21e22022
+m8 000240bc 00000000
+# B16 ftanh(0.8), exactly rounded to double
+m32 000240c0 3fe53fca
+m32 000240c4 0a748a41
+m8 000240c8 00000000
+# B17 fatanh(0.5), exactly rounded to double
+m32 000240cc 3fe193ea
+m32 000240d0 7aad030b
+m8 000240d4 00000000
+# B18 fetox(1.0), exactly rounded to double
+m32 000240d8 4005bf0a
+m32 000240dc 8b145769
+m8 000240e0 00000000
+# B19 fetox(-3.5), exactly rounded to double
+m32 000240e4 3f9eec10
+m32 000240e8 18e4ff66
+m8 000240ec 00000000
+# B20 fetox(10.0), exactly rounded to double
+m32 000240f0 40d5829d
+m32 000240f4 cf950560
+m8 000240f8 00000000
+# B21 fetoxm1(1e-3), exactly rounded to double
+m32 000240fc 3f506466
+m32 00024100 dfb8cf3a
+m8 00024104 00000000
+# B22 fetoxm1(0.5), exactly rounded to double
+m32 00024108 3fe4c253
+m32 0002410c 1c3c0d38
+m8 00024110 00000000
+# B23 ftwotox(3.3), exactly rounded to double
+m32 00024114 4023b2c4
+m32 00024118 7bff8328
+m8 0002411c 00000000
+# B24 ftentox(2.5), exactly rounded to double
+m32 00024120 4073c3a4
+m32 00024124 edfa9759
+m8 00024128 00000000
+# B25 flogn(2.0), exactly rounded to double
+m32 0002412c 3fe62e42
+m32 00024130 fefa39ef
+m8 00024134 00000000
+# B26 flogn(10.0), exactly rounded to double
+m32 00024138 40026bb1
+m32 0002413c bbb55516
+m8 00024140 00000000
+# B27 flogn(0.3), exactly rounded to double
+m32 00024144 bff34378
+m32 00024148 fcbda721
+m8 0002414c 00000008
+# B28 flognp1(1e-4), exactly rounded to double
+m32 00024150 3f1a368d
+m32 00024154 06580001
+m8 00024158 00000000
+# B29 flognp1(1.5), exactly rounded to double
+m32 0002415c 3fed5240
+m32 00024160 f0e0e078
+m8 00024164 00000000
+# B30 flog10(1000.0), exactly rounded to double
+m32 00024168 40080000
+m32 0002416c 00000000
+m8 00024170 00000000
+# B31 flog10(7.0), exactly rounded to double
+m32 00024174 3feb0b0b
+m32 00024178 0b78cc3f
+m8 0002417c 00000000
+# B32 flog2(8.0), exactly rounded to double
+m32 00024180 40080000
+m32 00024184 00000000
+m8 00024188 00000000
+# B33 flog2(3.0), exactly rounded to double
+m32 0002418c 3ff95c01
+m32 00024190 a39fbd68
+m8 00024194 00000000
+# every case ran
+m32 0000700c 00000073
+m32 00007028 0000600d

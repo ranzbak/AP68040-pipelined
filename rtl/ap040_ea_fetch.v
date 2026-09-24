@@ -188,6 +188,29 @@ module ap040_ea_fetch
 	output            fp_fr_wbte15,
 	output     [95:0] fp_fr_fpt,
 	output     [95:0] fp_fr_et,
+	// (M10 remainder, 2026-09-24) the $4160 BUSY frame: 25 longwords.  The
+	// unit prepares one for every unsupported data type (vector 55) and for
+	// an e3 arithmetic exception; the FPSP FSAVEs it, and FRESTOREs a BUSY
+	// frame of its own on the way out -- with CU_SAVEPC = $FE when the unit
+	// is to COMPLETE the instruction from the frame's operands (resume).
+	input             fp_st_busy,       // the state to save is the BUSY one
+	input      [95:0] fp_st_wbt,        // WBTEMP
+	input      [31:0] fp_st_fpiar,      // FPIARCU
+	output            fp_fr_busy,
+	output     [95:0] fp_fr_wbt,
+	output     [31:0] fp_fr_fpiar,
+	output      [7:0] fp_fr_cusavepc,
+	output            fp_fr_et15,
+	output            fp_fr_fpt15,
+	input             fp_fr_resume,     // the restored frame starts the unit
+	// (M10 remainder) the DEFERRED exception's frame (lib/AP68040 fpu_pendcap):
+	// when a released operation's enabled exception becomes pending, the unit
+	// prepares its E1 ($4130) or E3 ($4160) frame from its operand shadow; an
+	// FSAVE then EXTRACTS that frame instead of taking the exception, and an
+	// FRESTORE of an E1/E3 frame re-arms it for the next FP instruction.
+	output reg        fp_pcap,          // pend_capture
+	input             fp_fr_e1pend,     // frestore_e1_pend
+	input       [7:0] fp_cur_vec,       // cur_vec: the enabled exception's vector
 	input             fp_done,
 	input             fp_accepted,
 	input             fp_unimp,
@@ -323,7 +346,9 @@ reg        fp_fmte;
 // (M10.7) the state frame: a thirteen-longword sequence with its own index,
 // the fields latched on the way in, and the two pulses that hand the frame to
 // the unit or take it away.
-reg  [3:0] fp_fn;
+reg  [4:0] fp_fn;          // the frame beat: 0-12 ($4130) or 0-24 ($4160)
+reg        fp_bsy;         // this FSAVE/FRESTORE frame is the $4160 BUSY one
+reg        fp_rarm;        // an E1/E3 frame was just restored: re-arm its exception
 reg        fp_frm;         // this FSAVE/FRESTORE is a $4130 frame, not NULL/IDLE
 reg        fp_svack;
 reg        fp_frup;
@@ -331,6 +356,10 @@ reg [15:0] fr_cmd1, fr_cmd3;
 reg  [2:0] fr_stag, fr_dtag, fr_flags, fr_grs;
 reg        fr_wbte15;
 reg [95:0] fr_fpt, fr_et;
+reg        fr_busy, fr_et15, fr_fpt15;
+reg [95:0] fr_wbt;
+reg [31:0] fr_fpiar;
+reg  [7:0] fr_cusave;
 reg        fp_cw;          // a control-register write goes out this clock
 reg  [1:0] fp_csel;        // ... to this register: captured with the data, so
                            //     the beat index may advance on the same edge
@@ -1433,6 +1462,12 @@ assign fp_ia_wdata = (HAS_FPU != 0) ? i.pc : 32'd0;
 wire        fp_gen     = (i.opcode[8:6] == 3'b000);
 wire        fp_sv      = (HAS_FPU != 0) && (i.opcode[8:6] == 3'b100);   // FSAVE
 wire        fp_rs      = (HAS_FPU != 0) && (i.opcode[8:6] == 3'b101);   // FRESTORE
+// (M10 remainder) a pending deferred exception is NOT taken in front of an
+// FSAVE that finds its frame prepared -- the FSAVE extracts it -- nor in front
+// of an FRESTORE, which replaces the state wholesale (lib/AP68040 S_FSAVE1,
+// S_FREST1: "FRESTORE neither reports it").  An FSAVE with no frame left (it
+// was extracted already) still takes it: the reference's frameless fallback.
+wire        fp_pex     = fp_rs || (fp_sv && fp_st_unimp);
 wire        fp_cr      = (HAS_FPU != 0) && fp_gen && (i.ext[15:14] == 2'b10);
 // (M10.8) the conditional forms.  FBcc takes its predicate from the OPCODE,
 // the FScc family from the extension word; bit 5 of the six-bit field aliases
@@ -1553,6 +1588,12 @@ assign fp_fr_grs    = fr_grs;
 assign fp_fr_wbte15 = fr_wbte15;
 assign fp_fr_fpt    = fr_fpt;
 assign fp_fr_et     = fr_et;
+assign fp_fr_busy   = fr_busy;
+assign fp_fr_wbt    = fr_wbt;
+assign fp_fr_fpiar  = fr_fpiar;
+assign fp_fr_cusavepc = fr_cusave;
+assign fp_fr_et15   = fr_et15;
+assign fp_fr_fpt15  = fr_fpt15;
 // the thirteen longwords of the $4130 frame, laid out as lib/AP68040's
 // fsave_unimp_word does -- the same order the FPSP reads them in
 function automatic logic [31:0] fp_frame_w(input logic [3:0] n);
@@ -1572,10 +1613,38 @@ function automatic logic [31:0] fp_frame_w(input logic [3:0] n);
 		default: return fp_st_et[31:0];
 	endcase
 endfunction
+// (M10 remainder) the 25 longwords of the $4160 BUSY frame, laid out as
+// lib/AP68040's fsave_busy_word does (WinUAE's 68040 fpuop_save order, and the
+// offsets Motorola's fpsp.h counts from the top of the frame: WBTEMP LV-76,
+// FPIARCU LV-60, CMDREG3B LV-48, STAG LV-40, CMDREG1B LV-36, DTAG LV-32,
+// E_BYTE LV-28, FPTEMP LV-24, ETEMP LV-12).  The last twelve longwords are the
+// $4130 frame's; CU_SAVEPC (word 2) and the reserved words are zero.
+function automatic logic [31:0] fp_busy_w(input logic [4:0] n);
+	case (n)
+		5'd0:  return 32'h4160_0000;
+		5'd6:  return {fp_st_wbt[95:80], 16'd0};
+		5'd7:  return fp_st_wbt[63:32];
+		5'd8:  return fp_st_wbt[31:0];
+		5'd10: return fp_st_fpiar;
+		5'd13: return {fp_st_cmd3, 16'd0};
+		5'd15: return {fp_st_stag, 3'd0, fp_st_grs, 23'd0};
+		5'd16: return {fp_st_cmd1, 16'd0};
+		5'd17: return {fp_st_dtag, 8'd0, fp_st_wbte15, 20'd0};
+		5'd18: return {5'd0, fp_st_flags[2], fp_st_flags[1], 4'd0, fp_st_flags[0], 20'd0};
+		5'd19: return fp_st_fpt[95:64];
+		5'd20: return fp_st_fpt[63:32];
+		5'd21: return fp_st_fpt[31:0];
+		5'd22: return fp_st_et[95:64];
+		5'd23: return fp_st_et[63:32];
+		5'd24: return fp_st_et[31:0];
+		default: return 32'd0;
+	endcase
+endfunction
+wire  [4:0] fp_flast = fp_bsy ? 5'd24 : 5'd12;   // the frame's last beat
 // a frame beat's address, and the value An takes when the instruction ends:
 // FSAVE's base was already walked back by 48 at entry, FRESTORE's An steps by
 // the whole 52 bytes
-wire [31:0] fp_fadr = fp_addr + {26'd0, fp_fn, 2'b00};
+wire [31:0] fp_fadr = fp_addr + {25'd0, fp_fn, 2'b00};
 // the effective address as EA-calc gave it, before any frame or list walk
 wire [31:0] fp_addr0 = fp_mem_dst ? d_addr_c : s_addr_c;
 // (timing) fp_anv is only used in P_FPU, after the entry clock, and the
@@ -1587,7 +1656,7 @@ wire [31:0] fp_addr0 = fp_mem_dst ? d_addr_c : s_addr_c;
 wire [31:0] fp_anv  = fp_mvdy ? ((i.dst.upd == UPD_PRE) || (i.src.upd == UPD_PRE)
                                 ? fp_addr0 - {25'd0, fp_mvb12_q} + 32'd12
                                 : fp_addr0 + {25'd0, fp_mvb12_q}) :
-                      fp_sv   ? fp_addr : (fp_addr + 32'd52);
+                      fp_sv   ? fp_addr : (fp_addr + (fp_bsy ? 32'd100 : 32'd52));
 assign fp_fm_we    = fp_mw;
 assign fp_fm_wdata = fp_mwd;
 // the longword of the selected register this beat carries, reversed when the
@@ -1620,7 +1689,7 @@ wire [31:0] fp_baddr = fp_scc ? fp_addr :
                        (fp_mvm || fp_sv || fp_rs) ? fp_addr :
                        (fp_nb <= 5'd2) ? fp_addr : (fp_addr + {28'd0, fp_k, 2'b00});
 wire [31:0] fp_bdata = fp_scc          ? fp_sccv :
-                       (fp_sv && fp_frm) ? fp_frame_w(fp_fn) :
+                       (fp_sv && fp_frm) ? (fp_bsy ? fp_busy_w(fp_fn) : fp_frame_w(fp_fn[3:0])) :
                        fp_sv           ? fp_svw :
                        fp_mvm          ? fp_mvwv :
                        fp_cr           ? fp_cr_rdata :
@@ -1951,7 +2020,7 @@ wire stp_t st_i = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, 
                                      (fp_stt == FS_WR),
                                      (fp_mvm || fp_sv || fp_scc) ? (fp_crd && fp_k == 2'd3) : (fp_k == fp_beats),
                                      fp_ok, fp_mem_dst,
-                                     (HAS_FPU != 0) && fp_pend, fp_pvec, i.pc,
+                                     (HAS_FPU != 0) && fp_pend && !fp_pex, fp_pvec, i.pc,
                                      (HAS_FPU != 0) && fp_ae, fp_avec, fp_need_res,
                                      (HAS_FPU != 0) && fp_fmte,
                                      (HAS_FPU != 0) && fp_bsun_go && (ph == P_FPU) && !fp_crd,
@@ -2182,7 +2251,9 @@ always @(posedge clk) begin
 		fp_ae <= 1'b0; fp_avec <= 8'd0; fp_pend <= 1'b0; fp_pvec <= 8'd0;
 		fp_list <= 8'd0; fp_mvb12_q <= 7'd0; fp_fsel <= 3'd0; fp_mw <= 1'b0; fp_mwd <= 96'd0; fp_mwsel <= 3'd0;
 		fp_rstp <= 1'b0; fp_idlp <= 1'b0; fp_fmte <= 1'b0;
-		fp_fn <= 4'd0; fp_frm <= 1'b0; fp_svack <= 1'b0; fp_frup <= 1'b0;
+		fp_fn <= 5'd0; fp_frm <= 1'b0; fp_svack <= 1'b0; fp_frup <= 1'b0; fp_bsy <= 1'b0; fp_rarm <= 1'b0; fp_pcap <= 1'b0;
+		fr_busy <= 1'b0; fr_et15 <= 1'b0; fr_fpt15 <= 1'b0; fr_wbt <= 96'd0;
+		fr_fpiar <= 32'd0; fr_cusave <= 8'd0;
 		fr_cmd1 <= 16'd0; fr_cmd3 <= 16'd0; fr_stag <= 3'd0; fr_dtag <= 3'd0;
 		fr_flags <= 3'd0; fr_grs <= 3'd0; fr_wbte15 <= 1'b0; fr_fpt <= 96'd0; fr_et <= 96'd0;
 		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
@@ -2277,7 +2348,9 @@ always @(posedge clk) begin
 							// one waits here while a released operation is still
 							// running, which is also what keeps FBcc/FScc from
 							// reading a live `fpcc`.
-							if (!fp_bg) begin
+							// (and not in the clock the unit prepares a deferred
+							// exception's frame, or an FSAVE would judge it frameless)
+							if (!fp_bg && !fp_pcap) begin
 								ph <= P_FPU;
 								fp_sent <= 1'b0; fp_acc <= 1'b0; fp_dn <= 1'b0; fp_k <= 2'd0;
 								fp_ae <= 1'b0;
@@ -2291,7 +2364,7 @@ always @(posedge clk) begin
 								// and a store into Dn or An is finished before it
 								// starts -- cr_rdata reads combinationally.
 								fp_crd <= fp_cr_st && !fp_mem_dst;
-								fp_fmte <= 1'b0; fp_frm <= 1'b0; fp_svack <= 1'b0; fp_frup <= 1'b0;
+								fp_fmte <= 1'b0; fp_frm <= 1'b0; fp_svack <= 1'b0; fp_frup <= 1'b0; fp_bsy <= 1'b0;
 								fp_mw <= 1'b0;
 								// (M10.4) FMOVEM walks a register list, twelve bytes
 								// each: the list is consumed as it goes and the first
@@ -2303,7 +2376,7 @@ always @(posedge clk) begin
 								// (M10.3) a PENDING exception is taken in front of this
 								// instruction, so nothing of it starts: no command,
 								// no operand beats, no register list
-								if (fp_pend) ;
+								if (fp_pend && !fp_pex) ;
 								// (M10.5) FSAVE writes one longword, FRESTORE reads one
 								// (M10.8) a conditional form reads `fpcc` and nothing else --
 								// except FScc to memory, which writes one byte
@@ -2330,9 +2403,13 @@ always @(posedge clk) begin
 									// thirteen-longword $4130 frame, not the one-longword
 									// NULL/IDLE one, and a -(An) FSAVE must walk its base back
 									// by the REST of the frame -- EA-calc only knew about four.
+									// (M10 remainder) ... or the 25-longword $4160 BUSY
+									// frame, whose -(An) walk is 96 more
 									if (fp_st_unimp) begin
-										fp_frm <= 1'b1; fp_fn <= 4'd0;
-										if (i.dst.upd == UPD_PRE) fp_addr <= d_addr_c - 32'd48;
+										fp_frm <= 1'b1; fp_fn <= 5'd0; fp_bsy <= fp_st_busy;
+										fp_pend <= 1'b0;      // extracted, not reported
+										if (i.dst.upd == UPD_PRE)
+											fp_addr <= d_addr_c - (fp_st_busy ? 32'd96 : 32'd48);
 									end
 								end
 								else if (fp_rs) fp_stt <= FS_RD;
@@ -2489,19 +2566,46 @@ always @(posedge clk) begin
 							fp_crd <= 1'b1; fp_k <= 2'd3;
 						end
 						if (fp_sv && fp_frm && fp_stt == FS_WR && st.disp && !fp_crd) begin
-							if (fp_fn == 4'd12) begin
+							if (fp_fn == fp_flast) begin
 								fp_crd <= 1'b1; fp_k <= 2'd3;
 								// the unit keeps the state until the whole frame is out
 								fp_svack <= 1'b1;
 							end
-							else fp_fn <= fp_fn + 4'd1;
+							else fp_fn <= fp_fn + 5'd1;
 						end
 						else if (fp_sv && fp_stt == FS_WR && st.disp && !fp_crd) begin
 							fp_crd <= 1'b1; fp_k <= 2'd3;
 						end
-						if (fp_rs && fp_frm && fp_stt == FS_RD && cap && rd_tag == T_SLD && !fp_crd) begin
-							// the payload, in lib/AP68040 S_FREST_U's order
+						if (fp_rs && fp_frm && fp_bsy && fp_stt == FS_RD && cap && rd_tag == T_SLD && !fp_crd) begin
+							// (M10 remainder) the BUSY payload, in lib/AP68040
+							// S_FREST_B's order, plus what a resume needs:
+							// CU_SAVEPC and the ETE15/FPTE15 exponent flags
+							// (upstream apolkosnik/AP68040 880b81c)
 							case (fp_fn)
+								5'd2:  fr_cusave <= rd_data[31:24];
+								5'd6:  fr_wbt[95:64] <= rd_data;
+								5'd7:  fr_wbt[63:32] <= rd_data;
+								5'd8:  fr_wbt[31:0]  <= rd_data;
+								5'd10: fr_fpiar <= rd_data;
+								5'd13: fr_cmd3 <= rd_data[31:16];
+								5'd15: begin fr_stag <= rd_data[31:29]; fr_et15 <= rd_data[28]; fr_grs <= rd_data[25:23]; end
+								5'd16: fr_cmd1 <= rd_data[31:16];
+								5'd17: begin fr_dtag <= rd_data[31:29]; fr_fpt15 <= rd_data[28]; fr_wbte15 <= rd_data[20]; end
+								5'd18: fr_flags <= {rd_data[26], rd_data[25], rd_data[20]};
+								5'd19: fr_fpt[95:64] <= rd_data;
+								5'd20: fr_fpt[63:32] <= rd_data;
+								5'd21: fr_fpt[31:0]  <= rd_data;
+								5'd22: fr_et[95:64] <= rd_data;
+								5'd23: fr_et[63:32] <= rd_data;
+								5'd24: fr_et[31:0]  <= rd_data;
+								default: ;
+							endcase
+							if (fp_fn == 5'd24) begin fp_crd <= 1'b1; fp_frup <= 1'b1; fp_rarm <= 1'b1; end
+							else fp_fn <= fp_fn + 5'd1;
+						end
+						else if (fp_rs && fp_frm && fp_stt == FS_RD && cap && rd_tag == T_SLD && !fp_crd) begin
+							// the payload, in lib/AP68040 S_FREST_U's order
+							case (fp_fn[3:0])
 								4'd1:  fr_cmd3 <= rd_data[31:16];
 								4'd3:  begin fr_stag <= rd_data[31:29]; fr_grs <= rd_data[25:23]; end
 								4'd4:  fr_cmd1 <= rd_data[31:16];
@@ -2515,21 +2619,28 @@ always @(posedge clk) begin
 								4'd12: fr_et[31:0]  <= rd_data;
 								default: ;                       // 2: the reserved longword
 							endcase
-							if (fp_fn == 4'd12) begin fp_crd <= 1'b1; fp_frup <= 1'b1; end
-							else fp_fn <= fp_fn + 4'd1;
+							if (fp_fn == 5'd12) begin fp_crd <= 1'b1; fp_frup <= 1'b1; fp_rarm <= 1'b1; end
+							else fp_fn <= fp_fn + 5'd1;
 						end
 						else if (fp_rs && fp_stt == FS_RD && cap && rd_tag == T_SLD && !fp_crd) begin
 							fp_crd <= 1'b1;
 							// version byte 0 is the NULL frame, $41000000 the IDLE
-							// frame; the $4130 / $4160 payloads are not sequenced
-							// here, so they take the format error rather than being
-							// accepted with a state this core cannot install.
-							if (rd_data[31:24] == 8'd0)          fp_rstp <= 1'b1;
-							else if (rd_data == 32'h4100_0000)   fp_idlp <= 1'b1;
-							else if (rd_data == 32'h4130_0000) begin
+							// frame; anything this core cannot install takes the
+							// format error rather than being accepted.
+							if (rd_data[31:24] == 8'd0)          begin fp_rstp <= 1'b1; fp_pend <= 1'b0; end
+							else if (rd_data == 32'h4100_0000)   begin fp_idlp <= 1'b1; fp_pend <= 1'b0; end
+							else if (rd_data == 32'h4130_0000 || rd_data == 32'h4160_0000) begin
 								// (M10.7) the unimplemented-state frame: twelve more
-								// longwords follow, and the instruction is not finished
-								fp_crd <= 1'b0; fp_frm <= 1'b1; fp_fn <= 4'd1;
+								// longwords follow, and the instruction is not finished;
+								// (M10 remainder) the BUSY frame: twenty-four more
+								fp_crd <= 1'b0; fp_frm <= 1'b1; fp_fn <= 5'd1;
+								fp_bsy <= rd_data[22];      // size $60, not $30
+								fr_busy <= rd_data[22];
+								if (!rd_data[22]) begin
+									// a $4130 frame carries none of these
+									fr_cusave <= 8'd0; fr_et15 <= 1'b0; fr_fpt15 <= 1'b0;
+									fr_wbt <= 96'd0; fr_fpiar <= 32'd0;
+								end
 							end
 							else                                 fp_fmte <= 1'b1;
 						end
@@ -2709,7 +2820,11 @@ always @(posedge clk) begin
 			// (M10.2) a control-register move releases nothing: it sent no
 			// command, so `done` will never come and a background flag set
 			// here would deadlock the next FP instruction at P_START.
-			if (HAS_FPU != 0 && ph == P_FPU && st.disp && st.fin) fp_bg <= !fp_cr && !fp_mvm && !fp_sv && !fp_rs && !fp_cnd && !(fp_dn || fp_done);
+			// (M10 remainder) ... except a FRESTORE whose BUSY frame restarts the
+			// unit (CU_SAVEPC = $FE): that command is released the same way
+			// and the next FP instruction waits for its `done`
+			if (HAS_FPU != 0 && ph == P_FPU && st.disp && st.fin) fp_bg <= (!fp_cr && !fp_mvm && !fp_sv && !fp_rs && !fp_cnd && !(fp_dn || fp_done)) ||
+			                                                              (fp_rs && fp_frm && fp_bsy && fp_fr_resume && !fp_done);
 			else if (HAS_FPU != 0 && fp_bg && fp_done)            fp_bg <= 1'b0;
 			// (M10.3) a RELEASED operation's enabled exception: the instruction
 			// has left, so it cannot be reported against it.  It becomes
@@ -2719,11 +2834,24 @@ always @(posedge clk) begin
 			// M10.2 found for a different reason.  The second term catches an
 			// exception that arrives in the very clock of the release, when
 			// fp_bg is not set yet.
+			fp_pcap <= 1'b0;
 			if (HAS_FPU != 0 && fp_exc_req &&
 			    (fp_bg || (ph == P_FPU && st.disp && st.fin && !fp_cr && !fp_mvm && !fp_sv && !fp_rs && !fp_cnd && !fp_ae))) begin
 				fp_bg   <= 1'b0;
 				fp_pend <= 1'b1;
 				fp_pvec <= fp_exc_vec;
+				fp_pcap <= 1'b1;     // the unit prepares the frame from its shadow
+			end
+			// (M10 remainder) a completed FRESTORE of an E1/E3 frame re-arms the
+			// deferred exception for the NEW context, vectored by the FPSR/FPCR
+			// enables the unit now holds (lib/AP68040 S_FREST_UD/BD) -- the clock
+			// after the frame's last longword, when the unit has installed it --
+			// unless the frame restarts the unit (CU_SAVEPC $FE), whose command
+			// may raise its own
+			if (HAS_FPU != 0 && fp_rarm) begin
+				fp_rarm <= 1'b0;
+				fp_pend <= fp_fr_e1pend && !(fr_busy && fp_fr_resume);
+				fp_pvec <= fp_cur_vec;
 			end
 			if (aerr_dbl || wf_dbl) ph <= P_HALT;
 			if (ph != P_RTE && eac_v_use && cm_hit && (st.fin || st.exc_go || st0.mm_go)) cm_v <= 1'b0;
