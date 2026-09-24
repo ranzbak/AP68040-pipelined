@@ -4,7 +4,7 @@
 # wedge mutant) on the compat bench.  A mutant is CAUGHT when the program
 # does not print ALL TESTS PASSED.  Mutants run in parallel (vvp is single-
 # threaded), each in its own directory under $OUT.
-#   sh tb/perf/m14_mutants.sh [out-dir]
+#   sh tb/perf/m14_mutants.sh [out-dir]      (ONLY_D=1: step 3's table only)
 set -u
 T=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${1:-$T/build/m14mut}
@@ -40,6 +40,7 @@ PY
 	else echo "  $n: caught ($(grep -m1 -E 'FAIL|timeout|TIMEOUT' "$d/log" | cut -c1-100))"; fi
 }
 
+if [ -z "${ONLY_D:-}" ]; then   # ONLY_D=1: the data-path table alone
 run_one M1_data_copy_not_written compat/ap040_cache.v \
  "if (ce & cd_we[0] & cd_widx[8]) idat0" "if (1'b0) idat0" &
 run_one M2_valid_not_cleared_by_sweep compat/ap040_cache.v \
@@ -67,6 +68,7 @@ run_one M9_iatc_valid_ignored compat/ap040_mmu.v \
 run_one M11_iatc_copy_not_filled compat/ap040_mmu.v \
  "if (fill_we && fill_row[4]) iatc" "if (1'b0) iatc" &
 wait
+fi
 # step 3: the data read path (t_dcache_pipe.s)
 run_one D1_snoop_not_mirrored compat/ap040_cache.v \
  "if (w_inv) dv[inv_idx[5:0]]  <= 4'd0;" "" "$DPROG" &
@@ -82,8 +84,11 @@ run_one D6_datc_valid_ignored compat/ap040_mmu.v \
  "ALL:atc_v[{1'b0, d_set, 2'd" "1'b1 | atc_v[{1'b0, d_set, 2'd" "$DPROG" &
 run_one D7_translation_ignored compat/ap040_mmu.v \
  "assign dfp_pa = (!d_tce || d_ttr) ? d_la :" "assign dfp_pa = 1'b1 ? d_la :" "$DPROG" &
-run_one D8_collision_ignored compat/ap040_cache.v \
- "&& !g_col && !d_busy_now;" ";" "$DPROG" &
+# (not a mutant: D8, the collision terms `!g_col && !d_busy_now`, cannot be
+#  observed -- a launch-edge tag write is covered by the fill mask's
+#  previous-clock term, a store merge by the store-order rule (the merging
+#  store is still in WB in the launch clock), and a snoop by reading dv in
+#  the answer clock; the terms stay as defence)
 wait
 run_one D9_merge_not_mirrored compat/ap040_cache.v \
  "if (ce & cd_we[0] & !cd_widx[8]) ddat0" "if (ce & cd_we[0] & !cd_widx[8] & !st_merge) ddat0" "$DPROG" &

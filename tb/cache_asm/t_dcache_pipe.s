@@ -13,6 +13,8 @@
 ;   3  (after 2) the last value read is the new one
 ;   4  store then load of the same longword, word and byte, back to back,
 ;      many times: every load sees the store before it
+;  15  a store with nothing else in flight, then a load of it (0..7 ALU
+;      instructions in front; (An) and d16(An)): the load sees the store
 ;   5  CACR.DE clear: a read goes to memory (a DMA write without a snoop
 ;      changed it), not to the cached copy
 ;   6  a misaligned longword (not served by the path) reads right
@@ -129,6 +131,30 @@ start:	move.l	#CACR_ON,d0
 .c4c:	add.l	#$01030507,d5
 	dbra	d6,.l4
 
+; 15: a store with nothing else in flight, then a load of the same longword:
+;     the load's early read can go out in the clock the store is handed to EX
+;     (the store is visible to the core's store-order rule only a clock
+;     later).  Shapes: 0..7 ALU instructions in front, (An) and d16(An).
+	lea	X,a2
+	move.l	X,d0			; cached
+	moveq	#7,d6
+.l15:	move.l	d6,d5
+	swap	d5
+	move.w	d6,d5			; a value per pass
+	move.l	#$10000,d3
+	lea	sh15,a3
+	move.l	d6,d2
+	lsl.l	#2,d2
+	move.l	(a3,d2.l),a3
+	jsr	(a3)
+	cmp.l	d5,d0
+	beq.s	.c15a
+	failt	15
+.c15a:	cmp.l	d5,d1
+	beq.s	.c15b
+	failt	25
+.c15b:	dbra	d6,.l15
+
 ; 5: DE clear, memory changed behind the cache
 	move.l	#$66660000,X
 	move.l	X,d0			; cached
@@ -159,10 +185,13 @@ start:	move.l	#CACR_ON,d0
 	failt	6
 .c6:
 
-; 7/8/9: the data ATC copy.  4K pages 0-15 identity except logical page 2
-	move.l	#$0a0a0a0a,$4000
-	move.l	#$0b0b0b0b,$6000
-	move.l	#$0c0c0c0c,$2000	; physical page 2 itself
+; 7/8/9: the data ATC copy.  4K pages 0-15 identity except logical page 2.
+; The longword is at offset $100 (set $10): the walker's U-bit write-back to
+; the descriptors at $5000/$5408 snoops set 0 clear, which must not be the set
+; this test watches.
+	move.l	#$0a0a0a0a,$4100
+	move.l	#$0b0b0b0b,$6100
+	move.l	#$0c0c0c0c,$2100	; physical page 2 itself
 	lea	ROOT,a0
 	move.l	#PTR|3,(a0)
 	lea	PTR,a0
@@ -180,30 +209,32 @@ start:	move.l	#CACR_ON,d0
 	movec	d0,srp
 	movec	d0,urp
 	cpusha	bc
+	move.l	$2100,d0		; TC off: physical $2100's line is cached (so a
+					;  read path that skipped translation would hit it)
 	pflusha
 	move.l	#$8000,d0
 	movec	d0,tc
-	move.l	$2000,d0
-	move.l	$2000,d0		; (again: through the ATC copy)
+	move.l	$2100,d0
+	move.l	$2100,d0		; (again: through the ATC copy)
 	cmp.l	#$0a0a0a0a,d0
 	beq.s	.c7
 	failt	7
 .c7:	move.l	#$6000|1,PAGE+2*4	; remap -> physical $6000
 	pflusha
-	move.l	$2000,d0
-	move.l	$2000,d0
+	move.l	$2100,d0
+	move.l	$2100,d0
 	cmp.l	#$0b0b0b0b,d0
 	beq.s	.c8
 	failt	8
 .c8:	move.l	#$6000|$41,PAGE+2*4	; physical $6000, CM = 10 (inhibited)
 	pflusha
 	move.w	#1,DMA_NS
-	move.w	#$6002,DMA_A		; (the DMA agent writes PHYSICAL memory)
+	move.w	#$6102,DMA_A		; (the DMA agent writes PHYSICAL memory)
 	move.w	#$0d0d,DMA_D
 	move.w	#0,DMA_GO
 	moveq	#50,d1
 .w9:	dbra	d1,.w9
-	move.l	$2000,d0
+	move.l	$2100,d0
 	cmp.l	#$0b0b0d0d,d0
 	beq.s	.c9
 	failt	9
@@ -243,3 +274,29 @@ fail_all:
 
 unexp:	move.w	#99,d7
 	bra.s	fail_all
+
+; test 15's shapes: \1 ALU instructions, a store to (a2) and a load of it,
+; then the same with d16(An)
+SH15	macro
+	rept	\1
+	add.l	d3,d4
+	endr
+	move.l	d5,(a2)
+	move.l	(a2),d0
+	rept	\1
+	add.l	d3,d4
+	endr
+	move.l	d5,4(a2)
+	move.l	4(a2),d1
+	rts
+	endm
+	cnop	0,4
+sh15:	dc.l	h0,h1,h2,h3,h4,h5,h6,h7
+h0:	SH15	0
+h1:	SH15	1
+h2:	SH15	2
+h3:	SH15	3
+h4:	SH15	4
+h5:	SH15	5
+h6:	SH15	6
+h7:	SH15	7
