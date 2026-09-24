@@ -2717,6 +2717,22 @@ always @(posedge clk) begin
 				done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
 			end
 		end
+		// This stage's OWN redirect (RTS/RTD/RTR, a memory-indirect JMP/JSR,
+		// a not-taken Bcc/DBcc) flushes EA-calc and ID (flush_eac), but not
+		// this stage -- `flush` is EX's redirect or WB's SMC refetch.  Any read
+		// in flight then belongs to a flushed, YOUNGER instruction: the
+		// redirecting one finished its reads before it could redirect, and
+		// the early read (use_early) is issued for the instruction in EA-calc.
+		// Its answer must be thrown away and nothing it already delivered
+		// (done_*) may be handed to the next instruction.  Before this, a
+		// guessed-taken Bcc's target read its operand early, EA-fetch
+		// corrected the branch, and the late answer became the fall-through
+		// instruction's operand (exec's Enqueue in Kickstart 3.1.4 with the
+		// M14 instruction read path; t_earlydrop_pipe.s).
+		if (eaf_redir_v && !flush && !wf_go) begin
+			if ((rd_pend && !rd_ack) || rd_req) rd_drop <= 1'b1;
+			done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
+		end
 	end
 end
 
