@@ -1016,13 +1016,23 @@ function automatic stp_t stepf(
 			end else if (i.priv && !s_bit) begin
 				s.exc_go = 1'b1; s.ev = 8'd8; s.ef = 4'd0; s.epc = i.pc;
 			end else if (i.cls == CL_EXC) begin
-				s.exc_go = 1'b1; s.ev = i.exc_vec; s.ef = i.exc_fmt;
-				s.epc = i.exc_next ? i.next_pc : i.pc;
 				// A format $4 frame stacks the CALCULATED effective address,
 				// which EA-calc has already produced -- no operand is read.
 				// It is 0 when the instruction has no memory operand (D18).
-				s.eaddr = (i.exc_fmt == 4'd4) ? ((i.src.kind == EK_MEM) ? s_addr_c : 32'd0)
-				                              : i.exc_addr;
+				// (FPU fixes N1) Through a memory-indirect mode the calculated
+				// address is behind a pointer (M68040UM A.5.1, p. A-6), so the
+				// pointer is read first -- only the source's: a store's dst
+				// is the same EA, and the operand itself is never read.
+				if (i.exc_fmt == 4'd4 && nsmi && !dnsmi) begin
+					if (nx.v && nx.t == T_SMI && !cap && can_rd && !rd_pend) begin
+						s.issue = 1'b1; s.it = nx.t; s.ia = nx.a; s.isz = nx.sz;
+					end
+				end else begin
+					s.exc_go = 1'b1; s.ev = i.exc_vec; s.ef = i.exc_fmt;
+					s.epc = i.exc_next ? i.next_pc : i.pc;
+					s.eaddr = (i.exc_fmt == 4'd4) ? ((i.src.kind == EK_MEM) ? s_addr_c : 32'd0)
+					                              : i.exc_addr;
+				end
 			end else if (i.cls == CL_RTE) begin
 				// the sequence runs in P_RTE
 			end else if (i.cls == CL_PMMU) begin
