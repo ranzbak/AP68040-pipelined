@@ -1,0 +1,20 @@
+halt 00000440
+# findings/fpu-fixes/plan.md P1: memory-indirect FP effective addresses.
+# Hand-written: M68040UM 10.7.2 lists every memory-indirect mode for the FP
+# instructions, so each case executes; an F-line lands in `unexp` and the
+# program never reaches `halt`.
+# 3: FMOVE.L FP5 (= 10 / 5 + 3.0) through the pointer at $3104
+m32 00003300 00000005
+# 4: FSNE through the pointer at $3108 sets the byte, the rest untouched
+m32 00003400 ff112233
+# 5: FMOVE.L FPCR through the pointer at $310C
+m32 00003500 00000000
+# 6: FSAVE through the pointer at $3110: IDLE, the unit has been used
+m32 00003700 41000000
+# every pointer is read exactly once: a store decodes with dst = src and must
+# not read its pointer for both
+readonce 00003100
+readonce 00003104
+readonce 00003108
+readonce 0000310c
+readonce 00003110

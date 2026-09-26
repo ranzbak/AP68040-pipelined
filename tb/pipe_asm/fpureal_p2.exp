@@ -1,0 +1,32 @@
+halt 0000044c
+# findings/fpu-fixes/plan.md P2/P2b; hand-written from M68040UM 9.6.2, WinUAE
+# fpp.cpp put_fp_value/put_fp_value2 and PLAN.md D22.  Per trap, four
+# longwords: format/vector word, stacked PC, EA field, FSAVE header.
+# 1: FMOVE.P FP0,D0{#0} -- vector 55, format $3, next PC, EA 0, BUSY frame
+m32 00007010 000030dc
+m32 00007014 00000420
+m32 00007018 00000000
+m32 0000701c 41600000
+# 2: FMOVE.P FP0,D0{D1} -- the same with a dynamic k-factor
+m32 00007020 000030dc
+m32 00007024 0000042a
+m32 00007028 00000000
+m32 0000702c 41600000
+# 3: FMOVE.P FP0,A0{D1} -- F-line, format $0, own PC
+m32 00007030 0000002c
+m32 00007034 00000430
+m32 00007038 00000000
+m32 0000703c 00000000
+# 4: FMOVE.P FP0,A0{#5} -- F-line, format $0, own PC
+m32 00007040 0000002c
+m32 00007044 0000043a
+m32 00007048 00000000
+m32 0000704c 00000000
+# 5: FMOVE.P FP0,([$3120.w]){#0} -- vector 55, EA = the final address $3800
+m32 00007050 000030dc
+m32 00007054 0000044c
+m32 00007058 00003800
+m32 0000705c 41600000
+# the unit does not store a packed operand: the FPSP does
+m32 00003800 deadbeef
+readonce 00003120
