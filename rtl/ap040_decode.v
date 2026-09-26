@@ -1325,9 +1325,15 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						d.cls = CL_FPU;
 					end else if (x1[15:13] == 3'b011 &&
 					             ((d.src.kind == EK_DREG && fp_ireg) ||
+					              (d.src.kind == EK_DREG && x1[11:10] == 2'b11) ||
 					              (d.src.kind == EK_MEM))) begin
 						// opclass 011's EA is the DESTINATION: the core waits
-						// for `done` and writes the FPU's result into it
+						// for `done` and writes the FPU's result into it.
+						// (FPU fixes P2, D22) FMOVE.P to Dn -- static (011) or
+						// dynamic (111) k-factor -- is the unsupported DATA
+						// TYPE on a 68040: the unit answers vector 55, format
+						// $3, EA 0 (WinUAE fpp.cpp put_fp_value; the PRM calls
+						// Dn illegal, and rule 2 beats it).  Nothing is written.
 						d.cls = CL_FPU;
 						d.dst  = d.src;
 					end
@@ -1376,9 +1382,8 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					// the oracle and it names the cputest rounds: an address
 					// register is never a legal floating-point source or
 					// destination, and a data register holds only the formats
-					// that fit in it.  A LEGAL address this core does not
-					// sequence (memory indirect) keeps format $4, which is the
-					// separate, recorded gap.
+					// that fit in it (a packed STORE to Dn is the exception:
+					// the datatype fault, P2 above).
 					else if ((x1[15:13] == 3'b010 &&
 					          (d.src.kind == EK_AREG ||
 					           (d.src.kind == EK_DREG && !fp_ireg))) ||
@@ -1386,12 +1391,12 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					          (d.src.kind == EK_AREG ||
 					           d.src.kind == EK_IMM ||
 					           (sh.sm == 3'd7 && sh.sr[1]) ||
-					           (d.src.kind == EK_DREG && !fp_ireg &&
-					            x1[12:10] != 3'b011)))) begin
-						// (packed into a data register is the DATATYPE fault,
-						// vector 55, not the F-line -- it keeps format $4 for
-						// now and is recorded with the rest of M10.6)
-						if (fp_op_hw(x1[6:0])) begin
+					           (d.src.kind == EK_DREG && !fp_ireg)))) begin
+						// (FPU fixes P2b) the opmode split is opclass 010's
+						// alone: in opclass 011 bits 6:0 are the k-factor, and
+						// every rejected store is the plain F-line (WinUAE
+						// put_fp_value2; lib/AP68040 go_fp_fline)
+						if (x1[15:13] != 3'b010 || fp_op_hw(x1[6:0])) begin
 							d.exc_fmt = 4'd0; d.exc_next = 1'b0;
 						end else begin
 							// an FPSP-emulated opmode reports as UNIMPLEMENTED
