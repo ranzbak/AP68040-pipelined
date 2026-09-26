@@ -1,4 +1,4 @@
-halt 0000044c
+halt 00000466
 # findings/fpu-fixes/plan.md P2/P2b; hand-written from M68040UM 9.6.2, WinUAE
 # fpp.cpp put_fp_value/put_fp_value2 and PLAN.md D22.  Per trap, four
 # longwords: format/vector word, stacked PC, EA field, FSAVE header.
@@ -30,3 +30,21 @@ m32 0000705c 41600000
 # the unit does not store a packed operand: the FPSP does
 m32 00003800 deadbeef
 readonce 00003120
+# 6: FMOVE.L FP0,(d16,PC) -- a PC-relative destination: F-line, own PC
+m32 00007060 0000002c
+m32 00007064 00000452
+m32 00007068 00000000
+m32 0000706c 00000000
+m32 00003900 deadbeef
+m32 00003904 deadbeef
+m32 00003908 deadbeef
+m32 0000390c deadbeef
+# 7: FMOVE.L FP0,([bd,PC]) -- the same through a pointer, which is not read
+m32 00007070 0000002c
+m32 00007074 0000045e
+m32 00007078 00000000
+m32 0000707c 00000000
+noread 00003a00
+noread 00003a04
+noread 00003a08
+noread 00003a0c

@@ -1326,9 +1326,12 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					end else if (x1[15:13] == 3'b011 &&
 					             ((d.src.kind == EK_DREG && fp_ireg) ||
 					              (d.src.kind == EK_DREG && x1[11:10] == 2'b11) ||
-					              (d.src.kind == EK_MEM))) begin
+					              (d.src.kind == EK_MEM && !(sh.sm == 3'd7 && sh.sr[1])))) begin
 						// opclass 011's EA is the DESTINATION: the core waits
-						// for `done` and writes the FPU's result into it.
+						// for `done` and writes the FPU's result into it.  A
+						// PC-relative destination -- (d16,PC), (d8,PC,Xn) and
+						// the memory-indirect PC modes -- is not alterable: it
+						// falls to the reject block below, the plain F-line.
 						// (FPU fixes P2, D22) FMOVE.P to Dn -- static (011) or
 						// dynamic (111) k-factor -- is the unsupported DATA
 						// TYPE on a 68040: the unit answers vector 55, format

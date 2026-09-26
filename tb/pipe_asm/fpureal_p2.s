@@ -18,6 +18,10 @@
 ;   4  FMOVE.P FP0,A0{#5}: the same with a static k-factor.
 ;   5  FMOVE.P FP0,([$3120.w]){#0}: vector 55 with the FINAL address in the
 ;      frame's EA field, the pointer read once (P1 through the datatype path).
+;   6  FMOVE.L FP0,(d16,PC): a PC-relative DESTINATION is illegal for every
+;      store -- the plain F-line, own PC, nothing written.
+;   7  FMOVE.L FP0,([bd,PC]): the same through a memory-indirect PC mode --
+;      and the pointer is never read (P1 must not let it through).
 ;
 ; Each trap records four longwords at (a5)+: the format/vector word, the
 ; stacked PC, the EA field, and the first longword of an FSAVE taken in the
@@ -50,8 +54,12 @@ r2:	lea	r3,a6
 c3:	dc.w	$F208,$7C10		; 3: FMOVE.P FP0,A0{D1}
 r3:	lea	r4,a6
 c4:	dc.w	$F208,$6C05		; 4: FMOVE.P FP0,A0{#5}
-r4:	lea	halt,a6
+r4:	lea	r5,a6
 c5:	fmove.p	fp0,([$3120.w]){#0}	; 5: through the pointer at $3120
+r5:	lea	r6,a6
+c6:	dc.w	$F23A,$6000,(sent+4)-(c6+4)	; 6: FMOVE.L FP0,(d16,PC)
+r6:	lea	halt,a6
+c7:	dc.w	$F23B,$6000,$0161,sentp-(c7+4)	; 7: FMOVE.L FP0,([bd,PC])
 halt:	bra.s	halt
 
 ; vector 55, format $3: the stacked PC is already the next instruction's
@@ -84,3 +92,7 @@ unexp:	bra.s	unexp
 	dc.l	$3800			; case 5's pointer
 	org	$3800
 	dcb.l	3,$DEADBEEF		; case 5 must not write its operand
+	org	$3900
+sent:	dcb.l	4,$DEADBEEF		; case 6's target: must stay unwritten
+	org	$3A00
+sentp:	dcb.l	4,$00003900		; case 7's pointer: must not be read
