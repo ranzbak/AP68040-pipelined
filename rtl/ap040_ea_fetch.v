@@ -1250,8 +1250,8 @@ wire        aer_m16  = (i.cls == CL_MOVEM) && i.imm[2];
 // (audit 2026-09-27, finding 4) the reads of TAS, CAS and CAS2 belong to a
 // locked read-modify-write: the MMU checks write protection on them
 // (M68040UM 3.2.2.3), so a protected operand faults on the READ -- and a CAS2
-// whose compare fails, which never writes, still faults
-assign rd_lk = aer_lk;
+// whose compare fails, which never writes, still faults.  rd_lk is assigned
+// with the other read attributes, below.
 wire [15:0] aer_ssw  = ssw_f(ph == P_MOVEM && mm_cmi, rd_ma, rd_atc, aer_lk, 1'b0, rd_sz_q, aer_m16, i.fcsel != 2'd0, rd_fc_q);
 // A store's access error (synchronous stores: the micro-op is still in
 // WB).  On the instruction's last micro-op everything else it did has
@@ -1625,22 +1625,25 @@ wire [31:0] fp_svw = fp_used ? 32'h4100_0000 : 32'h0000_0000;
 // acknowledge, so it goes out only once the frame is really in memory.
 // fp_svack marks the dispatch of the frame's last store; the acknowledge
 // follows when everything older has retired (older_busy low: the frame's
-// stores are written), or when a store fault leaves the write pending in
-// WB1 (the instruction is complete; the handler finishes it).  A fault that
-// RESTARTS the FSAVE drops it: the unit keeps the state and the restart
+// stores are written), or when a LATER instruction's store faults (stores
+// are synchronous and in order, so the frame is already in memory -- final
+// review I2: such a fault used to drop the acknowledge when it restarted its
+// own instruction, e.g. a MOVEM with CM).  A fault on the FSAVE's own store
+// drops it: the FSAVE restarts, the unit keeps the state and the restart
 // writes the same frame again (it used to write IDLE, M68040UM 9.8).
 reg fp_svack_q1, fp_svpend, fp_svack_q;
+reg [31:0] fp_svpc;       // the FSAVE whose acknowledge is pending
 always @(posedge clk) begin
 	if (!nreset) begin
-		fp_svack_q1 <= 1'b0; fp_svpend <= 1'b0; fp_svack_q <= 1'b0;
+		fp_svack_q1 <= 1'b0; fp_svpend <= 1'b0; fp_svack_q <= 1'b0; fp_svpc <= 32'd0;
 	end else if (ce) begin
 		fp_svack_q1 <= fp_svack;
 		fp_svack_q  <= 1'b0;
-		if (fp_svack && !fp_svack_q1) fp_svpend <= 1'b1;
+		if (fp_svack && !fp_svack_q1) begin fp_svpend <= 1'b1; fp_svpc <= i.pc; end
 		else if (fp_svpend) begin
 			if (wb_fault) begin
 				fp_svpend <= 1'b0;
-				if (wf_last) fp_svack_q <= 1'b1;
+				if (wb_stf.ipc != fp_svpc) fp_svack_q <= 1'b1;   // a later instruction's store
 			end else if (!older_busy) begin
 				fp_svpend <= 1'b0; fp_svack_q <= 1'b1;
 			end
@@ -2218,6 +2221,10 @@ wire ex_t disp_x = with_fc(disp_x0, (st.dsel == 3'd1) ? 3'd5 : (st.dsel == 3'd0 
 // (plan M4; the lifted MMU's c_fc in M7)
 wire [2:0] fc_data = s_bit ? 3'd5 : 3'd1;
 // (exception entry's vector read and RTE's pops: supervisor data)
+// (final review I1/M2) only the locked instruction's OWN operand reads, issued
+// from this stage: the next instruction's early read goes out while `i` is
+// still the TAS/CAS, and a memory-indirect pointer read is not the operand
+assign rd_lk     = aer_lk && st.issue && (st.it == T_SLD || st.it == T_DLD);
 assign rd_fc     = (st.issue && (ph == P_START || ph == P_OPS) && i.fcsel == 2'd1) ? sfc_in :
                    (ph == P_EXC || ph == P_RTE || ph == P_RESET) ? 3'd5 : fc_data;
 // An early read is issued only for an instruction that is known to be on

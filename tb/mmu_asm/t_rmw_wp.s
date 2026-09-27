@@ -13,6 +13,8 @@
 ;   3  CAS.L whose compare fails: one read fault (was: none)
 ;   4  CAS2.L whose compare fails, first operand protected: one read fault
 ;      (was: none, the CAS2 completed)
+;   5  an ordinary read of the protected page right after a TAS elsewhere
+;      does not fault (the lock belongs to the TAS's own read only)
 
 FAILREG		equ	$F100
 DONEREG		equ	$F102
@@ -138,6 +140,20 @@ c2:	tas	(a1)
 	chkl	d3,$12345678,13
 	move.l	($6000).l,d0
 	chkl	d0,$33333333,14		; nothing written
+
+
+;------------------------------------- 5: the NEXT instruction's read is not locked
+; (final review I1) a TAS on a writable page, then an ordinary read of the
+; protected page right behind it: its early read must not inherit the TAS's
+; lock bit and take a write-protection fault on a readable page
+	protect
+	lea	($6000).l,a5		; page 6: writable
+	tas	(a5)
+	move.l	($5000).l,d0		; page 5: protected, but only READ
+	moveq	#0,d1
+	move.w	(cnt_aerr).l,d1
+	chkl	d1,0,15
+	chkl	d0,$12345678,16
 
 	move.w	#$600D,(DONEREG).l
 done:	bra.s	done

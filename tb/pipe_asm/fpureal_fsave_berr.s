@@ -12,8 +12,11 @@
 ;   2  the same state again, saved without a fault at $5500: the two frames
 ;      are identical (13 longwords)
 ;   3  the state was extracted once: FSAVE again writes the IDLE frame
+;   4  (final review I2) a YOUNGER instruction's store fault that restarts
+;      it (MOVEM, CM) must not cost the FSAVE its acknowledge: the FSAVE after
+;      it writes IDLE, not the same $4130 frame again
 ;
-; expect-berr: 5430 w
+; expect-berr: 5430 w 5714 w
 ; diff: --cycles 150000
 v_flin	equ	h_unimp
 v_fpun	equ	unexp
@@ -49,6 +52,15 @@ cmp:	move.l	(a2)+,d2
 	beq.s	cmp1
 	addq.l	#1,$7008
 cmp1:	dbra	d6,cmp
+	move.l	#$AAAA0001,d0
+	move.l	#$AAAA0002,d1
+	movea.l	#$5600,a5
+	fmove.l	#1,fp0
+	dc.w	$F200,$000E		; 4: a state again
+	dc.w	$F315			; FSAVE (A5) -- no fault
+	movem.l	d0-d1,($5710).l		; right behind it; the second longword faults: CM, restart
+	movea.l	#$5680,a4
+	dc.w	$F314			; FSAVE (A4) -- IDLE: the state went to $5600
 halt:	bra.s	halt
 
 h_unimp:
