@@ -1,0 +1,10 @@
+# audit 2026-09-27 finding 3: an FSAVE whose last frame longword faults must
+# still leave the complete $4130 frame, and extract the state exactly once.
+# Hand-written from M68040UM 9.8; bus legs only.
+halt 00000460
+berr 00005430 w
+m32 00007000 00000002
+m32 00007004 00000001
+m32 00005400 41300000
+m32 00005480 41000000
+m32 00007008 00000000

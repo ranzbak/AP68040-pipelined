@@ -1617,7 +1617,33 @@ assign fp_fridle   = fp_idlp;
 // FSAVE writes ONE longword: the IDLE frame when the unit has been used, the
 // NULL frame when it has not (lib/AP68040 S_FSAVE1's `fpu_used ? ... : ...`).
 wire [31:0] fp_svw = fp_used ? 32'h4100_0000 : 32'h0000_0000;
-assign fp_fsave_ack = fp_svack;
+// (audit 2026-09-27, finding 3) The unit discards the saved state on the
+// acknowledge, so it goes out only once the frame is really in memory.
+// fp_svack marks the dispatch of the frame's last store; the acknowledge
+// follows when everything older has retired (older_busy low: the frame's
+// stores are written), or when a store fault leaves the write pending in
+// WB1 (the instruction is complete; the handler finishes it).  A fault that
+// RESTARTS the FSAVE drops it: the unit keeps the state and the restart
+// writes the same frame again (it used to write IDLE, M68040UM 9.8).
+reg fp_svack_q1, fp_svpend, fp_svack_q;
+always @(posedge clk) begin
+	if (!nreset) begin
+		fp_svack_q1 <= 1'b0; fp_svpend <= 1'b0; fp_svack_q <= 1'b0;
+	end else if (ce) begin
+		fp_svack_q1 <= fp_svack;
+		fp_svack_q  <= 1'b0;
+		if (fp_svack && !fp_svack_q1) fp_svpend <= 1'b1;
+		else if (fp_svpend) begin
+			if (wb_fault) begin
+				fp_svpend <= 1'b0;
+				if (wf_last) fp_svack_q <= 1'b1;
+			end else if (!older_busy) begin
+				fp_svpend <= 1'b0; fp_svack_q <= 1'b1;
+			end
+		end
+	end
+end
+assign fp_fsave_ack = fp_svack_q;
 assign fp_fr_unimp  = fp_frup;
 assign fp_fr_cmd1   = fr_cmd1;
 assign fp_fr_cmd3   = fr_cmd3;
@@ -2392,7 +2418,7 @@ always @(posedge clk) begin
 							// exception's frame, or an FSAVE would judge it frameless)
 							// (FPU fixes P1) ... and not before a memory-indirect
 							// operand's pointer is in: fp_addr takes it below
-							if (!fp_bg && !fp_pcap &&
+							if (!fp_bg && !fp_pcap && !fp_svpend && !fp_svack_q &&
 							    (!need_smi || dn_smi) && (!need_dmi || dn_dmi) &&
 							    !(rd_pend && !rd_ack)) begin
 								ph <= P_FPU;
