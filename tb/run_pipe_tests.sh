@@ -147,7 +147,9 @@ if command -v vasmm68k_mot > /dev/null; then
 		( cd pipe_asm && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "../$WORK/$n.bin" "$n.s" ) || { echo "  FAIL  fpr:$n (assembler)"; fail=1; continue; }
 		python3 bin2hex.py "$WORK/$n.bin" "$WORK/$n.hex"
 		cyc=$(sed -n 's/^; diff:.*--cycles \([0-9]*\).*/\1/p' "$s" | head -1)
-		if timeout 900 vvp "$WORK/tb_pipe_fpr.vvp" +prog="$WORK/$n.hex" +expect="pipe_asm/$n.exp" +cycles=${cyc:-20000} > "$WORK/fpr_$n.log" 2>&1 &&
+		# bus errors exist only on the memory port: such programs run in the bus legs only
+		if grep -q "expect-berr" "$s"; then :
+		elif timeout 900 vvp "$WORK/tb_pipe_fpr.vvp" +prog="$WORK/$n.hex" +expect="pipe_asm/$n.exp" +cycles=${cyc:-20000} > "$WORK/fpr_$n.log" 2>&1 &&
 		   grep -q "ALL TESTS PASSED" "$WORK/fpr_$n.log"; then
 			echo "  pass  fpr:$n"
 		else
@@ -253,10 +255,10 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 	# landing on an instruction past P_START with no read in flight.  The
 	# failure is a WEDGE, so it gets a short phase timeout (it passes in
 	# 180k clocks) instead of the bench's 20M default.
-	for t in t_integer t_cache t_bitfield_mmu t_mmu_m9s t_mmu_pipe texc_m9t t_irq_pipe t_mbit_pipe t_trirq_pipe t_ipend_pipe t_irqwedge_pipe t_icache_pipe t_earlydrop_pipe t_specread_pipe t_dcache_pipe $TMR; do
+	for t in t_integer t_cache t_bitfield_mmu t_mmu_m9s t_mmu_pipe t_rmw_wp texc_m9t t_irq_pipe t_mbit_pipe t_trirq_pipe t_ipend_pipe t_irqwedge_pipe t_icache_pipe t_earlydrop_pipe t_specread_pipe t_dcache_pipe $TMR; do
 		if [ "$t" = t_mmu_m9s ] || [ "$t" = t_movem_restart_m9s ] || [ "$t" = texc_m9t ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "$WORK/$t.s"
-		elif [ "$t" = t_mmu_pipe ]; then
+		elif [ "$t" = t_mmu_pipe ] || [ "$t" = t_rmw_wp ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "mmu_asm/$t.s"
 		elif [ "$t" = t_icache_pipe ] || [ "$t" = t_earlydrop_pipe ] || [ "$t" = t_specread_pipe ] || [ "$t" = t_dcache_pipe ]; then
 			# plan M14: the pipelined instruction read path's coherency rules
@@ -278,6 +280,13 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 			fail=1
 		fi
 	done
+	# (audit 2026-09-27) a +prog= path longer than 128 characters: the bench
+	# kept it in a reg [1023:0] and cut it off, so the program never loaded
+	LP="$WORK/longpath_$(printf 'x%.0s' $(seq 1 140))"
+	mkdir -p "$LP" && cp "$WORK/t_rmw_wp.hex" "$LP/p.hex" &&
+	timeout 1800 vvp "$WORK/tb_compat.vvp" +prog="$LP/p.hex" > "$WORK/compat_longpath.log" 2>&1 &&
+	grep -q "ALL TESTS PASSED" "$WORK/compat_longpath.log" &&
+		echo "  pass  compat:longpath" || { echo "  FAIL  compat:longpath  (see $WORK/compat_longpath.log)"; fail=1; }
 	# the 2^31-word freeze: IF's word count preset 256 short of the wrapper's
 	# PROG_WORDS part way into t_integer (tb_issued_wrap.v); it must not wedge
 	iverilog -g2012 -DISSUED_T=200000 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_issued_wrap.vvp" \

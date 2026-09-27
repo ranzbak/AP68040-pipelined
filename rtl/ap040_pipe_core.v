@@ -84,6 +84,7 @@ module ap040_pipe_core
 	output [31:0] mem_addr,
 	output [31:0] mem_wdata,
 	output  [2:0] mem_fc,
+	output        mem_lock,      // (audit finding 4) a locked RMW's read, for the MMU's W check
 	input         mem_ack,
 	input  [31:0] mem_rdata,
 	input         mem_flt,
@@ -409,6 +410,7 @@ assign dbg_sr  = sr;
 //--------------------------------------------------------------- register file
 wire        d_rd_err, d_rd_atc, d_rd_ma;   // the read's access error (bus mode)
 wire  [2:0] d_rd_fc;    // data read function code (the MMU's c_fc in M7; benches read it)
+wire        d_rd_lk;    // a locked RMW's read (TAS/CAS/CAS2)
 wire [4:0]  ra_sb, ra_si, ra_db, ra_di, ra_a, ra_b, ra_c, ra_d;
 wire [31:0] rd_sb, rd_si, rd_db, rd_di, rd_a, rd_b, rd_c, rd_d;
 wire [31:0] usp_q, isp_q, msp_q;
@@ -483,6 +485,7 @@ generate if (BUS == 0) begin : g_l1
 	assign st_done = 1'b0; assign st_ferr = 1'b0; assign st_fatc = 1'b0; assign st_fma = 1'b0;
 	assign mem_req = 1'b0; assign mem_write = 1'b0; assign mem_instr = 1'b0; assign mem_size = 2'd0;
 	assign mem_addr = 32'd0; assign mem_wdata = 32'd0; assign mem_fc = 3'd0; assign bus_st_err = 1'b0;
+	assign mem_lock = 1'b0;
 	assign d_rd_err = 1'b0; assign d_rd_atc = 1'b0; assign d_rd_ma = 1'b0;
 	assign f_err = 1'b0; assign f_atc = 1'b0;
 	assign ifp_req = 1'b0; assign ifp_addr = 32'd0; assign ifp_s = 1'b0;
@@ -509,7 +512,9 @@ end else begin : g_bus
 			if (!nreset) begin dfp_look <= 1'b0; dfp_q1 <= 1'b0; end
 			else if (ce) begin dfp_look <= d_rd_req; dfp_q1 <= st_quiet; end
 		assign d_rd_fast = dfp_look && dfp_q1 && st_quiet && dfp_hit;
-		assign dfp_req  = d_rd_req && ce;
+		// a locked RMW's read never takes the fast path: it goes out of the
+		// BCU with mem_lock, where the MMU checks write protection on it
+		assign dfp_req  = d_rd_req && ce && !d_rd_lk;
 		assign dfp_addr = d_rd_addr;
 		assign dfp_size = d_rd_size;
 		assign dfp_fc   = d_rd_fc;
@@ -600,14 +605,14 @@ end else begin : g_bus
 		.st_data(exe_o.st_data), .st_fc(exe_o.st_fc), .st_rb(exe_o.st_rb), .mem_rb(),
 		.sb_full(sb_full), .sb_busy(sb_busy), .st_done(st_done), .st_ferr(st_ferr), .st_fatc(st_fatc), .st_fma(st_fma),
 		.older_st(older_store || (exe_valid && exe_o.st_v)),   // (registered state only: timing)
-		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
+		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc), .rd_lk(d_rd_lk),
 		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(d_rd_err),
 		.rd_fast(d_rd_fast), .rd_fast_data(dfp_data),
 		.f_req(b_f_req), .f_addr(b_f_addr), .f_long(b_f_long), .f_fc(b_f_s ? 3'd6 : 3'd2),
 		.f_gnt(b_f_gnt), .f_ack(b_f_ack), .f_data(b_f_data), .f_err(b_f_err),
 		.st_err(bus_st_err),
 		.mem_req(mem_req), .mem_write(mem_write), .mem_instr(mem_instr), .mem_size(mem_size),
-		.mem_addr(mem_addr), .mem_wdata(mem_wdata), .mem_fc(mem_fc),
+		.mem_addr(mem_addr), .mem_wdata(mem_wdata), .mem_fc(mem_fc), .mem_lock(mem_lock),
 		.mem_ack(mem_ack), .mem_rdata(mem_rdata), .mem_flt(mem_flt), .mem_atc(mem_atc),
 		.rd_atc(d_rd_atc), .rd_ma(d_rd_ma), .f_atc(b_f_atc),
 		.tc_e(tc[15]), .tc_p(tc[14])
@@ -693,7 +698,7 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HA
 	.ex_u0_val(eaf_o.sp_v ? eaf_o.sp_val : eaf_o.u0_val),
 	.ex_u1_v(eaf_valid && eaf_o.u1_v), .ex_u1_r(eaf_o.u1_r), .ex_u1_val(eaf_o.u1_val),
 	.ex_ccr_v(fw_ccr_v), .ex_ccr(fw_ccr),
-	.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc),
+	.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc), .rd_lk(d_rd_lk),
 	.rd_ack(d_rd_ack), .rd_data_raw(d_rd_data),
 	.rd_err(d_rd_err), .rd_atc(d_rd_atc), .rd_ma(d_rd_ma), .bus_wdata(mem_wdata),
 	.pt_req(pt_req), .pt_write(pt_write), .pt_addr(pt_addr), .pt_done(pt_done), .pt_mmusr(pt_mmusr),

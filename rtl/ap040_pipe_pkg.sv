@@ -205,6 +205,12 @@ function automatic rdreq_t first_rd(input id_t i, input logic [31:0] src_ea, inp
 	                                     i.cls == CL_MOVEM);
 	ld_dst = (i.dst.kind == EK_MEM) && i.rmw;
 	if (i.serialize || i.cls == CL_BF) return r;   // a bitfield's address needs its offset register
+	// (audit 2026-09-27, finding 4) a locked read-modify-write reads from
+	// EA-fetch, where its read carries the lock (rd_lk) the MMU's write-
+	// protection check needs; an early read would carry the lock bit of the
+	// instruction ahead of it.  (6'd17 = `AP040_ALU_TAS, ap040_pipe_defs.svh.)
+	if (i.cls == CL_CAS || i.cls == CL_CAS2 ||
+	    (i.cls == CL_ALU && i.alu == 6'd17 && i.dst.kind == EK_MEM)) return r;
 	if (i.src.kind == EK_MEM && i.src.mi != MI_NONE)      begin r.v = 1'b1; r.t = T_SMI; r.a = src_ea; end
 	else if (i.dst.kind == EK_MEM && i.dst.mi != MI_NONE) begin r.v = 1'b1; r.t = T_DMI; r.a = dst_ea; end
 	else if (ld_src) begin r.v = 1'b1; r.t = T_SLD; r.a = src_ea; r.sz = i.size; end

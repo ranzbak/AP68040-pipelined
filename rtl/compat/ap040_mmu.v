@@ -52,6 +52,11 @@ module ap040_mmu
 	input      [31:0] c_addr,
 	input      [31:0] c_wdata,
 	input       [2:0] c_fc,
+	// (audit 2026-09-27, finding 4) the read of a locked read-modify-write
+	// (TAS, CAS, CAS2): write protection is checked on it as on a write
+	// (M68040UM 3.2.2.3), so a protected operand faults on the READ.  The M
+	// bit is still set only by the write.
+	input             c_lock,
 	// A posted store is still draining behind the cache (plan X3.3,
 	// A2b-1).  A table search must not start until it has landed: the
 	// descriptor it reads may be the very word that store is writing,
@@ -247,9 +252,10 @@ wire        pt_ttr_w = pt_ttr_a ? pt_ttra[2] : pt_ttrb[2];
 // translation decision
 //---------------------------------------------------------------------------
 
-wire ttr_fault = ttr_hit && c_write && ttr_w;
+wire c_wchk     = c_write || c_lock;        // accesses the W bit applies to
+wire ttr_fault = ttr_hit && c_wchk && ttr_w;
 wire atc_fault = tc_e && !ttr_hit && atc_hit &&
-                 ((c_write && h_w) || (!a_super && h_s));
+                 ((c_wchk && h_w) || (!a_super && h_s));
 // write to a clean page runs a table search to set the M bit
 wire atc_mmiss = atc_hit && c_write && !h_m && !h_w;
 
@@ -288,6 +294,7 @@ reg        w_issued;
 reg        w_pt;
 reg [31:0] w_la;
 reg        w_super, w_write, w_user;
+reg        w_lock;      // the walk is for a locked RMW's read: W is checked, M is not set
 reg [31:0] w_desc_addr;
 reg [31:0] w_desc;
 reg        w_wp;
@@ -358,7 +365,7 @@ wire w_hist_m = w_write &&
                   (!w_pt || (!(w_wp || w_desc[2]) &&
                              !(w_user && w_desc[7])));
 wire w_denied = !w_pt && ((w_user && w_desc[7]) ||
-                          (w_write && (w_wp || w_desc[2])));
+                          ((w_write || w_lock) && (w_wp || w_desc[2])));
 
 //---------------------------------------------------------------------------
 // request forwarding
@@ -455,7 +462,7 @@ always @(posedge clk) begin
 	if (!nreset) begin
 		wst <= W_IDLE;
 		w_issued <= 0; w_pt <= 0;
-		w_la <= 0; w_super <= 0; w_write <= 0; w_user <= 0;
+		w_la <= 0; w_super <= 0; w_write <= 0; w_user <= 0; w_lock <= 0;
 		w_desc_addr <= 0; w_desc <= 0; w_wp <= 0;
 		w_req_addr <= 0; w_req_wdat <= 0; w_req_wr <= 0;
 		w_active <= 0; f_bank <= 0;
@@ -535,6 +542,7 @@ always @(posedge clk) begin
 					w_super <= a_super;
 					w_user  <= !a_super;
 					w_write <= c_write;
+					w_lock  <= c_lock && !c_write;
 					w_wp    <= 0;
 					f_bank  <= c_instr;
 					wrd({(a_super ? srp[31:9] : urp[31:9]), 9'd0} +
@@ -594,6 +602,7 @@ always @(posedge clk) begin
 					w_super <= pt_fc[2];
 					w_user  <= !pt_fc[2];
 					w_write <= pt_write;
+					w_lock  <= 1'b0;
 					w_wp    <= 0;
 					f_bank  <= pt_instr;
 					if (pt_ttr_hit) begin

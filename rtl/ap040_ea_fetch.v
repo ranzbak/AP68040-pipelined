@@ -106,6 +106,7 @@ module ap040_ea_fetch
 	output     [31:0] rd_addr,
 	output      [1:0] rd_size,
 	output      [2:0] rd_fc,      // the read's function code (MOVES: SFC)
+	output            rd_lk,      // (audit finding 4) a locked read-modify-write's read
 	input             rd_ack,
 	input      [31:0] rd_data_raw,
 	input             rd_err,     // the read ended in an access error (M6)
@@ -492,6 +493,7 @@ reg         cm_v;          // an RTE restored CM: the MOVEM at cm_pc uses cm_ea
 reg  [31:0] cm_ea, cm_pc;
 reg  [31:0] r_ea;          // RTE of a format $7 frame: its EA and SSW
 reg  [15:0] r_ssw;
+reg         x_rteodd;    // the exception being entered is an RTE's odd-PC address error
 wire        mm_cmi  = (i.cls == CL_MOVEM) && !i.imm[1] && !i.imm[2];   // MOVEM proper (not MOVEP/MOVE16)
 wire        cm_mode = i.imm[0] ? ((i.src.mode == 3'd6) || (i.src.mode == 3'd7 && (i.src.mreg == 3'd2 || i.src.mreg == 3'd3)))
                                : (i.dst.mode == 3'd6);
@@ -980,6 +982,9 @@ function automatic ex_t reset_final(input id_t i, input logic [31:0] ssp, input 
 endfunction
 
 wire rte_fmt_ok = (r_fv[15:12] <= 4'd3) || (r_fv[15:12] == 4'd4 && HAS_FPU == 0) || (r_fv[15:12] == 4'd7);
+// (audit 2026-09-27, finding 2) an RTE of a format $7 frame with SSW CT set:
+// the faulted instruction's trace is still due, in front of the restored PC
+wire rte_ct = (ph == P_RTE) && (r_fv[15:12] == 4'd7) && r_ssw[13];
 wire rte_goes   = (r_fv[15:12] != 4'd1) && !r_pc[0];   // the RTE final micro-op redirects
 
 //--------------------------------------------------------------- the step logic
@@ -1242,6 +1247,11 @@ endfunction
 wire        aer_lk   = (i.cls == CL_CAS) || (i.cls == CL_CAS2) ||
                        (i.cls == CL_ALU && i.alu == `AP040_ALU_TAS && i.dst.kind == EK_MEM);
 wire        aer_m16  = (i.cls == CL_MOVEM) && i.imm[2];
+// (audit 2026-09-27, finding 4) the reads of TAS, CAS and CAS2 belong to a
+// locked read-modify-write: the MMU checks write protection on them
+// (M68040UM 3.2.2.3), so a protected operand faults on the READ -- and a CAS2
+// whose compare fails, which never writes, still faults.  rd_lk is assigned
+// with the other read attributes, below.
 wire [15:0] aer_ssw  = ssw_f(ph == P_MOVEM && mm_cmi, rd_ma, rd_atc, aer_lk, 1'b0, rd_sz_q, aer_m16, i.fcsel != 2'd0, rd_fc_q);
 // A store's access error (synchronous stores: the micro-op is still in
 // WB).  On the instruction's last micro-op everything else it did has
@@ -1258,7 +1268,15 @@ endfunction
 wire        wf_dbl  = wb_fault && (wb_stf.exc || ph == P_EXC || ph == P_RTE || ph == P_RESET);
 wire        wf_last = wb_last && !wb_stf.cm;      // MOVEM: CM and a restart, never WB1
 wire        wf_go   = wb_fault && !wf_dbl;
-wire        aerr_go  = cap_err && eac_v_use && (ph == P_START || ph == P_OPS || ph == P_MOVEM);
+// (audit 2026-09-27, finding 1) P_FPU too: a floating-point memory read --
+// FMOVE/FMOVEM/FRESTORE/control-register loads -- that ends in an access error
+// was dropped and the read issued again, for ever on a fault that persists (a
+// nonresident page).  The instruction restarts like any other read fault: the
+// operand beats all come BEFORE the request to the unit, FMOVEM and the
+// control-register loads only rewrite registers a restart writes again, the An
+// update rides on the end, and the P_FPU entry re-initialises the FP state.
+wire        aerr_go  = cap_err && eac_v_use && (ph == P_START || ph == P_OPS || ph == P_MOVEM ||
+                                                (HAS_FPU != 0 && ph == P_FPU));
 wire        aerr_dbl = cap_err && (ph == P_EXC || ph == P_RTE || ph == P_RESET);
 
 //--------------------------------------------------------------- MOVEM
@@ -1603,7 +1621,36 @@ assign fp_fridle   = fp_idlp;
 // FSAVE writes ONE longword: the IDLE frame when the unit has been used, the
 // NULL frame when it has not (lib/AP68040 S_FSAVE1's `fpu_used ? ... : ...`).
 wire [31:0] fp_svw = fp_used ? 32'h4100_0000 : 32'h0000_0000;
-assign fp_fsave_ack = fp_svack;
+// (audit 2026-09-27, finding 3) The unit discards the saved state on the
+// acknowledge, so it goes out only once the frame is really in memory.
+// fp_svack marks the dispatch of the frame's last store; the acknowledge
+// follows when everything older has retired (older_busy low: the frame's
+// stores are written), or when a LATER instruction's store faults (stores
+// are synchronous and in order, so the frame is already in memory -- final
+// review I2: such a fault used to drop the acknowledge when it restarted its
+// own instruction, e.g. a MOVEM with CM).  A fault on the FSAVE's own store
+// drops it: the FSAVE restarts, the unit keeps the state and the restart
+// writes the same frame again (it used to write IDLE, M68040UM 9.8).
+reg fp_svack_q1, fp_svpend, fp_svack_q;
+reg [31:0] fp_svpc;       // the FSAVE whose acknowledge is pending
+always @(posedge clk) begin
+	if (!nreset) begin
+		fp_svack_q1 <= 1'b0; fp_svpend <= 1'b0; fp_svack_q <= 1'b0; fp_svpc <= 32'd0;
+	end else if (ce) begin
+		fp_svack_q1 <= fp_svack;
+		fp_svack_q  <= 1'b0;
+		if (fp_svack && !fp_svack_q1) begin fp_svpend <= 1'b1; fp_svpc <= i.pc; end
+		else if (fp_svpend) begin
+			if (wb_fault) begin
+				fp_svpend <= 1'b0;
+				if (wb_stf.ipc != fp_svpc) fp_svack_q <= 1'b1;   // a later instruction's store
+			end else if (!older_busy) begin
+				fp_svpend <= 1'b0; fp_svack_q <= 1'b1;
+			end
+		end
+	end
+end
+assign fp_fsave_ack = fp_svack_q;
 assign fp_fr_unimp  = fp_frup;
 assign fp_fr_cmd1   = fr_cmd1;
 assign fp_fr_cmd3   = fr_cmd3;
@@ -2174,6 +2221,10 @@ wire ex_t disp_x = with_fc(disp_x0, (st.dsel == 3'd1) ? 3'd5 : (st.dsel == 3'd0 
 // (plan M4; the lifted MMU's c_fc in M7)
 wire [2:0] fc_data = s_bit ? 3'd5 : 3'd1;
 // (exception entry's vector read and RTE's pops: supervisor data)
+// (final review I1/M2) only the locked instruction's OWN operand reads, issued
+// from this stage: the next instruction's early read goes out while `i` is
+// still the TAS/CAS, and a memory-indirect pointer read is not the operand
+assign rd_lk     = aer_lk && st.issue && (st.it == T_SLD || st.it == T_DLD);
 assign rd_fc     = (st.issue && (ph == P_START || ph == P_OPS) && i.fcsel == 2'd1) ? sfc_in :
                    (ph == P_EXC || ph == P_RTE || ph == P_RESET) ? 3'd5 : fc_data;
 // An early read is issued only for an instruction that is known to be on
@@ -2265,7 +2316,7 @@ always @(posedge clk) begin
 		done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
 		s_addr <= 32'd0; d_addr <= 32'd0; s_val <= 32'd0; d_val <= 32'd0;
 		x_vec <= 8'd0; x_fmt <= 4'd0; x_pc <= 32'd0; x_addr <= 32'd0; x_step <= 3'd0; x_k <= 4'd0;
-		x_sr <= 16'd0; x_sp <= 32'd0; x_bank <= R_ISP; x_target <= 32'd0;
+		x_sr <= 16'd0; x_sp <= 32'd0; x_bank <= R_ISP; x_target <= 32'd0; x_rteodd <= 1'b0;
 		x_pass2 <= 1'b0; x_sp1 <= 32'd0;
 		bf_step <= 1'b0;
 		pt_req <= 1'b0; pt_write <= 1'b0; pt_addr <= 32'd0; pf_req <= 1'b0; pf_mode <= 2'd0; pf_addr <= 32'd0;
@@ -2313,7 +2364,14 @@ always @(posedge clk) begin
 			x_addr <= wb_st_a;
 			x7[2] <= wb_stf.cm ? mm_ea[wb_stf.cmt] :                              // EA (MOVEM: calculated)
 			         wb_stf.m16 ? {wb_st_a[31:4], 4'd0} : wb_st_a;
-			x7[3] <= {wf_ssw, 16'h0000};                                          // SSW, WB3S
+			// (audit 2026-09-27, finding 2) a trace the faulted store's
+			// instruction armed: every read waits while one is pending, the
+			// vector fetch included, so it must not stay pending through this
+			// entry (the core deadlocked).  If the instruction completed (the
+			// write pending in WB1) the trace survives as SSW CT and the RTE
+			// takes it; a restart re-arms it by itself.
+			tr_take <= 1'b0;
+			x7[3] <= {wf_ssw | ((tr_take && wf_last) ? 16'h2000 : 16'h0000), 16'h0000};   // SSW (CT), WB3S
 			x7[4] <= {16'h0000, 8'h00, wf_last ? wbs_f(wf_ssw) : 8'h00};          // WB2S, WB1S
 			x7[5] <= wb_st_a;                                                     // FA
 			x7[6] <= wf_last ? 32'd0 : wb_st_a;                                   // WB3A
@@ -2378,7 +2436,7 @@ always @(posedge clk) begin
 							// exception's frame, or an FSAVE would judge it frameless)
 							// (FPU fixes P1) ... and not before a memory-indirect
 							// operand's pointer is in: fp_addr takes it below
-							if (!fp_bg && !fp_pcap &&
+							if (!fp_bg && !fp_pcap && !fp_svpend && !fp_svack_q &&
 							    (!need_smi || dn_smi) && (!need_dmi || dn_dmi) &&
 							    !(rd_pend && !rd_ack)) begin
 								ph <= P_FPU;
@@ -2509,7 +2567,11 @@ always @(posedge clk) begin
 					if (x_step == 3'd4 && st.disp && !x_target[0]) x_pass2 <= 1'b0;
 					if (x_step == 3'd5 && !older_busy) begin
 						x_pass2 <= 1'b0;
-						x_sr   <= sr_in;
+						// (audit 2026-09-27, finding 5) an RTE's odd-PC address
+						// error stacks the restored SR WITH S set -- $A700 for a
+						// restored $8700 (M68040UM 8.4, 1998 addendum p. 2)
+						x_sr   <= sr_in | (x_rteodd ? 16'h2000 : 16'h0000);
+						x_rteodd <= 1'b0;
 						x_bank <= bank_now;
 						x_sp   <= rd_a - fsize(x_fmt);  // ra_a = bank_now in P_EXC
 						x_step <= 3'd0; x_k <= 4'd0;
@@ -2531,6 +2593,7 @@ always @(posedge clk) begin
 							// restored SR (reference S_RTE_FIN2), PC = the RTE
 							ph <= P_EXC; x_step <= 3'd5;
 							x_vec <= 8'd3; x_fmt <= 4'd2; x_pc <= i.pc; x_addr <= {r_pc[31:1], 1'b0}; x_irq <= 1'b0;
+							x_rteodd <= 1'b1;   // the stacked SR has S set (see step 5)
 						end
 					end
 				end
@@ -2561,7 +2624,9 @@ always @(posedge clk) begin
 						// over the release that clock would otherwise cause
 						if (fp_exc_req) begin fp_ae <= 1'b1; fp_avec <= fp_exc_vec; end
 					end
-					if (fp_pend && st.exc_go) fp_pend <= 1'b0;
+					// (an access error leaves a pending deferred exception for the
+					// restart to take)
+					if (fp_pend && st.exc_go && !aerr_go) fp_pend <= 1'b0;
 					// the memory operand, LEFT aligned: one byte, one word, or
 					// one, two or three longwords
 					if (!fp_cr && !fp_mvm && !fp_sv && !fp_rs &&
@@ -2764,9 +2829,9 @@ always @(posedge clk) begin
 			// writeback, one stage later.  Exception entry is not a traced
 			// instruction, so P_EXC/P_RESET do not arm.
 			if (st.fin && ph != P_EXC && ph != P_RESET) begin
-				tr_take  <= tr_arm;
-				tr_pc    <= i.pc;
-				tr_yield <= !sr_in[15];   // a T0-only trace yields to the target's exception
+				tr_take  <= tr_arm || rte_ct;
+				tr_pc    <= rte_ct ? r_pc : i.pc;
+				tr_yield <= rte_ct ? 1'b0 : !sr_in[15];   // a T0-only trace yields to the target's exception
 			end
 			// no trace survives the exception its own instruction took: the
 			// TRAP takes the TRAP and nothing else (the reference clears the

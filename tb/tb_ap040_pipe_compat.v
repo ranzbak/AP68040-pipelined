@@ -437,7 +437,7 @@ integer phase;
 integer result;          // 0 running, 1 pass, 2 fail
 
 assign data_in = (phase == 2 && lvl_hold) ? lvl_data : mem[addr_out[15:1]];
-reg [1023:0] prog_file;
+string prog_file;   // (audit 2026-09-27) was reg [1023:0]: a path over 128 characters was cut off
 reg [1023:0] dump_file;
 
 function [2:0] latency;

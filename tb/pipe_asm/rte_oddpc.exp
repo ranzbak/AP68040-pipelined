@@ -1,0 +1,9 @@
+# audit 2026-09-27 finding 5: RTE to an odd PC with a restored SR of $8700
+# (T1, user): address error, format $2 vector 3, stacked SR with S set
+# ($A700), PC = the RTE, address = the restored PC made even.  Hand-written
+# from M68040UM 8.4 and the 1998 addendum p. 2.
+halt 00000416
+m32 00007000 0000a700
+m32 00007004 0000200c
+m32 00007008 00000414
+m32 0000700c 00000600
