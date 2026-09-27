@@ -147,7 +147,9 @@ if command -v vasmm68k_mot > /dev/null; then
 		( cd pipe_asm && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "../$WORK/$n.bin" "$n.s" ) || { echo "  FAIL  fpr:$n (assembler)"; fail=1; continue; }
 		python3 bin2hex.py "$WORK/$n.bin" "$WORK/$n.hex"
 		cyc=$(sed -n 's/^; diff:.*--cycles \([0-9]*\).*/\1/p' "$s" | head -1)
-		if timeout 900 vvp "$WORK/tb_pipe_fpr.vvp" +prog="$WORK/$n.hex" +expect="pipe_asm/$n.exp" +cycles=${cyc:-20000} > "$WORK/fpr_$n.log" 2>&1 &&
+		# bus errors exist only on the memory port: such programs run in the bus legs only
+		if grep -q "expect-berr" "$s"; then :
+		elif timeout 900 vvp "$WORK/tb_pipe_fpr.vvp" +prog="$WORK/$n.hex" +expect="pipe_asm/$n.exp" +cycles=${cyc:-20000} > "$WORK/fpr_$n.log" 2>&1 &&
 		   grep -q "ALL TESTS PASSED" "$WORK/fpr_$n.log"; then
 			echo "  pass  fpr:$n"
 		else

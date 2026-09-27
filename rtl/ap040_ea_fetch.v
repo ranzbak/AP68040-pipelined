@@ -1258,7 +1258,15 @@ endfunction
 wire        wf_dbl  = wb_fault && (wb_stf.exc || ph == P_EXC || ph == P_RTE || ph == P_RESET);
 wire        wf_last = wb_last && !wb_stf.cm;      // MOVEM: CM and a restart, never WB1
 wire        wf_go   = wb_fault && !wf_dbl;
-wire        aerr_go  = cap_err && eac_v_use && (ph == P_START || ph == P_OPS || ph == P_MOVEM);
+// (audit 2026-09-27, finding 1) P_FPU too: a floating-point memory read --
+// FMOVE/FMOVEM/FRESTORE/control-register loads -- that ends in an access error
+// was dropped and the read issued again, for ever on a fault that persists (a
+// nonresident page).  The instruction restarts like any other read fault: the
+// operand beats all come BEFORE the request to the unit, FMOVEM and the
+// control-register loads only rewrite registers a restart writes again, the An
+// update rides on the end, and the P_FPU entry re-initialises the FP state.
+wire        aerr_go  = cap_err && eac_v_use && (ph == P_START || ph == P_OPS || ph == P_MOVEM ||
+                                                (HAS_FPU != 0 && ph == P_FPU));
 wire        aerr_dbl = cap_err && (ph == P_EXC || ph == P_RTE || ph == P_RESET);
 
 //--------------------------------------------------------------- MOVEM
@@ -2561,7 +2569,9 @@ always @(posedge clk) begin
 						// over the release that clock would otherwise cause
 						if (fp_exc_req) begin fp_ae <= 1'b1; fp_avec <= fp_exc_vec; end
 					end
-					if (fp_pend && st.exc_go) fp_pend <= 1'b0;
+					// (an access error leaves a pending deferred exception for the
+					// restart to take)
+					if (fp_pend && st.exc_go && !aerr_go) fp_pend <= 1'b0;
 					// the memory operand, LEFT aligned: one byte, one word, or
 					// one, two or three longwords
 					if (!fp_cr && !fp_mvm && !fp_sv && !fp_rs &&
