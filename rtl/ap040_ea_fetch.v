@@ -493,6 +493,7 @@ reg         cm_v;          // an RTE restored CM: the MOVEM at cm_pc uses cm_ea
 reg  [31:0] cm_ea, cm_pc;
 reg  [31:0] r_ea;          // RTE of a format $7 frame: its EA and SSW
 reg  [15:0] r_ssw;
+reg         x_rteodd;    // the exception being entered is an RTE's odd-PC address error
 wire        mm_cmi  = (i.cls == CL_MOVEM) && !i.imm[1] && !i.imm[2];   // MOVEM proper (not MOVEP/MOVE16)
 wire        cm_mode = i.imm[0] ? ((i.src.mode == 3'd6) || (i.src.mode == 3'd7 && (i.src.mreg == 3'd2 || i.src.mreg == 3'd3)))
                                : (i.dst.mode == 3'd6);
@@ -2308,7 +2309,7 @@ always @(posedge clk) begin
 		done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
 		s_addr <= 32'd0; d_addr <= 32'd0; s_val <= 32'd0; d_val <= 32'd0;
 		x_vec <= 8'd0; x_fmt <= 4'd0; x_pc <= 32'd0; x_addr <= 32'd0; x_step <= 3'd0; x_k <= 4'd0;
-		x_sr <= 16'd0; x_sp <= 32'd0; x_bank <= R_ISP; x_target <= 32'd0;
+		x_sr <= 16'd0; x_sp <= 32'd0; x_bank <= R_ISP; x_target <= 32'd0; x_rteodd <= 1'b0;
 		x_pass2 <= 1'b0; x_sp1 <= 32'd0;
 		bf_step <= 1'b0;
 		pt_req <= 1'b0; pt_write <= 1'b0; pt_addr <= 32'd0; pf_req <= 1'b0; pf_mode <= 2'd0; pf_addr <= 32'd0;
@@ -2559,7 +2560,11 @@ always @(posedge clk) begin
 					if (x_step == 3'd4 && st.disp && !x_target[0]) x_pass2 <= 1'b0;
 					if (x_step == 3'd5 && !older_busy) begin
 						x_pass2 <= 1'b0;
-						x_sr   <= sr_in;
+						// (audit 2026-09-27, finding 5) an RTE's odd-PC address
+						// error stacks the restored SR WITH S set -- $A700 for a
+						// restored $8700 (M68040UM 8.4, 1998 addendum p. 2)
+						x_sr   <= sr_in | (x_rteodd ? 16'h2000 : 16'h0000);
+						x_rteodd <= 1'b0;
 						x_bank <= bank_now;
 						x_sp   <= rd_a - fsize(x_fmt);  // ra_a = bank_now in P_EXC
 						x_step <= 3'd0; x_k <= 4'd0;
@@ -2581,6 +2586,7 @@ always @(posedge clk) begin
 							// restored SR (reference S_RTE_FIN2), PC = the RTE
 							ph <= P_EXC; x_step <= 3'd5;
 							x_vec <= 8'd3; x_fmt <= 4'd2; x_pc <= i.pc; x_addr <= {r_pc[31:1], 1'b0}; x_irq <= 1'b0;
+							x_rteodd <= 1'b1;   // the stacked SR has S set (see step 5)
 						end
 					end
 				end
