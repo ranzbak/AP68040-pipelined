@@ -1,0 +1,10 @@
+# audit 2026-09-27 finding 2: a traced store whose write faults (pending in
+# WB1) -- SSW CT set, the RTE takes the store's trace (PC = the ANDI), then
+# the ANDI's own trace.  Hand-written from M68040UM 8.3 / 8.4.6.2.  Bus legs.
+halt 0000042e
+berr 00007000 w
+m32 00007200 00000001
+m32 00007204 00002000
+m32 00007208 11223344
+m32 00007800 00000424
+m32 00007804 00000428

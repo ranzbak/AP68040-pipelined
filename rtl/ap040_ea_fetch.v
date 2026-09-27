@@ -981,6 +981,9 @@ function automatic ex_t reset_final(input id_t i, input logic [31:0] ssp, input 
 endfunction
 
 wire rte_fmt_ok = (r_fv[15:12] <= 4'd3) || (r_fv[15:12] == 4'd4 && HAS_FPU == 0) || (r_fv[15:12] == 4'd7);
+// (audit 2026-09-27, finding 2) an RTE of a format $7 frame with SSW CT set:
+// the faulted instruction's trace is still due, in front of the restored PC
+wire rte_ct = (ph == P_RTE) && (r_fv[15:12] == 4'd7) && r_ssw[13];
 wire rte_goes   = (r_fv[15:12] != 4'd1) && !r_pc[0];   // the RTE final micro-op redirects
 
 //--------------------------------------------------------------- the step logic
@@ -2353,7 +2356,14 @@ always @(posedge clk) begin
 			x_addr <= wb_st_a;
 			x7[2] <= wb_stf.cm ? mm_ea[wb_stf.cmt] :                              // EA (MOVEM: calculated)
 			         wb_stf.m16 ? {wb_st_a[31:4], 4'd0} : wb_st_a;
-			x7[3] <= {wf_ssw, 16'h0000};                                          // SSW, WB3S
+			// (audit 2026-09-27, finding 2) a trace the faulted store's
+			// instruction armed: every read waits while one is pending, the
+			// vector fetch included, so it must not stay pending through this
+			// entry (the core deadlocked).  If the instruction completed (the
+			// write pending in WB1) the trace survives as SSW CT and the RTE
+			// takes it; a restart re-arms it by itself.
+			tr_take <= 1'b0;
+			x7[3] <= {wf_ssw | ((tr_take && wf_last) ? 16'h2000 : 16'h0000), 16'h0000};   // SSW (CT), WB3S
 			x7[4] <= {16'h0000, 8'h00, wf_last ? wbs_f(wf_ssw) : 8'h00};          // WB2S, WB1S
 			x7[5] <= wb_st_a;                                                     // FA
 			x7[6] <= wf_last ? 32'd0 : wb_st_a;                                   // WB3A
@@ -2806,9 +2816,9 @@ always @(posedge clk) begin
 			// writeback, one stage later.  Exception entry is not a traced
 			// instruction, so P_EXC/P_RESET do not arm.
 			if (st.fin && ph != P_EXC && ph != P_RESET) begin
-				tr_take  <= tr_arm;
-				tr_pc    <= i.pc;
-				tr_yield <= !sr_in[15];   // a T0-only trace yields to the target's exception
+				tr_take  <= tr_arm || rte_ct;
+				tr_pc    <= rte_ct ? r_pc : i.pc;
+				tr_yield <= rte_ct ? 1'b0 : !sr_in[15];   // a T0-only trace yields to the target's exception
 			end
 			// no trace survives the exception its own instruction took: the
 			// TRAP takes the TRAP and nothing else (the reference clears the
