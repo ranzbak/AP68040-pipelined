@@ -1248,7 +1248,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						             op[5:0] == 6'b111_100) begin // FTRAPcc
 							d.cls = CL_FPU;
 						end else if (d.src.kind == EK_DREG ||
-						             (d.src.kind == EK_MEM && d.src.mi == MI_NONE &&
+						             (d.src.kind == EK_MEM &&
 						              !(sh.sm == 3'd7 && sh.sr[1]))) begin
 							// FScc <ea>: a data-alterable byte destination
 							d.cls  = CL_FPU;
@@ -1272,7 +1272,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				// into the plain F-line by the block above it.
 				if (HAS_FPU != 0 && d.cls == CL_EXC && d.exc_fmt == 4'd4 &&
 				    ((op[8:6] == 3'b100 && fsave_ok) || (op[8:6] == 3'b101 && frest_ok)) &&
-				    d.src.kind == EK_MEM && d.src.mi == MI_NONE) begin
+				    d.src.kind == EK_MEM) begin
 					d.cls      = CL_FPU;
 					d.size     = SZ_L;
 					d.imm[6:0] = 7'd4;
@@ -1299,12 +1299,10 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 				// an illegal EA on a 68040 and stays the F-line.
 				if (HAS_FPU != 0 && d.cls == CL_EXC && d.exc_fmt == 4'd4 &&
 				    op[8:6] == 3'b000) begin
-					// (A memory-INDIRECT effective address is excluded: its
-					// pointer fetch would have to happen before the operand
-					// beats, and EA-fetch's FP phase does not sequence that
-					// yet.  Such an encoding keeps M10.0's format $4 frame,
-					// which is a functional gap with an FPU -- recorded in
-					// PLAN.md M10.1 -- on a form no compiler emits.)
+					// (FPU fixes P1) a memory-INDIRECT effective address is
+					// in: EA-fetch reads its pointer before P_FPU starts
+					// (M68040UM 10.7.2 times every memory-indirect mode for
+					// every FP class).
 					// a source/destination format that fits in a data register:
 					// B, W, L and single.  Extended, packed and double in Dn
 					// are illegal effective addresses on a 68040 and stay the
@@ -1315,7 +1313,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						d.cls = CL_FPU; d.size = SZ_L;
 					end else if (x1[15:13] == 3'b010 &&
 					             ((d.src.kind == EK_DREG && fp_ireg) ||
-					              (d.src.kind == EK_MEM && d.src.mi == MI_NONE) ||
+					              (d.src.kind == EK_MEM) ||
 					              d.src.kind == EK_IMM ||
 					              x1[12:10] == 3'b111)) begin
 						// (M10.7) specifier 111 is FMOVECR, which has no
@@ -1327,9 +1325,18 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						d.cls = CL_FPU;
 					end else if (x1[15:13] == 3'b011 &&
 					             ((d.src.kind == EK_DREG && fp_ireg) ||
-					              (d.src.kind == EK_MEM && d.src.mi == MI_NONE))) begin
+					              (d.src.kind == EK_DREG && x1[11:10] == 2'b11) ||
+					              (d.src.kind == EK_MEM && !(sh.sm == 3'd7 && sh.sr[1])))) begin
 						// opclass 011's EA is the DESTINATION: the core waits
-						// for `done` and writes the FPU's result into it
+						// for `done` and writes the FPU's result into it.  A
+						// PC-relative destination -- (d16,PC), (d8,PC,Xn) and
+						// the memory-indirect PC modes -- is not alterable: it
+						// falls to the reject block below, the plain F-line.
+						// (FPU fixes P2, D22) FMOVE.P to Dn -- static (011) or
+						// dynamic (111) k-factor -- is the unsupported DATA
+						// TYPE on a 68040: the unit answers vector 55, format
+						// $3, EA 0 (WinUAE fpp.cpp put_fp_value; the PRM calls
+						// Dn illegal, and rule 2 beats it).  Nothing is written.
 						d.cls = CL_FPU;
 						d.dst  = d.src;
 					end
@@ -1356,7 +1363,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						              sh.sm == 3'd7 && (sh.sr == 3'd2 || sh.sr == 3'd3));
 						if (!fp_crbad && (d.src.kind == EK_DREG || d.src.kind == EK_AREG ||
 						                  d.src.kind == EK_IMM ||
-						                  (d.src.kind == EK_MEM && d.src.mi == MI_NONE))) begin
+						                  (d.src.kind == EK_MEM))) begin
 							d.cls  = CL_FPU;
 							d.size = SZ_L;
 							if (x1[13]) d.dst = d.src;   // FPcr -> <ea>
@@ -1370,9 +1377,6 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 							// cpid-1 opcode the format $4 frame (D18).
 							d.exc_fmt = 4'd0; d.exc_next = 1'b0;
 						end
-						// ... and a LEGAL one this core does not sequence -- a
-						// memory-indirect EA -- keeps the format $4 frame it has
-						// today, which is M10.1's recorded gap and not this rule.
 					end
 					// (M10.6) An effective address the 68040 REJECTS for an
 					// opclass 010 or 011 instruction is the ordinary F-line --
@@ -1381,9 +1385,8 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					// the oracle and it names the cputest rounds: an address
 					// register is never a legal floating-point source or
 					// destination, and a data register holds only the formats
-					// that fit in it.  A LEGAL address this core does not
-					// sequence (memory indirect) keeps format $4, which is the
-					// separate, recorded gap.
+					// that fit in it (a packed STORE to Dn is the exception:
+					// the datatype fault, P2 above).
 					else if ((x1[15:13] == 3'b010 &&
 					          (d.src.kind == EK_AREG ||
 					           (d.src.kind == EK_DREG && !fp_ireg))) ||
@@ -1391,12 +1394,12 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					          (d.src.kind == EK_AREG ||
 					           d.src.kind == EK_IMM ||
 					           (sh.sm == 3'd7 && sh.sr[1]) ||
-					           (d.src.kind == EK_DREG && !fp_ireg &&
-					            x1[12:10] != 3'b011)))) begin
-						// (packed into a data register is the DATATYPE fault,
-						// vector 55, not the F-line -- it keeps format $4 for
-						// now and is recorded with the rest of M10.6)
-						if (fp_op_hw(x1[6:0])) begin
+					           (d.src.kind == EK_DREG && !fp_ireg)))) begin
+						// (FPU fixes P2b) the opmode split is opclass 010's
+						// alone: in opclass 011 bits 6:0 are the k-factor, and
+						// every rejected store is the plain F-line (WinUAE
+						// put_fp_value2; lib/AP68040 go_fp_fline)
+						if (x1[15:13] != 3'b010 || fp_op_hw(x1[6:0])) begin
 							d.exc_fmt = 4'd0; d.exc_next = 1'b0;
 						end else begin
 							// an FPSP-emulated opmode reports as UNIMPLEMENTED
@@ -1434,7 +1437,7 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						// instruction runs.  `reg_c` carries the register to
 						// EA-fetch, which reads it on op_c, and the step goes
 						// through the an_ov hook M10.7 built for exactly this.
-						else if (d.src.kind == EK_MEM && d.src.mi == MI_NONE) begin
+						else if (d.src.kind == EK_MEM) begin
 							d.cls  = CL_FPU;
 							d.size = SZ_L;
 							if (x1[11]) d.reg_c = {2'b00, x1[6:4]};

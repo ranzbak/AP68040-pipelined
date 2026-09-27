@@ -371,11 +371,34 @@ wire pass_ok = c_req && !c_flt && !need_walk && !ttr_fault && !atc_fault &&
                (!tc_e || ttr_hit || lk_fresh) &&
                (wst == W_IDLE) && !w_active && !pf_req && !pt_req;
 
-assign m_req   = pass_ok;
+// Once forwarded, a request stays forwarded -- to the same physical address --
+// until its answer.  pass_ok and pa_out are re-evaluated every clock from TC,
+// the TTRs and the ATC; a core whose clock enable does not stop during an
+// external access (MinimigAGA_TC64 findings/unfreeze: TG68K ap040_free_core)
+// can commit a MOVEC to TC or a TTR while its own fetch or read is in flight,
+// and must not see that access withdrawn, moved, faulted or overtaken by a
+// table walk.  With the core frozen for the access this latch never changes
+// what m_* shows.  It lets go if the core drops its request.
+reg        pass_hold;
+reg [31:0] pass_pa;
+always @(posedge clk) begin
+	if (!nreset)
+		pass_hold <= 1'b0;
+	else if (ce) begin
+		if (pass_hold) begin
+			if (m_ack || !c_req) pass_hold <= 1'b0;
+		end else if (pass_ok && !m_ack) begin
+			pass_hold <= 1'b1;
+			pass_pa   <= pa_out;
+		end
+	end
+end
+
+assign m_req   = pass_hold ? c_req : pass_ok;
 assign m_write = c_write;
 assign m_instr = c_instr;
 assign m_size  = c_size;
-assign m_addr  = pa_out;
+assign m_addr  = pass_hold ? pass_pa : pa_out;
 assign m_wdata = c_wdata;
 assign m_fc    = c_fc;
 
@@ -503,10 +526,10 @@ always @(posedge clk) begin
 					sw_pt     <= 1;
 					wst       <= W_SWEEP;
 				end
-				else if (c_req && !c_flt && (ttr_fault || atc_fault)) begin
+				else if (c_req && !c_flt && !pass_hold && (ttr_fault || atc_fault)) begin
 					c_flt <= 1;
 				end
-				else if (c_req && !c_flt && need_walk && !walk_hold) begin
+				else if (c_req && !c_flt && need_walk && !walk_hold && !pass_hold) begin
 					w_pt    <= 0;
 					w_la    <= c_addr;
 					w_super <= a_super;

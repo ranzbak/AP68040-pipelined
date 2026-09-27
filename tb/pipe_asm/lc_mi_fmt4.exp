@@ -1,0 +1,30 @@
+halt 00000430
+# findings/fpu-fixes/plan.md N1; hand-written from M68040UM A.5.1 p. A-6 (the
+# LC040 build: HAS_FPU = 0).  Per trap: format/vector word, stacked (next) PC,
+# EA field, faulted PC.
+# 1: ([$3100.w]) -- the pointer holds $3200
+m32 00007000 0000402c
+m32 00007004 00000416
+m32 00007008 00003200
+m32 0000700c 0000040e
+# 2: ([$3104.w],4)
+m32 00007010 0000402c
+m32 00007014 00000420
+m32 00007018 00003204
+m32 0000701c 00000416
+# 3: ([0,a0],d1.l*2,2), A0 = $3108, D1 = 1
+m32 00007020 0000402c
+m32 00007024 0000042a
+m32 00007028 00003204
+m32 0000702c 00000420
+# 4: $3200.w, the control
+m32 00007030 0000402c
+m32 00007034 00000430
+m32 00007038 00003200
+m32 0000703c 0000042a
+# each pointer read once; an unimplemented FP instruction never reads its operand
+readonce 00003100
+readonce 00003104
+readonce 00003108
+noread 00003200
+noread 00003204

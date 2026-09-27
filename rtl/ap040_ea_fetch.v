@@ -462,8 +462,16 @@ wire addr_only    = (i.cls == CL_JMP || i.cls == CL_JSR || i.cls == CL_LEA || i.
 wire needs_ld_src = ((i.src.kind == EK_MEM) && !addr_only && i.cls != CL_MOVEM) || (bf_mem && (bf_n == 3'd3 || bf_n == 3'd5));
 // CHK2/CMP2 read the upper bound from <ea>+size into the "destination" load
 wire needs_ld_dst = ((i.dst.kind == EK_MEM) && i.rmw && i.cls != CL_MOVEM) || (i.cls == CL_CHK2) || bf_mem;
-wire need_smi = (i.src.kind == EK_MEM) && (i.src.mi != MI_NONE) && !cm_use;   // (CM: the EA is the stacked one)
-wire need_dmi = (i.dst.kind == EK_MEM) && (i.dst.mi != MI_NONE) && !cm_use;
+// (FPU fixes P1) an FP instruction reads its memory-indirect pointer ONCE:
+// the destination's for a store (fp_addr takes d_addr_c), the source's for
+// everything else (fp_addr takes s_addr_c) -- opclass-011 stores, FScc, FSAVE
+// and FMOVE(M) stores decode with dst = src, which would read it twice.
+wire fp_mem_dst;           // defined with the FP datapath below
+wire fp_mi_dst = (i.cls == CL_FPU) && fp_mem_dst;
+wire need_smi = (i.src.kind == EK_MEM) && (i.src.mi != MI_NONE) && !cm_use &&   // (CM: the EA is the stacked one)
+                !fp_mi_dst;
+wire need_dmi = (i.dst.kind == EK_MEM) && (i.dst.mi != MI_NONE) && !cm_use &&
+                !(i.cls == CL_FPU && !fp_mem_dst);
 
 //--------------------------------------------------------------- MOVEM continuation (CM)
 // M68040UM 8.4.6.2 (p. 8-25) and 8.4.6.7 (p. 8-27): an access fault on a
@@ -995,7 +1003,8 @@ function automatic stp_t stepf(
 	input logic [31:0] s_addr_c, input logic [31:0] s_val_c, input logic [31:0] d_val_c,
 	input logic [2:0] x_step, input logic [31:0] vbr, input logic [7:0] x_vec, input logic [31:0] x_target,
 	input logic [2:0] r_step, input logic [31:0] sp_now, input logic fmt_ok, input logic rte_goes,
-	input logic rx7, input logic rs_done, input logic has_fpu, input logic tr_arm);
+	input logic rx7, input logic rs_done, input logic has_fpu, input logic tr_arm,
+	input logic nsmi, input logic dnsmi);
 	stp_t s;
 	s = '0;
 	case (ph)
@@ -1007,13 +1016,23 @@ function automatic stp_t stepf(
 			end else if (i.priv && !s_bit) begin
 				s.exc_go = 1'b1; s.ev = 8'd8; s.ef = 4'd0; s.epc = i.pc;
 			end else if (i.cls == CL_EXC) begin
-				s.exc_go = 1'b1; s.ev = i.exc_vec; s.ef = i.exc_fmt;
-				s.epc = i.exc_next ? i.next_pc : i.pc;
 				// A format $4 frame stacks the CALCULATED effective address,
 				// which EA-calc has already produced -- no operand is read.
 				// It is 0 when the instruction has no memory operand (D18).
-				s.eaddr = (i.exc_fmt == 4'd4) ? ((i.src.kind == EK_MEM) ? s_addr_c : 32'd0)
-				                              : i.exc_addr;
+				// (FPU fixes N1) Through a memory-indirect mode the calculated
+				// address is behind a pointer (M68040UM A.5.1, p. A-6), so the
+				// pointer is read first -- only the source's: a store's dst
+				// is the same EA, and the operand itself is never read.
+				if (i.exc_fmt == 4'd4 && nsmi && !dnsmi) begin
+					if (nx.v && nx.t == T_SMI && !cap && can_rd && !rd_pend) begin
+						s.issue = 1'b1; s.it = nx.t; s.ia = nx.a; s.isz = nx.sz;
+					end
+				end else begin
+					s.exc_go = 1'b1; s.ev = i.exc_vec; s.ef = i.exc_fmt;
+					s.epc = i.exc_next ? i.next_pc : i.pc;
+					s.eaddr = (i.exc_fmt == 4'd4) ? ((i.src.kind == EK_MEM) ? s_addr_c : 32'd0)
+					                              : i.exc_addr;
+				end
 			end else if (i.cls == CL_RTE) begin
 				// the sequence runs in P_RTE
 			end else if (i.cls == CL_PMMU) begin
@@ -1022,7 +1041,13 @@ function automatic stp_t stepf(
 				// the sequence runs in P_CINV
 			end else if (has_fpu && i.cls == CL_FPU) begin
 				// the FPU request runs in P_FPU (M10.1(c)).  With HAS_FPU = 0
-				// this arm folds away: CL_FPU is never decoded.
+				// this arm folds away: CL_FPU is never decoded.  (FPU fixes
+				// P1) a memory-indirect operand's pointer is read here first;
+				// P_FPU starts once it is in (the gate at the P_FPU entry).
+				// Only the pointer: the operand beats are P_FPU's own.
+				if (nx.v && (nx.t == T_SMI || nx.t == T_DMI) && !cap && can_rd && !rd_pend) begin
+					s.issue = 1'b1; s.it = nx.t; s.ia = nx.a; s.isz = nx.sz;
+				end
 			end else if (i.cls == CL_STOP) begin
 				// the SR micro-op, then the stopped state (P_STOP) -- unless
 				// the STOP is TRACED (M9.T), when it loads the SR and ENDS:
@@ -1189,7 +1214,8 @@ wire stp_t st0_nt = stepf(ph, eac_v_use, rst_pending, i, older_busy, !bf_rdblk, 
                       s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, 1'b0, trap_vec,
                       indexed_mode, two_uop, bf_step, sync_busy, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes,
-                      r_fv[15:12] == 4'd7, rs_cnt == 10'd0, HAS_FPU != 0, tr_arm_stop);
+                      r_fv[15:12] == 4'd7, rs_cnt == 10'd0, HAS_FPU != 0, tr_arm_stop,
+                      need_smi, dn_smi);
 wire stp_t st0 = trapn_ov(st0_nt, trap_n && trapn_arm, trap_vec, i.next_pc, i.pc);
 
 //--------------------------------------------------------------- access errors
@@ -1667,7 +1693,7 @@ wire [31:0] fp_mvwv = ((fp_rev ? (2'd2 - fp_k) : fp_k) == 2'd0) ? fp_fm_rdata[95
 wire        fp_mem_src = (fp_gen && (i.ext[15:13] == 3'b010) && (i.src.kind == EK_MEM)) ||
                          (fp_cr && !i.ext[13] && (i.src.kind == EK_MEM)) ||
                          (fp_mvm && !i.ext[13]) || fp_rs;
-wire        fp_mem_dst = (fp_gen && (i.ext[15:13] == 3'b011) && (i.dst.kind == EK_MEM)) ||
+assign      fp_mem_dst = (fp_gen && (i.ext[15:13] == 3'b011) && (i.dst.kind == EK_MEM)) ||
                          (fp_cr_st && (i.dst.kind == EK_MEM)) || fp_mvst || fp_sv ||
                          (fp_scc && (i.dst.kind == EK_MEM));
 assign fp_din      = fp_mem_src             ? fp_buf :
@@ -2350,7 +2376,11 @@ always @(posedge clk) begin
 							// reading a live `fpcc`.
 							// (and not in the clock the unit prepares a deferred
 							// exception's frame, or an FSAVE would judge it frameless)
-							if (!fp_bg && !fp_pcap) begin
+							// (FPU fixes P1) ... and not before a memory-indirect
+							// operand's pointer is in: fp_addr takes it below
+							if (!fp_bg && !fp_pcap &&
+							    (!need_smi || dn_smi) && (!need_dmi || dn_dmi) &&
+							    !(rd_pend && !rd_ack)) begin
 								ph <= P_FPU;
 								fp_sent <= 1'b0; fp_acc <= 1'b0; fp_dn <= 1'b0; fp_k <= 2'd0;
 								fp_ae <= 1'b0;
