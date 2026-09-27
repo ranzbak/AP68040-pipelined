@@ -280,6 +280,13 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 			fail=1
 		fi
 	done
+	# (audit 2026-09-27) a +prog= path longer than 128 characters: the bench
+	# kept it in a reg [1023:0] and cut it off, so the program never loaded
+	LP="$WORK/longpath_$(printf 'x%.0s' $(seq 1 140))"
+	mkdir -p "$LP" && cp "$WORK/t_rmw_wp.hex" "$LP/p.hex" &&
+	timeout 1800 vvp "$WORK/tb_compat.vvp" +prog="$LP/p.hex" > "$WORK/compat_longpath.log" 2>&1 &&
+	grep -q "ALL TESTS PASSED" "$WORK/compat_longpath.log" &&
+		echo "  pass  compat:longpath" || { echo "  FAIL  compat:longpath  (see $WORK/compat_longpath.log)"; fail=1; }
 	# the 2^31-word freeze: IF's word count preset 256 short of the wrapper's
 	# PROG_WORDS part way into t_integer (tb_issued_wrap.v); it must not wedge
 	iverilog -g2012 -DISSUED_T=200000 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_issued_wrap.vvp" \
