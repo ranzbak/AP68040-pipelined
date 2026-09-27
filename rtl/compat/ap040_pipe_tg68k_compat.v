@@ -184,6 +184,7 @@ wire  [1:0] mem_size;
 wire [31:0] mem_addr;
 wire [31:0] mem_wdata;
 wire  [2:0] mem_fc;
+wire        mem_lock;   // a locked RMW's read: the MMU checks W on it (audit finding 4)
 wire        mem_ack;
 wire [31:0] mem_rdata;
 wire        mem_flt_mmu;
@@ -322,6 +323,7 @@ ap040_pipe_core #(
 	.mem_addr(mem_addr),
 	.mem_wdata(mem_wdata),
 	.mem_fc(mem_fc),
+	.mem_lock(mem_lock),
 	.mem_ack(mem_ack),
 	.mem_rdata(mem_rdata),
 	.mem_flt(mem_flt),
@@ -412,7 +414,7 @@ ap040_mmu #(.IFP(IFP_ON ? 1 : 0)) mmu (
 	.tc(w_tc), .urp(w_urp), .srp(w_srp),
 	.itt0(w_itt0), .itt1(w_itt1), .dtt0(w_dtt0), .dtt1(w_dtt1),
 	.c_req(mem_req), .c_write(mem_write), .c_instr(mem_instr), .c_size(mem_size),
-	.c_addr(mem_addr), .c_wdata(mem_wdata), .c_fc(mem_fc),
+	.c_addr(mem_addr), .c_wdata(mem_wdata), .c_fc(mem_fc), .c_lock(mem_lock),
 	.walk_hold(post_busy),
 	.c_ack(mem_ack), .c_rdata(mem_rdata), .c_flt(mem_flt_mmu),
 	.pt_req(pt_req), .pt_write(pt_write), .pt_addr(pt_addr), .pt_fc(pt_fcw),

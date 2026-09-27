@@ -106,6 +106,7 @@ module ap040_ea_fetch
 	output     [31:0] rd_addr,
 	output      [1:0] rd_size,
 	output      [2:0] rd_fc,      // the read's function code (MOVES: SFC)
+	output            rd_lk,      // (audit finding 4) a locked read-modify-write's read
 	input             rd_ack,
 	input      [31:0] rd_data_raw,
 	input             rd_err,     // the read ended in an access error (M6)
@@ -1242,6 +1243,11 @@ endfunction
 wire        aer_lk   = (i.cls == CL_CAS) || (i.cls == CL_CAS2) ||
                        (i.cls == CL_ALU && i.alu == `AP040_ALU_TAS && i.dst.kind == EK_MEM);
 wire        aer_m16  = (i.cls == CL_MOVEM) && i.imm[2];
+// (audit 2026-09-27, finding 4) the reads of TAS, CAS and CAS2 belong to a
+// locked read-modify-write: the MMU checks write protection on them
+// (M68040UM 3.2.2.3), so a protected operand faults on the READ -- and a CAS2
+// whose compare fails, which never writes, still faults
+assign rd_lk = aer_lk;
 wire [15:0] aer_ssw  = ssw_f(ph == P_MOVEM && mm_cmi, rd_ma, rd_atc, aer_lk, 1'b0, rd_sz_q, aer_m16, i.fcsel != 2'd0, rd_fc_q);
 // A store's access error (synchronous stores: the micro-op is still in
 // WB).  On the instruction's last micro-op everything else it did has

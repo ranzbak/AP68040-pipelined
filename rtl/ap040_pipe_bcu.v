@@ -80,6 +80,7 @@ module ap040_pipe_bcu
 	input      [31:0] rd_addr,
 	input       [1:0] rd_size,
 	input       [2:0] rd_fc,
+	input             rd_lk,      // a locked RMW's read (the MMU checks W on it)
 	output reg        rd_ack,
 	output reg [31:0] rd_data,
 	output reg        rd_err,
@@ -109,6 +110,7 @@ module ap040_pipe_bcu
 	output reg [31:0] mem_addr,
 	output reg [31:0] mem_wdata,
 	output reg  [2:0] mem_fc,
+	output reg        mem_lock,   // the read in progress is a locked RMW's read
 	output reg        mem_rb,     // the store in progress is a locked write-back (debug)
 	input             mem_ack,
 	input      [31:0] mem_rdata,
@@ -140,6 +142,7 @@ reg        dq_v;
 reg [31:0] dq_a;
 reg  [1:0] dq_s;
 reg  [2:0] dq_f;
+reg        dq_l;
 
 //--------------------------------------------------------------- the port
 localparam [1:0] K_ST = 2'd0, K_RD = 2'd1, K_IF = 2'd2;
@@ -210,7 +213,7 @@ always @(posedge clk) begin
 		mem_addr <= 32'd0; mem_wdata <= 32'd0; mem_fc <= 3'd5;
 		kind <= K_ST;
 		sb_rp <= '0; sb_wp <= '0; sb_cnt <= '0;
-		dq_v <= 1'b0; dq_a <= 32'd0; dq_s <= SZ_L; dq_f <= 3'd5;
+		dq_v <= 1'b0; dq_a <= 32'd0; dq_s <= SZ_L; dq_f <= 3'd5; dq_l <= 1'b0; mem_lock <= 1'b0;
 		rd_ack <= 1'b0; rd_data <= 32'd0; rd_err <= 1'b0; rd_atc <= 1'b0; f_atc <= 1'b0; rd_ma <= 1'b0;
 		f_ack <= 1'b0; f_data <= 32'd0; f_err <= 1'b0;
 		st_err <= 1'b0;
@@ -227,7 +230,7 @@ always @(posedge clk) begin
 		end
 		if (POST) sb_cnt <= sb_cnt + (st_v ? 1'b1 : 1'b0) - ((done && kind == K_ST && sp_fin) ? 1'b1 : 1'b0);
 		// a data read request waits in the slot
-		if (rd_req) begin dq_v <= 1'b1; dq_a <= rd_addr; dq_s <= rd_size; dq_f <= rd_fc; end
+		if (rd_req) begin dq_v <= 1'b1; dq_a <= rd_addr; dq_s <= rd_size; dq_f <= rd_fc; dq_l <= rd_lk; end
 		// ... unless the data read path answers it (M14 step 3)
 		if (rd_fast && dq_v) begin
 			dq_v <= 1'b0;
@@ -267,7 +270,7 @@ always @(posedge clk) begin
 			// the store WB holds (stable until st_done), or the FIFO's oldest
 			logic [31:0] a, d; logic [1:0] z;
 			a = POST ? sb_a[sb_rp] : st_addr; d = POST ? sb_d[sb_rp] : st_data; z = POST ? sb_s[sb_rp] : st_size;
-			mem_req <= 1'b1; kind <= K_ST; mem_write <= 1'b1; mem_instr <= 1'b0;
+			mem_req <= 1'b1; kind <= K_ST; mem_write <= 1'b1; mem_instr <= 1'b0; mem_lock <= 1'b0;
 			mem_fc <= POST ? sb_f[sb_rp] : st_fc; mem_rb <= POST ? sb_b[sb_rp] : st_rb;
 			if (crosses(tc_e, tc_p, a, z)) begin
 				sp_on <= 1'b1; sp_i <= 2'd0; sp_s <= z; sp_a <= a; sp_d <= d;
@@ -277,14 +280,14 @@ always @(posedge clk) begin
 			end
 		end else if (go_rd) begin
 			mem_req <= 1'b1; kind <= K_RD; mem_write <= 1'b0; mem_instr <= 1'b0;
-			mem_addr <= dq_a; mem_fc <= dq_f;
+			mem_addr <= dq_a; mem_fc <= dq_f; mem_lock <= dq_l;
 			if (crosses(tc_e, tc_p, dq_a, dq_s)) begin
 				sp_on <= 1'b1; sp_i <= 2'd0; sp_s <= dq_s; sp_a <= dq_a; sp_acc <= 24'd0;
 				mem_size <= SZ_B;
 			end else mem_size <= dq_s;
 			dq_v <= 1'b0;
 		end else if (go_if) begin
-			mem_req <= 1'b1; kind <= K_IF; mem_write <= 1'b0; mem_instr <= 1'b1;
+			mem_req <= 1'b1; kind <= K_IF; mem_write <= 1'b0; mem_instr <= 1'b1; mem_lock <= 1'b0;
 			mem_addr <= f_addr; mem_size <= f_long ? SZ_L : SZ_W; mem_fc <= f_fc;
 		end
 	end
