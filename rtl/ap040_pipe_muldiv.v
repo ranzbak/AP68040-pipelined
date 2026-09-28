@@ -81,7 +81,10 @@ endfunction
 
 wire [96:0] div4 = div_step(div_step(div_step(div_step(acc, den), den), den), den);
 
-wire [63:0] q_raw = div_r ? acc[63:0] : prod;
+// (perf 2026-09-28) the product straight from the registered operands, in
+// the clock that finishes: MUL takes 3 clocks at EX instead of 4 (the DSP
+// tree and the 64-bit sign fix-up fit clk_38's period together)
+wire [63:0] q_raw = div_r ? acc[63:0] : (mcand * den);
 wire [31:0] r_raw = acc[95:64];
 
 always @(posedge clk) begin
@@ -117,7 +120,7 @@ always @(posedge clk) begin
 			else begin
 				den   <= abs_a;
 				mcand <= abs_m;
-				count <= 7'd1;
+				count <= 7'd0;
 				neg_q <= sign_op && (op_a[31] ^ op_lo[31]) && (op_a != 0) && (op_lo != 0);
 				neg_r <= 0;
 			end

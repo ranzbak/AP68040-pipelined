@@ -1,0 +1,7 @@
+halt 00000622
+m32 00007000 000000c1
+# cycle budget: 1195 clocks before the handshake work (2026-09-28).
+# Dispatch on the unit's raw `accepted`: 1127 -- a clock off each FMOVE; a
+# dependent FADD chain gains ~nothing there, the next FADD waits for the unit
+# (fp_bg) anyway.
+maxclk 1135

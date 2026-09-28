@@ -1,0 +1,7 @@
+halt 00000596
+# 1 x 1^64 = 1; 1 x (-1)^64 = 1 (MULS.W: the low words, sign-extended product)
+m32 00007000 00000001
+m32 00007004 00000001
+# cycle budget: 533 clocks at 4 per MUL (2026-09-28); the product and its
+# sign fix-up in one clock make it 3: 128 x 3 + 21 = 405
+maxclk 413
