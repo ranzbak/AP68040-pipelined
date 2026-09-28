@@ -27,7 +27,8 @@ run_one() {   # name file old new bench(prog|compat) program
 	n=$1; f=$2; old=$3; new=$4; b=$5; prog=$6
 	d=$OUT/$n; rm -rf "$d"; mkdir -p "$d"
 	cp -r "$T/../rtl" "$d/rtl"
-	python3 - "$d/rtl/$f" "$old" "$new" <<'PY' || { echo "  $n: EDIT DID NOT APPLY"; return; }
+	ff=$d/rtl/$f; [ -f "$ff" ] || ff=$d/rtl/compat/$f
+	python3 - "$ff" "$old" "$new" <<'PY' || { echo "  $n: EDIT DID NOT APPLY"; return; }
 import sys
 p,old,new=sys.argv[1:4]; s=open(p).read()
 if s.count(old)!=1: sys.exit(1)
@@ -59,10 +60,10 @@ run_one rd_nodrain ap040_pipe_bcu.v \
 run_one sync_overtake ap040_pipe_bcu.v \
 	"!((DONE_REG != 0) && st_done_q) && (sb_cnt == 0);" \
 	"!((DONE_REG != 0) && st_done_q);" prog sb_order &
-# the data read path answers with posted stores in the FIFO
-run_one fast_nodrain ap040_pipe_core.v \
-	"!((STORE_BUF != 0) && sb_busy);" \
-	"1'b1;" compat t_sbuf_pipe &
+# (stage 2) the data read path ignores the FIFO overlap
+run_one ovl_ignored ap040_pipe_core.v \
+	"dfp_hit && !((STORE_BUF != 0) && sb_ovl);" \
+	"dfp_hit;" compat t_sbuf_pipe &
 # a serialising instruction does not wait for the FIFO
 run_one ser_nodrain ap040_pipe_core.v \
 	"wire older_busy  = eaf_valid || exe_valid || sb_busy;" \
@@ -80,6 +81,15 @@ run_one no_halt ap040_pipe_core.v \
 run_one post_tc_on ap040_pipe_core.v \
 	"!tc[15] && !(dtt0[15] && dtt0[2])" \
 	"!(dtt0[15] && dtt0[2])" compat t_mmu_m9s &
+# (stage 2) the overlap compare misses a misaligned store's second longword
+run_one ovl_nohi ap040_pipe_bcu.v \
+	"(sb_lo[q] == lk_lo || sb_lo[q] == lk_hi || sb_hi[q] == lk_lo || sb_hi[q] == lk_hi)" \
+	"(sb_lo[q] == lk_lo || sb_lo[q] == lk_hi)" compat t_sbuf_pipe &
+# (stage 2) the cache's pending-invalidate gate on the data read path
+run_one inv_gate ap040_cache.v \
+	"!store_inv_lost && !winv_pend && (cst != C_WINV);" \
+	"1'b1;" compat t_sbuf_pipe &
+wait
 # the FIFO drains its NEWEST entry
 run_one fifo_lifo ap040_pipe_bcu.v \
 	"a = go_fifo ? sb_a[sb_rp] : st_addr;" \

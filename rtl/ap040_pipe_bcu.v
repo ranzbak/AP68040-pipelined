@@ -83,6 +83,15 @@ module ap040_pipe_bcu
 	output            st_fatc,    // ... from the MMU
 	output            sb_busy,    // a posted store is not in memory yet
 	input             older_st,   // EX or WB holds a store not yet committed
+	// (MIX, findings/storebuf/plan.md stage 2) the data read path's lookup
+	// (lk_v: launched this enabled clock, at lk_addr/lk_size): sb_ovl, the
+	// next clock, says a store in the FIFO touches one of its longwords
+	// (page offset only, addr[11:2]: an alias only costs the fast answer)
+	input             lk_v,
+	input      [31:0] lk_addr,
+	input       [1:0] lk_size,
+	output reg        sb_ovl,
+	output            k_fifo_o,   // (MIX) the store on the port is the FIFO's
 
 	// data reads (EA-fetch)
 	input             rd_req,
@@ -140,6 +149,9 @@ reg [31:0] sb_d [0:SB_N-1];
 reg  [1:0] sb_s [0:SB_N-1];
 reg  [2:0] sb_f [0:SB_N-1];
 reg        sb_b [0:SB_N-1];
+reg        sb_vld [0:SB_N-1];   // (MIX) the entry holds a store not yet in memory
+reg  [9:0] sb_lo [0:SB_N-1];    // ... its first and last byte's longword (addr[11:2])
+reg  [9:0] sb_hi [0:SB_N-1];
 reg [PW-1:0] sb_rp, sb_wp;
 reg [PW:0]   sb_cnt;
 
@@ -157,6 +169,7 @@ reg        dq_l;
 localparam [1:0] K_ST = 2'd0, K_RD = 2'd1, K_IF = 2'd2;
 reg  [1:0] kind;           // what the transfer in progress is
 reg        k_fifo;         // (kind K_ST) the store came from the FIFO, not from WB
+assign k_fifo_o = k_fifo;
 
 // page-crossing split state (see below)
 reg        sp_on;          // the transfer in progress is split into bytes
@@ -219,6 +232,23 @@ always @(posedge clk)
 		st_done_q <= st_done_c; st_ferr_q <= st_ferr_c; st_fatc_q <= st_fatc_c; st_fma_q <= st_fma_c;
 	end
 
+// the longword (addr[11:2]) of an access's last byte
+function automatic logic [9:0] lw_last(input logic [31:0] a, input logic [1:0] sz);
+	logic [31:0] e;
+	e = a + ((sz == SZ_L) ? 32'd3 : (sz == SZ_W) ? 32'd1 : 32'd0);
+	return e[11:2];
+endfunction
+wire [9:0] lk_lo = lk_addr[11:2];
+wire [9:0] lk_hi = lw_last(lk_addr, lk_size);
+reg        lk_hit;
+integer    q;
+always @* begin
+	lk_hit = 1'b0;
+	for (q = 0; q < SB_N; q = q + 1)
+		if (sb_vld[q] && (sb_lo[q] == lk_lo || sb_lo[q] == lk_hi || sb_hi[q] == lk_lo || sb_hi[q] == lk_hi))
+			lk_hit = 1'b1;
+end
+
 integer k;
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -230,13 +260,23 @@ always @(posedge clk) begin
 		rd_ack <= 1'b0; rd_data <= 32'd0; rd_err <= 1'b0; rd_atc <= 1'b0; f_atc <= 1'b0; rd_ma <= 1'b0;
 		f_ack <= 1'b0; f_data <= 32'd0; f_err <= 1'b0;
 		st_err <= 1'b0;
-		for (k = 0; k < SB_N; k = k + 1) begin sb_a[k] <= 32'd0; sb_d[k] <= 32'd0; sb_s[k] <= SZ_L; sb_f[k] <= 3'd5; sb_b[k] <= 1'b0; end
+		for (k = 0; k < SB_N; k = k + 1) begin
+			sb_a[k] <= 32'd0; sb_d[k] <= 32'd0; sb_s[k] <= SZ_L; sb_f[k] <= 3'd5; sb_b[k] <= 1'b0;
+			sb_vld[k] <= 1'b0; sb_lo[k] <= 10'd0; sb_hi[k] <= 10'd0;
+		end
+		sb_ovl <= 1'b0;
 		mem_rb <= 1'b0;
 		sp_on <= 1'b0; sp_i <= 2'd0; sp_s <= SZ_L; sp_a <= 32'd0; sp_d <= 32'd0; sp_acc <= 24'd0;
 	end else if (ce) begin
 		rd_ack <= 1'b0; f_ack <= 1'b0;
+		// the lookup's overlap verdict, against the FIFO before this edge (a
+		// store WB posts at this edge is older than the read, but it was in
+		// WB in this clock, and the core's st_quiet refuses the fast answer
+		// for that)
+		if (lk_v) sb_ovl <= MIX && lk_hit;
 		// a store committed by WB (posted)
 		if ((POST && st_v) || (MIX && sp_v)) begin
+			sb_vld[sb_wp] <= 1'b1; sb_lo[sb_wp] <= st_addr[11:2]; sb_hi[sb_wp] <= lw_last(st_addr, st_size);
 			sb_a[sb_wp] <= st_addr; sb_d[sb_wp] <= st_data; sb_s[sb_wp] <= st_size; sb_f[sb_wp] <= st_fc;
 			sb_b[sb_wp] <= st_rb;
 			sb_wp <= sb_wp + 1'b1;
@@ -265,6 +305,7 @@ always @(posedge clk) begin
 				K_ST: begin
 					if (k_fifo) begin
 						sb_rp <= sb_rp + 1'b1;   // (sp_fin: the whole store)
+						sb_vld[sb_rp] <= 1'b0;
 						if (mem_flt) st_err <= 1'b1;
 					end
 				end

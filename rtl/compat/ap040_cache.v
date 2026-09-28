@@ -1133,7 +1133,11 @@ if (IFP != 0) begin : g_dfp
 	wire e1 = dvv[1] && (dtag_q[43:22] == dfp_ptag);
 	wire e2 = dvv[2] && (dtag_q[65:44] == dfp_ptag);
 	wire e3 = dvv[3] && (dtag_q[87:66] == dfp_ptag);
-	assign dfp_thit  = (e0 | e1 | e2 | e3) && !g_col && !d_busy_now;
+	// (findings/storebuf/plan.md) not while a store still owes an
+	// invalidate: its second line's (winv) or one a snoop displaced
+	// (store_inv_lost).  The data bank may hold the line the store changed.
+	assign dfp_thit  = (e0 | e1 | e2 | e3) && !g_col && !d_busy_now &&
+	                   !store_inv_lost && !winv_pend && (cst != C_WINV);
 	assign dfp_rdata = lw_extract(e0 ? ddat_q0 : e1 ? ddat_q1 : e2 ? ddat_q2 : ddat_q3, g_size, g_off);
 end else begin : g_nodfp
 	assign dfp_thit  = 1'b0;

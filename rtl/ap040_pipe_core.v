@@ -524,15 +524,20 @@ end else begin : g_bus
 	// only in the next.  Anything else goes out of the slot as before, with
 	// no clock lost.
 	wire d_rd_fast;
-	// (STORE_BUF) and nothing posted: the FIFO's stores are older too
-	wire st_quiet = !(older_store || (exe_valid && exe_o.st_v)) && !(mem_req && mem_write) &&
-	                !((STORE_BUF != 0) && sb_busy);
+	// (STORE_BUF, findings/storebuf/plan.md stage 2) a POSTED store on the
+	// port or waiting in the FIFO blocks only a read that overlaps it: the
+	// BCU compares the lookup against the FIFO when it is launched
+	// (sb_ovl, a register the next clock).  A synchronous store on the port
+	// blocks every read, as before.
+	wire sb_ovl, sb_kfifo;
+	wire st_quiet = !(older_store || (exe_valid && exe_o.st_v)) &&
+	                !(mem_req && mem_write && !((STORE_BUF != 0) && sb_kfifo));
 	if (DFP != 0) begin : g_dfp
 		reg dfp_look, dfp_q1;
 		always @(posedge clk)
 			if (!nreset) begin dfp_look <= 1'b0; dfp_q1 <= 1'b0; end
 			else if (ce) begin dfp_look <= d_rd_req; dfp_q1 <= st_quiet; end
-		assign d_rd_fast = dfp_look && dfp_q1 && st_quiet && dfp_hit;
+		assign d_rd_fast = dfp_look && dfp_q1 && st_quiet && dfp_hit && !((STORE_BUF != 0) && sb_ovl);
 		// a locked RMW's read never takes the fast path: it goes out of the
 		// BCU with mem_lock, where the MMU checks write protection on it
 		assign dfp_req  = d_rd_req && ce && !d_rd_lk;
@@ -545,7 +550,7 @@ end else begin : g_bus
 		assign dfp_addr = 32'd0;
 		assign dfp_size = 2'd0;
 		assign dfp_fc   = 3'd0;
-		wire unused_dfp = dfp_hit | st_quiet;
+		wire unused_dfp = dfp_hit | st_quiet | sb_ovl;
 	end
 
 	// The BCU's fetch slot (b_f_*): IF's own request with IFP = 0; with
@@ -627,6 +632,7 @@ end else begin : g_bus
 		.st_data(exe_o.st_data), .st_fc(exe_o.st_fc), .st_rb(exe_o.st_rb), .mem_rb(),
 		.sb_full(sb_full), .sb_busy(sb_busy), .st_done(st_done), .st_ferr(st_ferr), .st_fatc(st_fatc), .st_fma(st_fma),
 		.older_st(older_store || (exe_valid && exe_o.st_v)),   // (registered state only: timing)
+		.lk_v(ce && d_rd_req), .lk_addr(d_rd_addr), .lk_size(d_rd_size), .sb_ovl(sb_ovl), .k_fifo_o(sb_kfifo),
 		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc), .rd_lk(d_rd_lk),
 		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(d_rd_err),
 		.rd_fast(d_rd_fast), .rd_fast_data(dfp_data),

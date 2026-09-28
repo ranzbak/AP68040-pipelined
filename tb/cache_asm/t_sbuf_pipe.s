@@ -24,6 +24,9 @@
 ;      (logical page 2 -> physical $4000): the store lands at physical
 ;      $2100, not $4100 -- the FIFO drains before the MOVEC
 ;   6  PFLUSHA and CPUSHA behind posted stores: the stores land
+;   8  as 4, the DMA write into the SAME line the stores go to (a store
+;      merge the snoop makes untrustworthy, store_inv_lost): the DMA'd
+;      longword, sampled after every store, goes old -> new, never back
 
 FAILREG	equ	$F100
 DONEREG	equ	$F102
@@ -217,6 +220,46 @@ start:	move.l	#CACR_ON,d0
 	beq.s	.c5c
 	failt	25
 .c5c:
+
+; 8: a snoop into the line a burst of stores merges into
+	lea	$2580,a4
+	moveq	#0,d6			; the delay
+.l8:	move.l	#$88880000,4(a4)	; the DMA target's old value
+	move.l	(a4),d0
+	move.l	4(a4),d0		; cached
+	move.w	#$2586,DMA_A
+	move.w	#$8888,DMA_D
+	move.w	d6,DMA_GO
+	lea	$2800,a1		; samples
+	move.l	d6,d5
+	rept	16
+	move.l	d5,(a4)
+	move.l	4(a4),(a1)+
+	addq.l	#1,d5
+	endr
+	moveq	#50,d1
+.w8:	dbra	d1,.w8
+	lea	$2800,a1
+	moveq	#15,d1
+	moveq	#0,d2			; seen the new value
+.s8:	move.l	(a1)+,d0
+	cmp.l	#$88888888,d0
+	beq.s	.n8
+	cmp.l	#$88880000,d0
+	beq.s	.o8
+	failt	18			; neither
+.o8:	tst.b	d2
+	beq.s	.x8
+	failt	8			; old after new
+.n8:	st	d2
+.x8:	dbra	d1,.s8
+	move.l	4(a4),d0
+	cmp.l	#$88888888,d0
+	beq.s	.c8
+	failt	28
+.c8:	addq.l	#1,d6
+	cmp.l	#48,d6
+	bne	.l8
 
 ; 6: PFLUSHA and CPUSHA behind posted stores
 	move.l	#$66666666,$2500
