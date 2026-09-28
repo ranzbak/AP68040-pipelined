@@ -54,7 +54,15 @@ module ap040_pipe_bcu
 	// stall and the whole stall chain back to IF's request -- 8.8 ns, the
 	// design's one structural timing family (PLAN M11.1).  Registering it
 	// ends that family at this module's flip-flops, for one clock per store.
-	parameter DONE_REG = 0
+	parameter DONE_REG = 0,
+	// (POST = 0) 1: mixed stores (findings/storebuf/plan.md).  A store WB
+	// hands over with sp_v is POSTED: it enters the SB_N FIFO and WB is
+	// released while there is room (sb_full).  A store on st_v is SYNC, as
+	// with MIX = 0, and goes out only once the FIFO is empty (the posted ones
+	// are older).  The core posts only stores that cannot fault (RAM window,
+	// translation off); a bus error on one is fatal (st_err).  0: the FIFO
+	// is never used and everything is as before, clock for clock.
+	parameter MIX = 0
 )
 (
 	input             clk,
@@ -68,6 +76,7 @@ module ap040_pipe_bcu
 	input      [31:0] st_data,
 	input       [2:0] st_fc,
 	input             st_rb,      // (a CAS/CAS2 locked write-back: carried to mem_rb for the benches)
+	input             sp_v,       // (MIX) WB posts its store this enabled clock (st_* as for st_v)
 	output            sb_full,    // WB must hold a store (POST = 1)
 	output            st_done,    // (POST = 0) WB's store completes this clock ...
 	output            st_ferr,    // ... with an access error
@@ -134,7 +143,7 @@ reg        sb_b [0:SB_N-1];
 reg [PW-1:0] sb_rp, sb_wp;
 reg [PW:0]   sb_cnt;
 
-assign sb_full = POST ? (sb_cnt == SB_N[PW:0]) : 1'b0;
+assign sb_full = (POST || MIX) ? (sb_cnt == SB_N[PW:0]) : 1'b0;
 assign sb_busy = (sb_cnt != 0) || (mem_req && mem_write);
 
 //--------------------------------------------------------------- data read slot
@@ -147,6 +156,7 @@ reg        dq_l;
 //--------------------------------------------------------------- the port
 localparam [1:0] K_ST = 2'd0, K_RD = 2'd1, K_IF = 2'd2;
 reg  [1:0] kind;           // what the transfer in progress is
+reg        k_fifo;         // (kind K_ST) the store came from the FIFO, not from WB
 
 // page-crossing split state (see below)
 reg        sp_on;          // the transfer in progress is split into bytes
@@ -156,8 +166,11 @@ reg [31:0] sp_a;           // ... its address
 reg [31:0] sp_d;           // ... its store data
 reg [23:0] sp_acc;         // the bytes read so far
 wire idle    = !mem_req;         // (a new request never starts in the ack clock: one low enabled edge)
-wire go_st   = POST ? (idle && !sp_on && (sb_cnt != 0)) :
-                      (idle && !sp_on && st_v && !((DONE_REG != 0) && st_done_q));
+// the FIFO's oldest store (always first: it is older than WB's), or WB's
+// synchronous store once the FIFO is empty
+wire go_fifo = (POST || MIX) && idle && !sp_on && (sb_cnt != 0);
+wire go_sync = !POST && idle && !sp_on && st_v && !((DONE_REG != 0) && st_done_q) && (sb_cnt == 0);
+wire go_st   = go_fifo || go_sync;
 // A read goes from the slot, never in the clock it is requested: EA-fetch
 // may be sending the older instruction's store to EX in that same clock
 // (an early read), and older_st sees it only once it is there.
@@ -188,7 +201,7 @@ wire       sp_fin = !sp_on || mem_flt || (sp_i == sp_nm1);   // the transfer end
 wire       go_sp  = idle && sp_on;                           // the next byte (first priority)
 wire [31:0] sp_rd = (sp_s == SZ_L) ? {sp_acc, mem_rdata[7:0]} : {16'd0, sp_acc[7:0], mem_rdata[7:0]};
 
-wire   st_done_c = !POST && done && (kind == K_ST) && sp_fin;
+wire   st_done_c = !POST && done && (kind == K_ST) && sp_fin && !k_fifo;
 wire   st_fma_c, st_ferr_c, st_fatc_c;
 reg    st_done_q, st_ferr_q, st_fatc_q, st_fma_q;
 assign st_done = (DONE_REG != 0) ? st_done_q : st_done_c;
@@ -211,7 +224,7 @@ always @(posedge clk) begin
 	if (!nreset) begin
 		mem_req <= 1'b0; mem_write <= 1'b0; mem_instr <= 1'b0; mem_size <= SZ_L;
 		mem_addr <= 32'd0; mem_wdata <= 32'd0; mem_fc <= 3'd5;
-		kind <= K_ST;
+		kind <= K_ST; k_fifo <= 1'b0;
 		sb_rp <= '0; sb_wp <= '0; sb_cnt <= '0;
 		dq_v <= 1'b0; dq_a <= 32'd0; dq_s <= SZ_L; dq_f <= 3'd5; dq_l <= 1'b0; mem_lock <= 1'b0;
 		rd_ack <= 1'b0; rd_data <= 32'd0; rd_err <= 1'b0; rd_atc <= 1'b0; f_atc <= 1'b0; rd_ma <= 1'b0;
@@ -223,12 +236,14 @@ always @(posedge clk) begin
 	end else if (ce) begin
 		rd_ack <= 1'b0; f_ack <= 1'b0;
 		// a store committed by WB (posted)
-		if (POST && st_v) begin
+		if ((POST && st_v) || (MIX && sp_v)) begin
 			sb_a[sb_wp] <= st_addr; sb_d[sb_wp] <= st_data; sb_s[sb_wp] <= st_size; sb_f[sb_wp] <= st_fc;
 			sb_b[sb_wp] <= st_rb;
 			sb_wp <= sb_wp + 1'b1;
 		end
-		if (POST) sb_cnt <= sb_cnt + (st_v ? 1'b1 : 1'b0) - ((done && kind == K_ST && sp_fin) ? 1'b1 : 1'b0);
+		if (POST || MIX)
+			sb_cnt <= sb_cnt + (((POST && st_v) || (MIX && sp_v)) ? 1'b1 : 1'b0)
+			                 - ((done && kind == K_ST && sp_fin && k_fifo) ? 1'b1 : 1'b0);
 		// a data read request waits in the slot
 		if (rd_req) begin dq_v <= 1'b1; dq_a <= rd_addr; dq_s <= rd_size; dq_f <= rd_fc; dq_l <= rd_lk; end
 		// ... unless the data read path answers it (M14 step 3)
@@ -248,7 +263,7 @@ always @(posedge clk) begin
 			sp_on <= 1'b0;
 			case (kind)
 				K_ST: begin
-					if (POST) begin
+					if (k_fifo) begin
 						sb_rp <= sb_rp + 1'b1;   // (sp_fin: the whole store)
 						if (mem_flt) st_err <= 1'b1;
 					end
@@ -269,9 +284,9 @@ always @(posedge clk) begin
 		end else if (go_st) begin : g_st
 			// the store WB holds (stable until st_done), or the FIFO's oldest
 			logic [31:0] a, d; logic [1:0] z;
-			a = POST ? sb_a[sb_rp] : st_addr; d = POST ? sb_d[sb_rp] : st_data; z = POST ? sb_s[sb_rp] : st_size;
-			mem_req <= 1'b1; kind <= K_ST; mem_write <= 1'b1; mem_instr <= 1'b0; mem_lock <= 1'b0;
-			mem_fc <= POST ? sb_f[sb_rp] : st_fc; mem_rb <= POST ? sb_b[sb_rp] : st_rb;
+			a = go_fifo ? sb_a[sb_rp] : st_addr; d = go_fifo ? sb_d[sb_rp] : st_data; z = go_fifo ? sb_s[sb_rp] : st_size;
+			mem_req <= 1'b1; kind <= K_ST; k_fifo <= go_fifo; mem_write <= 1'b1; mem_instr <= 1'b0; mem_lock <= 1'b0;
+			mem_fc <= go_fifo ? sb_f[sb_rp] : st_fc; mem_rb <= go_fifo ? sb_b[sb_rp] : st_rb;
 			if (crosses(tc_e, tc_p, a, z)) begin
 				sp_on <= 1'b1; sp_i <= 2'd0; sp_s <= z; sp_a <= a; sp_d <= d;
 				mem_addr <= a; mem_size <= SZ_B; mem_wdata <= {24'd0, sp_byte(d, z, 2'd0)};

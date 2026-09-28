@@ -43,7 +43,12 @@ module ap040_pipe_tg68k_compat
 	// IF's fetches are looked up in a read-only copy of the I-cache bank and
 	// answered the clock after they issue, without the shared port.  Needs
 	// AP040_ENABLE_CACHE; 0 is the shared-port A/B reference.
-	parameter AP040_IFP          = 1
+	parameter AP040_IFP          = 1,
+	// findings/storebuf/plan.md: the core's store buffer.  1 posts the stores
+	// that cannot fault (translation off, to chip or fast RAM) into a 4-entry
+	// FIFO in front of the MMU; 2 is the same hardware never posting (the A/B
+	// reference, clock-identical to 0); 0 synchronous stores only.
+	parameter AP040_STORE_BUF    = 0
 )
 (
 	input         clk,
@@ -283,6 +288,28 @@ wire [31:0] c_dbg_pc, c_dbg_d0, c_dbg_d1, c_dbg_d2, c_dbg_a0, c_dbg_sp, c_dbg_us
 wire [15:0] c_dbg_sr;
 wire        c_dbg_halted;
 
+// The store buffer's RAM window (findings/storebuf/plan.md), asked about
+// EX's store address: memory with no side effects that answers without a
+// bus error -- chip RAM and the configured Zorro II / III fast RAM, the data
+// read path's da_win below.  The core posts only with translation off, so
+// the address is physical.  In a flat bench (cache_allow_all) everything is
+// memory except the bench's registers at $xxxxF100-$xxxxF1FF.  The windows
+// are registered copies (autoconfig state, set once at boot).
+wire [31:0] stw_addr;
+reg  [4:0]  sw_z3b0;
+reg  [3:0]  sw_z3b1;
+reg         sw_z3e0, sw_z3e1, sw_z2e;
+always @(posedge clk) begin
+	sw_z3b0 <= cache_z3_base0; sw_z3e0 <= cache_z3_ena0;
+	sw_z3b1 <= cache_z3_base1; sw_z3e1 <= cache_z3_ena1;
+	sw_z2e  <= cache_z2_ena;
+end
+wire stw_ram = cache_allow_all ? (stw_addr[15:8] != 8'hF1) :
+               (((stw_addr[31:27] == sw_z3b0) && sw_z3e0) ||
+                ((stw_addr[31:28] == sw_z3b1) && sw_z3e1) ||
+                (!stw_addr[31:24] && (stw_addr[23] ^ |stw_addr[22:21]) && sw_z2e) ||
+                (stw_addr[31:21] == 11'd0));
+
 // the instruction read path (plan M14): see the g_cache block
 localparam IFP_ON = (AP040_IFP != 0) && (AP040_ENABLE_CACHE != 0);
 wire        ifp_req, ifp_s, ifp_hit, ifp_try;
@@ -303,7 +330,8 @@ ap040_pipe_core #(
 	.IRQ(1),
 	.CINV(1),
 	.IFP(IFP_ON ? 1 : 0),
-	.DFP(IFP_ON ? 1 : 0)
+	.DFP(IFP_ON ? 1 : 0),
+	.STORE_BUF(AP040_STORE_BUF)
 ) core (
 	.clk(clk),
 	.nreset(nreset),
@@ -328,6 +356,7 @@ ap040_pipe_core #(
 	.mem_rdata(mem_rdata),
 	.mem_flt(mem_flt),
 	.mem_atc(mem_flt_mmu),
+	.stw_addr(stw_addr), .stw_ram(stw_ram),
 	.bus_st_err(core_st_err),
 
 	.cacr_q(cacr_out),

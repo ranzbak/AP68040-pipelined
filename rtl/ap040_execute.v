@@ -54,6 +54,7 @@ module ap040_execute
 	output     [31:0] fw_st_addr,
 	output      [1:0] fw_st_size,
 	output     [31:0] fw_st_data,
+	input             fw_st_ram,  // (the wrapper's window on fw_st_addr) the store goes to RAM
 
 	output            ex_redirect,
 	output     [31:0] ex_redirect_pc,
@@ -437,7 +438,12 @@ always @(posedge clk) begin
 	end else if (ce && !stall_in) begin
 		// a MUL/DIV still running sends a bubble to WB
 		exe_valid <= eaf_valid && !md_wait && !in_drop;
-		if (eaf_valid && !md_wait) exe_o <= w;
+		if (eaf_valid && !md_wait) begin
+			exe_o <= w;
+			// (findings/storebuf/plan.md) a store WB may post: it goes to
+			// RAM, is not a locked read-modify-write's, and is not MOVES
+			exe_o.st_post <= w.st_v && fw_st_ram && !w.stf.lk && !w.stf.moves;
+		end
 	end
 end
 

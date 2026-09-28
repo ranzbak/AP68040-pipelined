@@ -58,7 +58,14 @@ module ap040_pipe_core
 	// (BUS = 1, STORE_POST = 0) register the synchronous store's completion
 	// (ap040_pipe_bcu DONE_REG): one clock per store, and the memory
 	// acknowledge no longer reaches the stall chain (PLAN M14 / Q23)
-	parameter         STDONE_REG         = 1
+	parameter         STDONE_REG         = 1,
+	// (BUS = 1, STORE_POST = 0) the store buffer (findings/storebuf/plan.md):
+	// 1 a store that cannot fault -- to RAM (stw_ram), translation off, no
+	// DTTx write-protecting, not a locked RMW's, not MOVES -- is POSTED into
+	// the BCU's FIFO and WB moves on; every other store stays synchronous.
+	// 2 the same hardware with posting never chosen (the A/B reference: it
+	// must be clock-identical to 0).  0 synchronous stores only, as before.
+	parameter         STORE_BUF          = 0
 )
 (
 	input  clk,
@@ -90,6 +97,11 @@ module ap040_pipe_core
 	input         mem_flt,
 	input         mem_atc,       // (with mem_flt) an MMU fault, not a bus error (M7; 0 until then)
 	output        bus_st_err,    // a posted store bus-errored (fatal)
+	// (STORE_BUF) the wrapper's RAM window, asked about EX's store address:
+	// stw_ram = 1 when stw_addr is in memory that has no side effects and
+	// cannot fault (chip RAM, fast RAM) -- combinational, registered here
+	output [31:0] stw_addr,
+	input         stw_ram,
 
 	// status for the wrapper (cacr_out/vbr_out, debug_status)
 	output [31:0] cacr_q,
@@ -284,7 +296,11 @@ wire eaf_stopped, eaf_rsto;
 // stand) and EA-fetch takes vector 2 (M6)
 wire st_done, st_ferr, st_fatc, st_fma;
 wire wb_fault = exe_valid && exe_o.st_v && st_ferr;
-wire wb_hold  = exe_valid && exe_o.st_v && ((BUS != 0 && STORE_POST == 0) ? !st_done : sb_full);
+// (STORE_BUF) WB's store is posted: EX's verdict (exe_o.st_post) and, from
+// registers, translation off and no DTTx write-protecting -- here, not in
+// EX, because a MOVEC to TC or a DTTx may commit while the store is in EX
+wire wb_post;
+wire wb_hold  = exe_valid && exe_o.st_v && ((BUS != 0 && STORE_POST == 0) ? (wb_post ? sb_full : !st_done) : sb_full);
 wire commit   = exe_valid;
 // (a fault on the last micro-op: the instruction is complete, its write pending in WB1)
 // (a faulted store retires only on an instruction's last micro-op, and never
@@ -298,6 +314,9 @@ reg [31:0] cacr;
 // MMU registers: stored with the reference's write masks (lib/AP68040
 // ap040_core.v S_MOVEC2); they drive the MMU outside (M7)
 reg [31:0] tc, itt0, itt1, dtt0, dtt1, mmusr, urp, srp;
+assign wb_post = (BUS != 0) && (STORE_POST == 0) && (STORE_BUF == 1) && exe_o.st_post &&
+                 !tc[15] && !(dtt0[15] && dtt0[2]) && !(dtt1[15] && dtt1[2]);
+assign stw_addr = fw_st_addr;
 
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -505,7 +524,9 @@ end else begin : g_bus
 	// only in the next.  Anything else goes out of the slot as before, with
 	// no clock lost.
 	wire d_rd_fast;
-	wire st_quiet = !(older_store || (exe_valid && exe_o.st_v)) && !(mem_req && mem_write);
+	// (STORE_BUF) and nothing posted: the FIFO's stores are older too
+	wire st_quiet = !(older_store || (exe_valid && exe_o.st_v)) && !(mem_req && mem_write) &&
+	                !((STORE_BUF != 0) && sb_busy);
 	if (DFP != 0) begin : g_dfp
 		reg dfp_look, dfp_q1;
 		always @(posedge clk)
@@ -597,10 +618,11 @@ end else begin : g_bus
 		assign ifp_s    = 1'b0;
 		wire unused_ifp = ifp_hit | ifp_try | (|ifp_data);
 	end
-	ap040_pipe_bcu #(.POST(STORE_POST), .DONE_REG(STDONE_REG)) u_bcu
+	ap040_pipe_bcu #(.POST(STORE_POST), .DONE_REG(STDONE_REG), .MIX((STORE_POST == 0 && STORE_BUF != 0) ? 1 : 0)) u_bcu
 	(
 		.clk(clk), .nreset(nreset), .ce(ce),
-		.st_v(STORE_POST ? (ce && retire && exe_o.st_v) : (exe_valid && exe_o.st_v)),
+		.st_v(STORE_POST ? (ce && retire && exe_o.st_v) : (exe_valid && exe_o.st_v && !wb_post)),
+		.sp_v(ce && retire && exe_o.st_v && wb_post),
 		.st_addr(exe_o.st_addr), .st_size(exe_o.st_size),
 		.st_data(exe_o.st_data), .st_fc(exe_o.st_fc), .st_rb(exe_o.st_rb), .mem_rb(),
 		.sb_full(sb_full), .sb_busy(sb_busy), .st_done(st_done), .st_ferr(st_ferr), .st_fatc(st_fatc), .st_fma(st_fma),
@@ -704,6 +726,7 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HA
 	.pt_req(pt_req), .pt_write(pt_write), .pt_addr(pt_addr), .pt_done(pt_done), .pt_mmusr(pt_mmusr),
 	.pf_req(pf_req), .pf_mode(pf_mode), .pf_addr(pf_addr), .pf_done(pf_done),
 	.bus_idle(BUS == 0 || (!mem_req && !sb_busy)), .pmmu_busy(pmmu_busy),
+	.st_fatal((STORE_BUF == 1) && bus_st_err),
 	.fp_req(fp_req), .fp_op_class(fp_op_class), .fp_opmode(fp_opmode),
 	.fp_src_fmt(fp_src_fmt), .fp_src_r(fp_src_r), .fp_dst_r(fp_dst_r), .fp_din(fp_din),
 	.fp_ia_we(fp_ia_we), .fp_ia_wdata(fp_ia_wdata),
@@ -792,6 +815,7 @@ ap040_execute #(.HAS_FPU(HAS_FPU)) u_ex
 	.fw_w0_v(fw_w0_v), .fw_w0_r(fw_w0_r), .fw_w0_val(fw_w0_val),
 	.fw_ccr_v(fw_ccr_v), .fw_ccr(fw_ccr),
 	.fw_st_v(fw_st_v), .fw_st_addr(fw_st_addr), .fw_st_size(fw_st_size), .fw_st_data(fw_st_data),
+	.fw_st_ram(stw_ram),
 	.ex_redirect(ex_redirect), .ex_redirect_pc(ex_redirect_pc), .ex_redirect_s(ex_redirect_s),
 	.exe_valid(exe_valid), .exe_o(exe_o)
 );

@@ -250,9 +250,13 @@ always @(posedge clk) begin
 		end
 	end
 end
+`ifndef STORE_BUF
+`define STORE_BUF 0
+`endif
 ap040_pipe_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
                      .AP040_POST_STORES(POST),
-                     .AP040_FILL_CHANNEL(FILLCH)) dut
+                     .AP040_FILL_CHANNEL(FILLCH),
+                     .AP040_STORE_BUF(`STORE_BUF)) dut
 (
 	.clk(clk),
 	.nreset(nreset),
@@ -1187,6 +1191,10 @@ initial begin
 	run_phase(1);
 	run_phase(2);
 
+	// the store order (tb_sb_check.v), settled at each phase's reset
+	u_sbc.settle;
+	u_sbc.report("compat");
+	errors = errors + u_sbc.bad;
 	if (errors == 0) $display("ALL TESTS PASSED");
 	else             $display("TEST FAILED with %0d errors", errors);
 	// differential testing: dump the data window for comparison
@@ -1194,5 +1202,27 @@ initial begin
 		$writememh(dump_file, mem, 'h3000 >> 1, ('h4000 >> 1) - 1);
 	$finish;
 end
+
+// the store order on the core's memory port (findings/storebuf/plan.md)
+tb_sb_check u_sbc
+(
+	.clk(clk), .nreset(nreset), .ce(dut.ce_core),
+	.ret_v(dut.core.retire && dut.core.exe_o.st_v && !dut.core.wb_fault),
+	.ret_a(dut.core.exe_o.st_addr), .ret_s(dut.core.exe_o.st_size), .ret_d(dut.core.exe_o.st_data),
+	.bw_v(dut.core.g_bus.u_bcu.done && dut.core.g_bus.u_bcu.kind == 2'd0 && !dut.core.g_bus.u_bcu.mem_flt),
+	.bw_a(dut.core.g_bus.u_bcu.mem_addr), .bw_s(dut.core.g_bus.u_bcu.mem_size), .bw_d(dut.core.g_bus.u_bcu.mem_wdata),
+	.bf_v(dut.core.g_bus.u_bcu.done && dut.core.g_bus.u_bcu.kind == 2'd0 && dut.core.g_bus.u_bcu.mem_flt &&
+	      dut.core.g_bus.u_bcu.k_fifo && dut.core.g_bus.u_bcu.sp_fin),
+	.bf_a(dut.core.g_bus.u_bcu.sp_on ? dut.core.g_bus.u_bcu.sp_a : dut.core.g_bus.u_bcu.mem_addr),
+	.bf_s(dut.core.g_bus.u_bcu.sp_on ? dut.core.g_bus.u_bcu.sp_s : dut.core.g_bus.u_bcu.mem_size),
+	.br_v(dut.core.g_bus.u_bcu.go_rd), .br_a(dut.core.g_bus.u_bcu.dq_a),
+	.fr_v(dut.core.g_bus.u_bcu.rd_fast && dut.core.g_bus.u_bcu.dq_v),
+	.fr_a(dut.core.g_bus.u_bcu.dq_a), .fr_s(dut.core.g_bus.u_bcu.dq_s),
+	.occ_n(dut.core.g_bus.u_bcu.sb_cnt),
+	.full_hold(dut.core.exe_valid && dut.core.exe_o.st_v && dut.core.wb_post && dut.core.sb_full),
+	.rd_wait(dut.core.g_bus.u_bcu.dq_v && dut.core.g_bus.u_bcu.sb_cnt != 0),
+	.f_wait(dut.core.g_bus.b_f_req && dut.core.g_bus.u_bcu.sb_cnt != 0),
+	.sy_wait(dut.core.g_bus.u_bcu.st_v && dut.core.g_bus.u_bcu.sb_cnt != 0)
+);
 
 endmodule

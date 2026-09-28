@@ -10,6 +10,10 @@
 // retires (or after +cycles clocks, default 20000), then checks every line //
 // of the expect file:                                                      //
 //   halt <pc>            stop when the instruction at <pc> retires         //
+//   berr <addr> <r|w|f>  (bus mode) the first read/write/fetch touching    //
+//                        <addr> bus-errors; a "w" address is never posted  //
+//   lberr <addr>         (bus mode) the first write touching <addr>        //
+//                        bus-errors AFTER it was posted (-DSTORE_BUF)      //
 //                        (required; the first line normally)               //
 //   d0..d7 a0..a6 <v>    register value (hex)                              //
 //   usp|isp|msp <v>                                                        //
@@ -28,6 +32,10 @@
 // port instead of the L1 array; +prof=0 back-to-back acks, 1 varied waits,  //
 // 2 varied waits under a clock enable high one clock in three with the ack //
 // held until the next enable (the Minimig kernel's clkena).               //
+// -DSTORE_BUF=<n> builds the core with that store buffer mode             //
+// (findings/storebuf/plan.md); the bench's RAM window is everything but   //
+// $xxxxF000-$xxxxFFFF and the "berr ... w" addresses.  In bus mode         //
+// tb_sb_check.v checks the store order on every run.                      //
 //--------------------------------------------------------------------------//
 `timescale 1ns/1ps
 
@@ -55,6 +63,8 @@ wire  [1:0] mem_size;
 wire [31:0] mem_addr, mem_wdata;
 wire  [2:0] mem_fc;
 reg         m_ack = 1'b0;
+wire [31:0] stw_addr;             // (the store buffer's RAM window, below)
+reg         stw_ram;
 reg         m_flt = 1'b0;         // (bus mode) the answer is an access error
 reg  [31:0] m_rdata = 32'd0;
 
@@ -126,6 +136,9 @@ ap040_pipe_core #(
 `ifdef BUS_MODE
 	, .BUS(1)
 `endif
+`ifdef STORE_BUF
+	, .STORE_BUF(`STORE_BUF)
+`endif
 `ifdef FPU_STUB
 	, .HAS_FPU(1)
 `endif
@@ -137,6 +150,7 @@ ap040_pipe_core #(
 	.mem_req(mem_req), .mem_write(mem_write), .mem_instr(mem_instr), .mem_size(mem_size),
 	.mem_addr(mem_addr), .mem_wdata(mem_wdata), .mem_fc(mem_fc),
 	.mem_ack(m_ack), .mem_rdata(m_rdata), .mem_flt(m_flt), .mem_atc(1'b0), .bus_st_err(),
+	.stw_addr(stw_addr), .stw_ram(stw_ram),
 	.dbg_if_valid(), .dbg_if_pc(), .dbg_id_valid(), .dbg_id_pc(),
 	.dbg_eac_valid(), .dbg_eac_pc(), .dbg_eaf_valid(), .dbg_eaf_pc(),
 	.dbg_ex_valid(), .dbg_ex_pc(), .dbg_wb_valid(dbg_wb_valid), .dbg_wb_pc(dbg_wb_pc),
@@ -174,6 +188,15 @@ reg [31:0] be_at [0:7];
 reg  [7:0] be_kind [0:7];
 reg        be_used [0:7];
 integer    n_be = 0, kbe;
+
+// the store buffer's RAM window: not the bench's I/O page, not a store
+// the program expects a precise bus error on ("berr <a> w")
+always @* begin
+	stw_ram = (stw_addr[15:12] != 4'hF);
+	for (kbe = 0; kbe < n_be; kbe = kbe + 1)
+		if (be_kind[kbe] == "w" && be_at[kbe] + 32'd3 >= stw_addr && be_at[kbe] < stw_addr + 32'd4)
+			stw_ram = 1'b0;
+end
 `ifdef BUS_MODE
 reg [15:0] bmem [0:L1_WORDS-1];       // 64K at address 0 by default (high bits alias, as the L1)
 function [7:0] mb(input [31:0] a);
@@ -232,7 +255,8 @@ function automatic be_hit(input [31:0] a, input [1:0] sz, input w, input ins);
 		h = 1'b0; n = (sz == 2'd0) ? 1 : (sz == 2'd1) ? 2 : 4;
 		for (kk = 0; kk < n_be; kk = kk + 1)
 			if (!be_used[kk] && be_at[kk] >= a && be_at[kk] < a + n &&
-			    ((be_kind[kk] == "r" && !w && !ins) || (be_kind[kk] == "w" && w) || (be_kind[kk] == "f" && ins)))
+			    ((be_kind[kk] == "r" && !w && !ins) || ((be_kind[kk] == "w" || be_kind[kk] == "l") && w) ||
+			     (be_kind[kk] == "f" && ins)))
 				h = 1'b1;
 		be_hit = h;
 	end
@@ -243,7 +267,8 @@ task be_use(input [31:0] a, input [1:0] sz, input w, input ins);
 		n = (sz == 2'd0) ? 1 : (sz == 2'd1) ? 2 : 4;
 		for (kk = 0; kk < n_be; kk = kk + 1)
 			if (!be_used[kk] && be_at[kk] >= a && be_at[kk] < a + n &&
-			    ((be_kind[kk] == "r" && !w && !ins) || (be_kind[kk] == "w" && w) || (be_kind[kk] == "f" && ins)))
+			    ((be_kind[kk] == "r" && !w && !ins) || ((be_kind[kk] == "w" || be_kind[kk] == "l") && w) ||
+			     (be_kind[kk] == "f" && ins)))
 				be_used[kk] = 1'b1;
 	end
 endtask
@@ -295,6 +320,27 @@ always @(negedge clk)
 			end
 		endcase
 always @(posedge clk) ce <= (prof == 2) ? ((cyc % 3) == 0) : 1'b1;
+
+// the store order (tb_sb_check.v)
+tb_sb_check u_sbc
+(
+	.clk(clk), .nreset(nreset), .ce(ce),
+	.ret_v(dut.retire && dut.exe_o.st_v && !dut.wb_fault),
+	.ret_a(dut.exe_o.st_addr), .ret_s(dut.exe_o.st_size), .ret_d(dut.exe_o.st_data),
+	.bw_v(dut.g_bus.u_bcu.done && dut.g_bus.u_bcu.kind == 2'd0 && !m_flt),
+	.bw_a(mem_addr), .bw_s(mem_size), .bw_d(mem_wdata),
+	.bf_v(dut.g_bus.u_bcu.done && dut.g_bus.u_bcu.kind == 2'd0 && m_flt && dut.g_bus.u_bcu.k_fifo &&
+	      dut.g_bus.u_bcu.sp_fin),
+	.bf_a(dut.g_bus.u_bcu.sp_on ? dut.g_bus.u_bcu.sp_a : mem_addr),
+	.bf_s(dut.g_bus.u_bcu.sp_on ? dut.g_bus.u_bcu.sp_s : mem_size),
+	.br_v(dut.g_bus.u_bcu.go_rd), .br_a(dut.g_bus.u_bcu.dq_a),
+	.fr_v(dut.g_bus.u_bcu.rd_fast && dut.g_bus.u_bcu.dq_v), .fr_a(dut.g_bus.u_bcu.dq_a), .fr_s(dut.g_bus.u_bcu.dq_s),
+	.occ_n(dut.g_bus.u_bcu.sb_cnt),
+	.full_hold(dut.exe_valid && dut.exe_o.st_v && dut.wb_post && dut.sb_full),
+	.rd_wait(dut.g_bus.u_bcu.dq_v && dut.g_bus.u_bcu.sb_cnt != 0),
+	.f_wait(dut.g_bus.b_f_req && dut.g_bus.u_bcu.sb_cnt != 0),
+	.sy_wait(dut.g_bus.u_bcu.st_v && dut.g_bus.u_bcu.sb_cnt != 0)
+);
 `else
 assign ev_rd = dut.u_l1.rd_req;   assign ev_rd_addr = dut.u_l1.rd_addr; assign ev_rd_size = dut.u_l1.rd_size;
 assign ev_wr = dut.u_l1.wr_req;   assign ev_wr_addr = dut.u_l1.wr_addr; assign ev_wr_size = dut.u_l1.wr_size;
@@ -424,7 +470,7 @@ always @(posedge clk)
 
 // "syncpc <addr>": when the instruction at <addr> retires, no store may be
 // on its way to memory any more (NOP synchronises, M68040UM 7.7) -- bus mode
-reg [31:0] sync_at [0:7];
+reg [31:0] sync_at [0:15];
 integer    n_sync = 0, sync_bad = 0, sync_hits = 0, ks;
 always @(posedge clk)
 	if (nreset && dbg_wb_valid)
@@ -497,6 +543,10 @@ initial begin
 				rc = $fscanf(fd, "%h %s", a, key);
 				be_at[n_be] = a; be_kind[n_be] = key[7:0]; be_used[n_be] = 1'b0; n_be = n_be + 1;
 			end
+			else if (key == "lberr") begin
+				rc = $fscanf(fd, "%h", a);
+				be_at[n_be] = a; be_kind[n_be] = "l"; be_used[n_be] = 1'b0; n_be = n_be + 1;
+			end
 			else if (key == "fc") begin rc = $fscanf(fd, "%h %d", a, v); fc_at[n_fc] = a; fc_want[n_fc] = v[2:0]; n_fc = n_fc + 1; end
 			else if (key == "rb") begin rc = $fscanf(fd, "%h", a); rb_at[n_rbl] = a; n_rbl = n_rbl + 1; end
 			else if (key == "x80") rc = $fscanf(fd, "%h %h %h %d", a, xse, xman, xn);
@@ -532,6 +582,7 @@ initial begin
 		else if (key == "maxclk") rc = $fscanf(fd, "%d", v);
 		else if (key == "syncpc") rc = $fscanf(fd, "%h", v);
 		else if (key == "berr") rc = $fscanf(fd, "%h %s", v, key);
+		else if (key == "lberr") rc = $fscanf(fd, "%h", v);
 		else if (key == "fc") rc = $fscanf(fd, "%h %d", a, v);
 		else if (key == "rb") rc = $fscanf(fd, "%h", v);
 		// "fpiar <v>": the unit's FPIAR, which no instruction can read until
@@ -599,6 +650,9 @@ initial begin
 	end
 `ifdef BUS_MODE
 	errors = errors + gap_bad;
+	u_sbc.settle;
+	u_sbc.report("prog");
+	errors = errors + u_sbc.bad;
 `endif
 	if (n_fc > 0 && fc_hits == 0) begin
 		errors = errors + 1;

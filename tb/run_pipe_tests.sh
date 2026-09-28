@@ -18,6 +18,10 @@ WORK=build
 mkdir -p "$WORK"
 
 SRC="$RTL/ap040_pipe_pkg.sv $(ls $RTL/ap040_*.v | tr '\n' ' ')"
+# PIPE_STORE_BUF=<n>: build the program and wrapper benches with that store
+# buffer mode (findings/storebuf/plan.md: 0 off, 1 posting, 2 the A/B
+# reference); the bus-mode benches check the store order with tb_sb_check.v
+SBDEF=${PIPE_STORE_BUF:+-DSTORE_BUF=$PIPE_STORE_BUF}
 
 # milestone benches (1-17)
 TESTS="nop moveq add bra bcc bccw bccl scc dbcc move_mem move_disp jmp bsr jsr exc sup rts_rte addrerr"
@@ -46,7 +50,7 @@ done
 # (needs vasmm68k_mot; the .exp files were made from a reference-core run
 # with findings/ap040-pipelined/tests/mkprog.sh and reviewed)
 if command -v vasmm68k_mot > /dev/null; then
-	iverilog -g2012 -I "$RTL" -o "$WORK/tb_pipe_prog.vvp" tb_ap040_pipe_prog.v $SRC > "$WORK/tb_pipe_prog.clog" 2>&1 || {
+	iverilog -g2012 $SBDEF -I "$RTL" -o "$WORK/tb_pipe_prog.vvp" tb_ap040_pipe_prog.v $SRC > "$WORK/tb_pipe_prog.clog" 2>&1 || {
 		echo "  COMPILE-ERROR prog bench"; grep -v "constant selects" "$WORK/tb_pipe_prog.clog" | head -5; exit 1; }
 	for s in pipe_asm/*.s; do
 		n=$(basename "$s" .s)
@@ -73,13 +77,15 @@ if command -v vasmm68k_mot > /dev/null; then
 	# the same programs through the memory port (BUS=1, plan M5) at the three
 	# wait profiles of tb_ap040_pipe_prog.v's memory model
 	if [ -z "${PIPE_NO_BUS:-}" ]; then
-	iverilog -g2012 -DBUS_MODE -I "$RTL" -o "$WORK/tb_pipe_bus.vvp" tb_ap040_pipe_prog.v $SRC > "$WORK/tb_pipe_bus.clog" 2>&1 || {
+	iverilog -g2012 $SBDEF -DBUS_MODE -I "$RTL" -o "$WORK/tb_pipe_bus.vvp" tb_ap040_pipe_prog.v tb_sb_check.v $SRC > "$WORK/tb_pipe_bus.clog" 2>&1 || {
 		echo "  COMPILE-ERROR bus bench"; grep -v "constant selects" "$WORK/tb_pipe_bus.clog" | head -5; exit 1; }
 	for s in pipe_asm/*.s; do
 		n=$(basename "$s" .s)
 		[ -f "pipe_asm/$n.exp" ] || continue
 		case "$n" in fpu*) continue ;; esac
 		[ -f "$WORK/$n.hex" ] || continue
+		# a late (posted-store) bus error exists only with posting on
+		if grep -q "^lberr" "pipe_asm/$n.exp" && [ "${PIPE_STORE_BUF:-0}" != 1 ]; then continue; fi
 		cyc=$(sed -n 's/^; diff:.*--cycles \([0-9]*\).*/\1/p' "$s" | head -1)
 		cyc=$(( ${cyc:-20000} * 8 ))
 		for p in 0 1 2; do
@@ -99,9 +105,9 @@ if command -v vasmm68k_mot > /dev/null; then
 	# req/accepted/done interlock is testable before the real unit goes in.
 	# The pipe_asm/fpu*.s programs run only here; with HAS_FPU = 0 every one
 	# of their opcodes is M10.0's F-line exception instead (fline4.s).
-	iverilog -g2012 -DFPU_STUB -I "$RTL" -o "$WORK/tb_pipe_fpu.vvp" tb_ap040_pipe_prog.v tb_fpu_stub.v $SRC > "$WORK/tb_pipe_fpu.clog" 2>&1 || {
+	iverilog -g2012 $SBDEF -DFPU_STUB -I "$RTL" -o "$WORK/tb_pipe_fpu.vvp" tb_ap040_pipe_prog.v tb_fpu_stub.v $SRC > "$WORK/tb_pipe_fpu.clog" 2>&1 || {
 		echo "  COMPILE-ERROR fpu prog bench"; grep -v "constant selects" "$WORK/tb_pipe_fpu.clog" | head -5; exit 1; }
-	iverilog -g2012 -DFPU_STUB -DBUS_MODE -I "$RTL" -o "$WORK/tb_fpu_bus.vvp" tb_ap040_pipe_prog.v tb_fpu_stub.v $SRC > "$WORK/tb_fpu_bus.clog" 2>&1 || {
+	iverilog -g2012 $SBDEF -DFPU_STUB -DBUS_MODE -I "$RTL" -o "$WORK/tb_fpu_bus.vvp" tb_ap040_pipe_prog.v tb_fpu_stub.v tb_sb_check.v $SRC > "$WORK/tb_fpu_bus.clog" 2>&1 || {
 		echo "  COMPILE-ERROR fpu bus bench"; grep -v "constant selects" "$WORK/tb_fpu_bus.clog" | head -5; exit 1; }
 	for s in pipe_asm/fpu*.s; do
 		[ -f "$s" ] || continue
@@ -136,9 +142,9 @@ if command -v vasmm68k_mot > /dev/null; then
 	# programs drive the instance the bitstream carries.  pipe_asm/fpureal*.s
 	# holds hand-computed IEEE results, which the stub could not produce.
 	FSRC="$SRC $RTL/compat/ap040_fpu.v"
-	iverilog -g2012 -DFPU_REAL -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_pipe_fpr.vvp" tb_ap040_pipe_prog.v $FSRC > "$WORK/tb_pipe_fpr.clog" 2>&1 || {
+	iverilog -g2012 $SBDEF -DFPU_REAL -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_pipe_fpr.vvp" tb_ap040_pipe_prog.v $FSRC > "$WORK/tb_pipe_fpr.clog" 2>&1 || {
 		echo "  COMPILE-ERROR fpu-real prog bench"; grep -v "constant selects" "$WORK/tb_pipe_fpr.clog" | head -5; exit 1; }
-	iverilog -g2012 -DFPU_REAL -DBUS_MODE -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_fpr_bus.vvp" tb_ap040_pipe_prog.v $FSRC > "$WORK/tb_fpr_bus.clog" 2>&1 || {
+	iverilog -g2012 $SBDEF -DFPU_REAL -DBUS_MODE -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_fpr_bus.vvp" tb_ap040_pipe_prog.v tb_sb_check.v $FSRC > "$WORK/tb_fpr_bus.clog" 2>&1 || {
 		echo "  COMPILE-ERROR fpu-real bus bench"; grep -v "constant selects" "$WORK/tb_fpr_bus.clog" | head -5; exit 1; }
 	for s in pipe_asm/fpureal*.s; do
 		[ -f "$s" ] || continue
@@ -180,8 +186,8 @@ if command -v vasmm68k_mot > /dev/null; then
 	if [ -f "$FPSP_LIB" ] && python3 mk_fpsplib.py "$FPSP_LIB" "$WORK/fpsp040lib.bin" "$WORK/fpsp040lib.inc" > "$WORK/fpsplib.log" 2>&1; then
 		( cd fpsp_asm && vasmm68k_mot -Fbin -m68040 -m68882 -no-opt -quiet -o "../$WORK/fpsp_lib.bin" fpsp_lib.s ) &&
 		python3 bin2hex.py "$WORK/fpsp_lib.bin" "$WORK/fpsp_lib.hex" || { echo "  FAIL  fpsp:fpsp_lib (assembler)"; fail=1; }
-		iverilog -g2012 -DFPU_REAL -Ptb_ap040_pipe_prog.L1_AW=17 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_fpsp.vvp" tb_ap040_pipe_prog.v $FSRC > "$WORK/tb_fpsp.clog" 2>&1 &&
-		iverilog -g2012 -DFPU_REAL -DBUS_MODE -Ptb_ap040_pipe_prog.L1_AW=17 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_fpsp_bus.vvp" tb_ap040_pipe_prog.v $FSRC > "$WORK/tb_fpsp_bus.clog" 2>&1 || {
+		iverilog -g2012 $SBDEF -DFPU_REAL -Ptb_ap040_pipe_prog.L1_AW=17 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_fpsp.vvp" tb_ap040_pipe_prog.v $FSRC > "$WORK/tb_fpsp.clog" 2>&1 &&
+		iverilog -g2012 $SBDEF -DFPU_REAL -DBUS_MODE -Ptb_ap040_pipe_prog.L1_AW=17 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_fpsp_bus.vvp" tb_ap040_pipe_prog.v tb_sb_check.v $FSRC > "$WORK/tb_fpsp_bus.clog" 2>&1 || {
 			echo "  COMPILE-ERROR fpsp bench"; grep -v "constant selects" "$WORK/tb_fpsp.clog" "$WORK/tb_fpsp_bus.clog" | head -5; exit 1; }
 		timeout 1800 vvp "$WORK/tb_fpsp.vvp" +prog="$WORK/fpsp_lib.hex" +expect=fpsp_asm/fpsp_lib.exp +cycles=4000000 > "$WORK/fpsp_lib.log" 2>&1 &
 		for p in 0 1 2; do
@@ -216,7 +222,7 @@ fi
 AP040_REF=${AP040_REF:-$(cd ../../MinimigAGA_TC64/lib/AP68040 2>/dev/null && pwd)}
 if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v vasmm68k_mot > /dev/null; then
 	CSRC="$SRC $(ls $RTL/compat/*.v | tr '\n' ' ') $RTL/compat/primitives/dpram.v"
-	iverilog -g2012 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_compat.vvp" tb_ap040_pipe_compat.v $CSRC > "$WORK/tb_compat.clog" 2>&1 || {
+	iverilog -g2012 $SBDEF -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_compat.vvp" tb_ap040_pipe_compat.v tb_sb_check.v $CSRC > "$WORK/tb_compat.clog" 2>&1 || {
 		echo "  COMPILE-ERROR compat bench"; grep -v "constant selects" "$WORK/tb_compat.clog" | head -5; exit 1; }
 	# lib/AP68040's reset bench on the wrapper, and its adapter unit benches
 	# on the lifted copies
@@ -255,12 +261,12 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 	# landing on an instruction past P_START with no read in flight.  The
 	# failure is a WEDGE, so it gets a short phase timeout (it passes in
 	# 180k clocks) instead of the bench's 20M default.
-	for t in t_integer t_cache t_bitfield_mmu t_mmu_m9s t_mmu_pipe t_rmw_wp texc_m9t t_irq_pipe t_mbit_pipe t_trirq_pipe t_ipend_pipe t_irqwedge_pipe t_icache_pipe t_earlydrop_pipe t_specread_pipe t_dcache_pipe $TMR; do
+	for t in t_integer t_cache t_bitfield_mmu t_mmu_m9s t_mmu_pipe t_rmw_wp texc_m9t t_irq_pipe t_mbit_pipe t_trirq_pipe t_ipend_pipe t_irqwedge_pipe t_icache_pipe t_earlydrop_pipe t_specread_pipe t_dcache_pipe t_sbuf_pipe $TMR; do
 		if [ "$t" = t_mmu_m9s ] || [ "$t" = t_movem_restart_m9s ] || [ "$t" = texc_m9t ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "$WORK/$t.s"
 		elif [ "$t" = t_mmu_pipe ] || [ "$t" = t_rmw_wp ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "mmu_asm/$t.s"
-		elif [ "$t" = t_icache_pipe ] || [ "$t" = t_earlydrop_pipe ] || [ "$t" = t_specread_pipe ] || [ "$t" = t_dcache_pipe ]; then
+		elif [ "$t" = t_icache_pipe ] || [ "$t" = t_earlydrop_pipe ] || [ "$t" = t_specread_pipe ] || [ "$t" = t_dcache_pipe ] || [ "$t" = t_sbuf_pipe ]; then
 			# plan M14: the pipelined instruction read path's coherency rules
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "cache_asm/$t.s"
 		elif [ "$t" = t_irq_pipe ] || [ "$t" = t_mbit_pipe ] || [ "$t" = t_trirq_pipe ] || [ "$t" = t_ipend_pipe ] || [ "$t" = t_irqwedge_pipe ]; then
@@ -289,8 +295,8 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 		echo "  pass  compat:longpath" || { echo "  FAIL  compat:longpath  (see $WORK/compat_longpath.log)"; fail=1; }
 	# the 2^31-word freeze: IF's word count preset 256 short of the wrapper's
 	# PROG_WORDS part way into t_integer (tb_issued_wrap.v); it must not wedge
-	iverilog -g2012 -DISSUED_T=200000 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_issued_wrap.vvp" \
-		tb_ap040_pipe_compat.v tb_issued_wrap.v $CSRC > "$WORK/tb_issued_wrap.clog" 2>&1 &&
+	iverilog -g2012 $SBDEF -DISSUED_T=200000 -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_issued_wrap.vvp" \
+		tb_ap040_pipe_compat.v tb_issued_wrap.v tb_sb_check.v $CSRC > "$WORK/tb_issued_wrap.clog" 2>&1 &&
 	timeout 1800 vvp "$WORK/tb_issued_wrap.vvp" +prog="$WORK/t_integer.hex" +timeout=2000000 > "$WORK/compat_issued_wrap.log" 2>&1 &&
 	grep -q "ALL TESTS PASSED" "$WORK/compat_issued_wrap.log" && grep -q "issued_wrap: IF's word count preset" "$WORK/compat_issued_wrap.log" &&
 		echo "  pass  compat:issued_wrap" || { echo "  FAIL  compat:issued_wrap  (see $WORK/compat_issued_wrap.log)"; fail=1; }

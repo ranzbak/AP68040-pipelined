@@ -123,6 +123,7 @@ module ap040_ea_fetch
 	output reg [31:0] pf_addr,
 	input             pf_done,
 	input             bus_idle,    // the memory port has no transfer (the MMU is ours)
+	input             st_fatal,    // a posted store bus-errored (sticky): halt
 	output            pmmu_busy,   // IF must not fetch
 	// the FPU (plan M10.1): a pulse-request / pulse-done unit instantiated
 	// OUTSIDE the core, as the MMU is.  The command port is bit fields of the
@@ -2976,6 +2977,10 @@ always @(posedge clk) begin
 			if ((rd_pend && !rd_ack) || rd_req) rd_drop <= 1'b1;
 			done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
 		end
+		// (findings/storebuf/plan.md) a POSTED store bus-errored: nothing can
+		// report or restart it, so the core stops, as on a double fault
+		// (PLAN D13: posted-store errors are fatal) -- visibly, not silently
+		if (st_fatal) ph <= P_HALT;
 	end
 end
 

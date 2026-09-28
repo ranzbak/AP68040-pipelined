@@ -1,0 +1,7 @@
+# findings/storebuf/plan.md decision 2: a posted store's bus error halts the
+# core (dbg_halted); the store is not written.  STORE_BUF = 1 only.
+halt 00000424
+halted
+lberr 00006004
+m32 00006000 11111111
+m32 00006004 eeeeeeee

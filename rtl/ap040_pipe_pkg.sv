@@ -321,6 +321,7 @@ typedef struct packed {
 	logic        st_v;  logic [31:0] st_addr; logic [31:0] st_data; logic [1:0] st_size;
 	logic        st_rb;        // locked write-back (trace benches: not a data write the reference makes)
 	logic [2:0]  st_fc;        // function code (MOVES: DFC; else supervisor/user data)
+	logic        st_post;      // (STORE_BUF) EX's verdict: RAM window, not locked, not MOVES
 	stf_t        stf;          // for an access error on the store (M6)
 	logic        creg_v; logic [3:0] creg_sel; logic [31:0] creg_val;
 	logic        exc;   logic [31:0] exc_sp;
