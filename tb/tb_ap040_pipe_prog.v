@@ -342,7 +342,9 @@ reg        done = 0;
 // M68040UM 7.6.3), not at the halt label
 reg want_halt = 0;
 // "maxclk <n>": the program must halt within n clocks -- a performance
-// regression test (a cycle budget the core has been measured to meet)
+// regression test (a cycle budget the core has been measured to meet).  It is
+// a zero-wait budget: checked on the L1 build only; the bus profiles add
+// memory latency by design.
 integer max_clk = 0;
 always @(posedge clk)
 	if (nreset && ((dbg_wb_valid && dbg_wb_pc == halt_pc && !want_halt) || (want_halt && dut.dbg_halted))) done = 1;
@@ -611,10 +613,12 @@ initial begin
 		errors = errors + 1;
 		$display("FAIL: %0d locked write-backs, expected %0d", n_rb, want_rb);
 	end
+`ifndef BUS_MODE
 	if (max_clk != 0 && cycles > max_clk) begin
 		$display("FAIL: halted after %0d clocks, over the budget of %0d (maxclk)", cycles, max_clk);
 		errors = errors + 1;
 	end
+`endif
 	if (errors == 0) $display("ALL TESTS PASSED (%0d checks, halt after %0d clocks)", nchk, cycles);
 	else $display("%0d CHECK(S) FAILED", errors);
 	$finish;
