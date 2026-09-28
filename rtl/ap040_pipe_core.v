@@ -72,7 +72,14 @@ module ap040_pipe_core
 	// location is RAM (dfp_ram).  0: every such read waits for the store.
 	parameter         FWD                = 0,
 	// findings/catchup/plan.md step 2: ID's return-address stack (RTS predicted)
-	parameter         RAS                = 0
+	parameter         RAS                = 0,
+	// (DFP = 1; findings/storebuf/plan.md stage 3) the data read path is
+	// refused only by a store in EX or WB that touches the read's
+	// longwords (addr[11:2]), not by any store there.  0: by any.
+	parameter         PRECISE            = 0,
+	// (BUS = 1; findings/catchup/plan.md) split misaligned data transfers
+	// into aligned pieces the cache serves (ap040_pipe_bcu MISPLIT)
+	parameter         MISPLIT            = 0
 )
 (
 	input  clk,
@@ -494,6 +501,14 @@ ap040_pipe_l1 #(
 	.wr_ready  (d_wr_ready)
 );
 
+// (PRECISE) do two accesses touch a common longword of the page offset
+// (addr[11:2], the first and last byte's)
+function automatic logic lwo(input logic [31:0] a1, input logic [1:0] s1, input logic [31:0] a2, input logic [1:0] s2);
+	logic [31:0] e1, e2;
+	e1 = a1 + ((s1 == SZ_L) ? 32'd3 : (s1 == SZ_W) ? 32'd1 : 32'd0);
+	e2 = a2 + ((s2 == SZ_L) ? 32'd3 : (s2 == SZ_W) ? 32'd1 : 32'd0);
+	return (a1[11:2] == a2[11:2]) || (a1[11:2] == e2[11:2]) || (e1[11:2] == a2[11:2]) || (e1[11:2] == e2[11:2]);
+endfunction
 wire older_store = eaf_valid && (eaf_o.st_v || eaf_o.dk == DK_MEM ||
                                  eaf_o.cls == CL_BSR || eaf_o.cls == CL_JSR);
 
@@ -545,18 +560,35 @@ end else begin : g_bus
 	wire [31:0] fw_data;
 	wire st_quiet = !(older_store || (exe_valid && exe_o.st_v)) &&
 	                !(mem_req && mem_write && !((STORE_BUF != 0) && sb_kfifo));
+	// (PRECISE) the same by address: EX's store and WB's (a synchronous
+	// store on the port is WB's, which holds it until memory has it) against
+	// the read being issued, and EX's again against the slot in the answer
+	// clock (a store that entered EX in the issue clock).  Longword indices
+	// in the page offset, both longwords of a misaligned access: an alias
+	// only costs the fast answer.  All inputs are registers.
+	wire [31:0] slot_a;
+	wire  [1:0] slot_s;
+	wire ex_st_iss = fw_st_v && lwo(fw_st_addr, fw_st_size, d_rd_addr, d_rd_size);
+	wire wb_st_iss = exe_valid && exe_o.st_v && lwo(exe_o.st_addr, exe_o.st_size, d_rd_addr, d_rd_size);
+	wire ex_st_ans = fw_st_v && lwo(fw_st_addr, fw_st_size, slot_a, slot_s);
+	wire st_quiet_i = (PRECISE != 0) ? (!ex_st_iss && !wb_st_iss) : st_quiet;
+	wire st_quiet_a = (PRECISE != 0) ? !ex_st_ans : st_quiet;
 	if (DFP != 0) begin : g_dfp
 		reg dfp_look, dfp_q1, dfp_fq1;
 		always @(posedge clk)
 			if (!nreset) begin dfp_look <= 1'b0; dfp_q1 <= 1'b0; dfp_fq1 <= 1'b0; end
-			else if (ce) begin dfp_look <= d_rd_req; dfp_q1 <= st_quiet; dfp_fq1 <= !older_store || ex_push; end
+			else if (ce) begin
+				dfp_look <= d_rd_req; dfp_q1 <= st_quiet_i;
+				dfp_fq1 <= ((PRECISE != 0) ? !ex_st_iss : !older_store) || ex_push;
+			end
 		// (FWD) forwarded: no store in EX in the answer clock (one entering
 		// EX in the issue clock is seen only now), and none in the issue
 		// clock but a BSR/JSR push (its data is EX's input register, not ALU
 		// output); that push, WB's store and the FIFO's were compared at the
 		// lookup (fw_ok)
-		assign d_rd_fwd  = (FWD != 0) && dfp_look && dfp_fq1 && !older_store && dfp_ram && fw_ok;
-		assign d_rd_fast = dfp_look && dfp_q1 && st_quiet && dfp_hit && !((STORE_BUF != 0) && sb_ovl) && !d_rd_fwd;
+		assign d_rd_fwd  = (FWD != 0) && dfp_look && dfp_fq1 && ((PRECISE != 0) ? !ex_st_ans : !older_store) &&
+		                   dfp_ram && fw_ok;
+		assign d_rd_fast = dfp_look && dfp_q1 && st_quiet_a && dfp_hit && !((STORE_BUF != 0) && sb_ovl) && !d_rd_fwd;
 		// a locked RMW's read never takes the fast path: it goes out of the
 		// BCU with mem_lock, where the MMU checks write protection on it
 		assign dfp_req  = d_rd_req && ce && !d_rd_lk;
@@ -570,7 +602,7 @@ end else begin : g_bus
 		assign dfp_addr = 32'd0;
 		assign dfp_size = 2'd0;
 		assign dfp_fc   = 3'd0;
-		wire unused_dfp = dfp_hit | st_quiet | sb_ovl | dfp_ram | fw_ok | (|fw_data);
+		wire unused_dfp = dfp_hit | st_quiet | sb_ovl | dfp_ram | fw_ok | (|fw_data) | st_quiet_i | st_quiet_a | ex_st_iss;
 	end
 
 	// The BCU's fetch slot (b_f_*): IF's own request with IFP = 0; with
@@ -644,7 +676,7 @@ end else begin : g_bus
 		wire unused_ifp = ifp_hit | ifp_try | (|ifp_data);
 	end
 	ap040_pipe_bcu #(.POST(STORE_POST), .DONE_REG(STDONE_REG), .MIX((STORE_POST == 0 && STORE_BUF != 0) ? 1 : 0),
-	                 .FWD((DFP != 0) ? FWD : 0)) u_bcu
+	                 .FWD((DFP != 0) ? FWD : 0), .MISPLIT(MISPLIT)) u_bcu
 	(
 		.clk(clk), .nreset(nreset), .ce(ce),
 		.st_v(STORE_POST ? (ce && retire && exe_o.st_v) : (exe_valid && exe_o.st_v && !wb_post)),
@@ -658,7 +690,7 @@ end else begin : g_bus
 		.lk_fc(d_rd_fc), .exs_v(ex_push), .exs_addr(eaf_o.daddr), .exs_data(eaf_o.next_pc), .exs_fc(eaf_o.st_fc),
 		.wbs_v(exe_valid && exe_o.st_v), .wbs_ok(!exe_o.stf.lk),
 		.wbs_addr(exe_o.st_addr), .wbs_size(exe_o.st_size), .wbs_data(exe_o.st_data), .wbs_fc(exe_o.st_fc),
-		.fw_ok(fw_ok), .fw_data(fw_data), .rd_fwd(d_rd_fwd),
+		.fw_ok(fw_ok), .fw_data(fw_data), .rd_fwd(d_rd_fwd), .dq_a_o(slot_a), .dq_s_o(slot_s),
 		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc), .rd_lk(d_rd_lk),
 		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(d_rd_err),
 		.rd_fast(d_rd_fast), .rd_fast_data(dfp_data),

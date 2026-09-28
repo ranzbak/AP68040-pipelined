@@ -69,7 +69,15 @@ module ap040_pipe_bcu
 	// whole (same FC, not a locked write), fw_ok says so the next clock
 	// with the read's value in fw_data, and the core may answer the slot
 	// from it (rd_fwd) instead of waiting for the store to reach memory.
-	parameter FWD = 0
+	parameter FWD = 0,
+	// (findings/catchup/plan.md) 1: a misaligned data transfer is split
+	// into aligned pieces -- a longword at 2 mod 4 into two words, any other
+	// misaligned word or longword into bytes -- so each piece fits one
+	// longword: the cache serves it (a misaligned read bypassed it) and a
+	// store updates the line (a misaligned store cleared its row).  The
+	// 68040 splits a misaligned operand into several accesses too (M68040UM
+	// 7.x).  0: only a page-crossing transfer with translation on is split.
+	parameter MISPLIT = 0
 )
 (
 	input             clk,
@@ -100,6 +108,8 @@ module ap040_pipe_bcu
 	input       [1:0] lk_size,
 	output reg        sb_ovl,
 	output            k_fifo_o,   // (MIX) the store on the port is the FIFO's
+	output     [31:0] dq_a_o,     // the data read slot's address and size (the core's
+	output      [1:0] dq_s_o,     // answer-clock overlap check, PRECISE)
 	// (FWD) forwarding: the lookup's function code, WB's store as it stands
 	// (wbs_ok: one a read may take its bytes from), the verdict, the answer
 	input       [2:0] lk_fc,
@@ -196,9 +206,12 @@ localparam [1:0] K_ST = 2'd0, K_RD = 2'd1, K_IF = 2'd2;
 reg  [1:0] kind;           // what the transfer in progress is
 reg        k_fifo;         // (kind K_ST) the store came from the FIFO, not from WB
 assign k_fifo_o = k_fifo;
+assign dq_a_o = dq_a;
+assign dq_s_o = dq_s;
 
 // page-crossing split state (see below)
 reg        sp_on;          // the transfer in progress is split into bytes
+reg        sp_w;           // ... into two words (a longword at 2 mod 4, MISPLIT)
 reg  [1:0] sp_i;           // the byte on the bus
 reg  [1:0] sp_s;           // the whole transfer's size
 reg [31:0] sp_a;           // ... its address
@@ -238,10 +251,18 @@ function automatic logic [7:0] sp_byte(input logic [31:0] d, input logic [1:0] s
 		default: return d[7:0];
 	endcase
 endfunction
-wire [1:0] sp_nm1 = (sp_s == SZ_L) ? 2'd3 : 2'd1;            // the last byte's index
+// (MISPLIT) misaligned: split; a longword at 2 mod 4 into words
+function automatic logic misal(input logic [31:0] a, input logic [1:0] sz);
+	return (MISPLIT != 0) && ((sz == SZ_L && a[1:0] != 2'b00) || (sz == SZ_W && a[0]));
+endfunction
+function automatic logic wsplit(input logic [31:0] a, input logic [1:0] sz);
+	return (MISPLIT != 0) && sz == SZ_L && a[1:0] == 2'b10;
+endfunction
+wire [1:0] sp_nm1 = (sp_w || sp_s != SZ_L) ? 2'd1 : 2'd3;    // the last piece's index
 wire       sp_fin = !sp_on || mem_flt || (sp_i == sp_nm1);   // the transfer ends with this answer
 wire       go_sp  = idle && sp_on;                           // the next byte (first priority)
-wire [31:0] sp_rd = (sp_s == SZ_L) ? {sp_acc, mem_rdata[7:0]} : {16'd0, sp_acc[7:0], mem_rdata[7:0]};
+wire [31:0] sp_rd = sp_w ? {sp_acc[15:0], mem_rdata[15:0]} :
+                   (sp_s == SZ_L) ? {sp_acc, mem_rdata[7:0]} : {16'd0, sp_acc[7:0], mem_rdata[7:0]};
 
 wire   st_done_c = !POST && done && (kind == K_ST) && sp_fin && !k_fifo;
 wire   st_fma_c, st_ferr_c, st_fatc_c;
@@ -353,7 +374,7 @@ always @(posedge clk) begin
 		end
 		sb_ovl <= 1'b0; fw_ok <= 1'b0; fw_data <= 32'd0;
 		mem_rb <= 1'b0;
-		sp_on <= 1'b0; sp_i <= 2'd0; sp_s <= SZ_L; sp_a <= 32'd0; sp_d <= 32'd0; sp_acc <= 24'd0;
+		sp_on <= 1'b0; sp_w <= 1'b0; sp_i <= 2'd0; sp_s <= SZ_L; sp_a <= 32'd0; sp_d <= 32'd0; sp_acc <= 24'd0;
 	end else if (ce) begin
 		rd_ack <= 1'b0; f_ack <= 1'b0;
 		// the lookup's overlap verdict, against the FIFO before this edge (a
@@ -385,7 +406,7 @@ always @(posedge clk) begin
 			// a byte of a split transfer: on to the next
 			mem_req <= 1'b0;
 			sp_i <= sp_i + 2'd1;
-			sp_acc <= {sp_acc[15:0], mem_rdata[7:0]};
+			sp_acc <= sp_w ? {8'd0, mem_rdata[15:0]} : {sp_acc[15:0], mem_rdata[7:0]};
 		end else if (done) begin
 			mem_req <= 1'b0;
 			sp_on <= 1'b0;
@@ -406,28 +427,30 @@ always @(posedge clk) begin
 		end
 		// a new transfer
 		if (go_sp) begin
-			// the next byte of a split transfer (write/fc/kind stand)
-			mem_req <= 1'b1; mem_size <= SZ_B;
-			mem_addr <= sp_a + {30'd0, sp_i};
-			mem_wdata <= {24'd0, sp_byte(sp_d, sp_s, sp_i)};
+			// the next piece of a split transfer (write/fc/kind stand)
+			mem_req <= 1'b1; mem_size <= sp_w ? SZ_W : SZ_B;
+			mem_addr <= sp_w ? sp_a + {29'd0, sp_i, 1'b0} : sp_a + {30'd0, sp_i};
+			mem_wdata <= sp_w ? {16'd0, sp_i[0] ? sp_d[15:0] : sp_d[31:16]} : {24'd0, sp_byte(sp_d, sp_s, sp_i)};
 		end else if (go_st) begin : g_st
 			// the store WB holds (stable until st_done), or the FIFO's oldest
 			logic [31:0] a, d; logic [1:0] z;
 			a = go_fifo ? sb_a[sb_rp] : st_addr; d = go_fifo ? sb_d[sb_rp] : st_data; z = go_fifo ? sb_s[sb_rp] : st_size;
 			mem_req <= 1'b1; kind <= K_ST; k_fifo <= go_fifo; mem_write <= 1'b1; mem_instr <= 1'b0; mem_lock <= 1'b0;
 			mem_fc <= go_fifo ? sb_f[sb_rp] : st_fc; mem_rb <= go_fifo ? sb_b[sb_rp] : st_rb;
-			if (crosses(tc_e, tc_p, a, z)) begin
-				sp_on <= 1'b1; sp_i <= 2'd0; sp_s <= z; sp_a <= a; sp_d <= d;
-				mem_addr <= a; mem_size <= SZ_B; mem_wdata <= {24'd0, sp_byte(d, z, 2'd0)};
+			if (crosses(tc_e, tc_p, a, z) || misal(a, z)) begin
+				sp_on <= 1'b1; sp_w <= wsplit(a, z); sp_i <= 2'd0; sp_s <= z; sp_a <= a; sp_d <= d;
+				mem_addr <= a;
+				if (wsplit(a, z)) begin mem_size <= SZ_W; mem_wdata <= {16'd0, d[31:16]}; end
+				else begin mem_size <= SZ_B; mem_wdata <= {24'd0, sp_byte(d, z, 2'd0)}; end
 			end else begin
 				mem_addr <= a; mem_size <= z; mem_wdata <= d;
 			end
 		end else if (go_rd) begin
 			mem_req <= 1'b1; kind <= K_RD; mem_write <= 1'b0; mem_instr <= 1'b0;
 			mem_addr <= dq_a; mem_fc <= dq_f; mem_lock <= dq_l;
-			if (crosses(tc_e, tc_p, dq_a, dq_s)) begin
-				sp_on <= 1'b1; sp_i <= 2'd0; sp_s <= dq_s; sp_a <= dq_a; sp_acc <= 24'd0;
-				mem_size <= SZ_B;
+			if (crosses(tc_e, tc_p, dq_a, dq_s) || misal(dq_a, dq_s)) begin
+				sp_on <= 1'b1; sp_w <= wsplit(dq_a, dq_s); sp_i <= 2'd0; sp_s <= dq_s; sp_a <= dq_a; sp_acc <= 24'd0;
+				mem_size <= wsplit(dq_a, dq_s) ? SZ_W : SZ_B;
 			end else mem_size <= dq_s;
 			dq_v <= 1'b0;
 		end else if (go_if) begin

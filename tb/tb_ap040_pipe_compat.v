@@ -259,12 +259,20 @@ end
 `ifndef RAS
 `define RAS 0
 `endif
+`ifndef PRECISE
+`define PRECISE 0
+`endif
+`ifndef MISPLIT
+`define MISPLIT 0
+`endif
 ap040_pipe_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
                      .AP040_POST_STORES(POST),
                      .AP040_FILL_CHANNEL(FILLCH),
                      .AP040_STORE_BUF(`STORE_BUF),
                      .AP040_FWD(`FWD),
-                     .AP040_RAS(`RAS)) dut
+                     .AP040_RAS(`RAS),
+                     .AP040_PRECISE(`PRECISE),
+                     .AP040_MISPLIT(`MISPLIT)) dut
 (
 	.clk(clk),
 	.nreset(nreset),

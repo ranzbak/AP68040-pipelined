@@ -53,7 +53,13 @@ module ap040_pipe_tg68k_compat
 	// data read path, AP040_IFP).  0: off, as before.
 	parameter AP040_FWD          = 0,
 	// findings/catchup/plan.md step 2: ID's return-address stack.  0: off.
-	parameter AP040_RAS          = 0
+	parameter AP040_RAS          = 0,
+	// findings/storebuf/plan.md stage 3: the data read path refused only by
+	// a store in EX/WB that touches the read (needs AP040_IFP).  0: by any.
+	parameter AP040_PRECISE      = 0,
+	// findings/catchup/plan.md: misaligned data transfers split into
+	// aligned pieces the cache serves.  0: bypass as before.
+	parameter AP040_MISPLIT      = 0
 )
 (
 	input         clk,
@@ -338,7 +344,9 @@ ap040_pipe_core #(
 	.DFP(IFP_ON ? 1 : 0),
 	.STORE_BUF(AP040_STORE_BUF),
 	.FWD(AP040_FWD),
-	.RAS(AP040_RAS)
+	.RAS(AP040_RAS),
+	.PRECISE(AP040_PRECISE),
+	.MISPLIT(AP040_MISPLIT)
 ) core (
 	.clk(clk),
 	.nreset(nreset),
@@ -640,13 +648,21 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 	// gives without its request port (not cache-inhibited), and the physical
 	// address in the data-cacheable window (chip RAM included: the D side is
 	// snooped).  The core adds the store-order rule.
-	reg  dfp_ok_q;
+	reg  dfp_ok_q, dfp_rok_q;
 	always @(posedge clk)
-		if (!nreset) dfp_ok_q <= 1'b0;
-		else if (ce_core) dfp_ok_q <= dfp_req && cacr_out[31] &&
-			((dfp_size == `AP040_SZ_B) ||
-			 (dfp_size == `AP040_SZ_W && !dfp_addr[0]) ||
-			 (dfp_size == `AP040_SZ_L && dfp_addr[1:0] == 2'b00));
+		if (!nreset) begin dfp_ok_q <= 1'b0; dfp_rok_q <= 1'b0; end
+		else if (ce_core) begin
+			dfp_ok_q <= dfp_req && cacr_out[31] &&
+				((dfp_size == `AP040_SZ_B) ||
+				 (dfp_size == `AP040_SZ_W && !dfp_addr[0]) ||
+				 (dfp_size == `AP040_SZ_L && dfp_addr[1:0] == 2'b00));
+			// (forwarding) any alignment, but inside one 4K page: the
+			// translation looked up is the whole read's
+			dfp_rok_q <= dfp_req && cacr_out[31] &&
+				((dfp_size == `AP040_SZ_B) ||
+				 (dfp_size == `AP040_SZ_W && dfp_addr[11:0] != 12'hFFF) ||
+				 (dfp_size == `AP040_SZ_L && dfp_addr[11:0] < 12'hFFD));
+		end
 	wire da_win =
 		((dfp_pa[31:27] == w_z3b0) && w_z3e0) ||
 		((dfp_pa[31:28] == w_z3b1) && w_z3e1) ||
@@ -656,7 +672,8 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 	assign dfp_hit = IFP_ON && dfp_ok_q && dfp_tok && !dfp_tci &&
 	                 (cache_allow_all || da_win) && dfp_thit;
 	// (forwarding) the same without the tag hit: the location is RAM
-	assign dfp_ram = IFP_ON && dfp_ok_q && dfp_tok && !dfp_tci && (cache_allow_all || da_win);
+	// (forwarding: the store supplies the bytes, so any alignment)
+	assign dfp_ram = IFP_ON && dfp_rok_q && dfp_tok && !dfp_tci && (cache_allow_all || da_win);
 
 	ap040_cache #(
 		.POST_STORES(AP040_POST_STORES),

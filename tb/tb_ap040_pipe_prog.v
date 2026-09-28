@@ -142,6 +142,9 @@ ap040_pipe_core #(
 `ifdef RAS
 	, .RAS(`RAS)
 `endif
+`ifdef MISPLIT
+	, .MISPLIT(`MISPLIT)
+`endif
 `ifdef FPU_STUB
 	, .HAS_FPU(1)
 `endif
