@@ -1,0 +1,21 @@
+# findings/catchup/plan.md: misaligned transfers split into aligned pieces.  Hand-computed.
+halt 00000488
+d0 11223344
+d1 55667788
+d2 99aabbcc
+d3 0000ddee
+d4 0f1e2d3c
+d5 4b5a6978
+d6 00000101
+d7 5566a588
+m32 00006000 ee112233
+m32 00006004 44ee5566
+m32 00006008 a588ee99
+m32 0000600c aabbccee
+m32 00006010 eeddeeee
+m32 0000601c eeee0f1e
+m32 00006020 2d3c0000
+m32 00006024 0101eeee
+m32 00006ffc eeee4b5a
+m32 00007000 6978eeee
+inimage

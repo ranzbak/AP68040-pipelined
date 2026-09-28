@@ -16,7 +16,7 @@ asm() {   # name dir -> $OUT/name.hex
 	( cd "$2" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OUT/$1.bin" "$1.s" ) &&
 	python3 "$T/bin2hex.py" "$OUT/$1.bin" "$OUT/$1.hex"
 }
-for p in sb_raw sb_order sb_serialize sb_lateberr nop_sync smc ras; do asm $p "$T/pipe_asm" || exit 1; done
+for p in sb_raw sb_order sb_serialize sb_lateberr nop_sync smc ras misplit; do asm $p "$T/pipe_asm" || exit 1; done
 asm t_sbuf_pipe "$T/cache_asm" || exit 1
 asm t_fwd_pipe "$T/cache_asm" || exit 1
 asm t_dcache_pipe "$T/cache_asm" || exit 1
@@ -131,5 +131,23 @@ run_one ras_nocheck ap040_ea_fetch.v \
 run_one ras_rtd_nopop ap040_decode.v \
 	"end else if ((d.cls == CL_RTS || d.cls == CL_RTD || d.cls == CL_RTR) && ras_n != 4'd0) begin" \
 	"end else if (d.cls == CL_RTS && ras_n != 4'd0) begin" prog ras -DRAS=1 &
+wait
+echo "== PRECISE / MISPLIT mutants (findings/catchup/plan.md)"
+# the second word of a longword at 2 mod 4 carries the first's data
+run_one mis_word ap040_pipe_bcu.v \
+	"{16'd0, sp_i[0] ? sp_d[15:0] : sp_d[31:16]}" \
+	"{16'd0, sp_d[31:16]}" prog misplit -DMISPLIT=1 &
+# WB's store is not compared with the read
+run_one pre_no_wb ap040_pipe_core.v \
+	"wire st_quiet_i = (PRECISE != 0) ? (!ex_st_iss && !wb_st_iss) : st_quiet;" \
+	"wire st_quiet_i = (PRECISE != 0) ? (!ex_st_iss) : st_quiet;" compat t_sbuf_pipe "-DPRECISE=1 -DFWD=1" &
+# no answer-clock check for a store that entered EX
+run_one pre_no_ans ap040_pipe_core.v \
+	"wire st_quiet_a = (PRECISE != 0) ? !ex_st_ans : st_quiet;" \
+	"wire st_quiet_a = (PRECISE != 0) ? 1'b1 : st_quiet;" compat t_sbuf_pipe "-DPRECISE=1 -DFWD=1" &
+# only the first longword of each access is compared
+run_one pre_lo_only ap040_pipe_core.v \
+	"return (a1[11:2] == a2[11:2]) || (a1[11:2] == e2[11:2]) || (e1[11:2] == a2[11:2]) || (e1[11:2] == e2[11:2]);" \
+	"return (a1[11:2] == a2[11:2]);" compat t_sbuf_pipe "-DPRECISE=1 -DFWD=1" &
 wait
 
