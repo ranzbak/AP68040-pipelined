@@ -70,7 +70,9 @@ module ap040_pipe_core
 	// forwarding: a read that WB's store or a posted one fully covers is
 	// answered from it the clock after the lookup, when the wrapper says the
 	// location is RAM (dfp_ram).  0: every such read waits for the store.
-	parameter         FWD                = 0
+	parameter         FWD                = 0,
+	// findings/catchup/plan.md step 2: ID's return-address stack (RTS predicted)
+	parameter         RAS                = 0
 )
 (
 	input  clk,
@@ -688,7 +690,7 @@ ap040_inst_fetch #(
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1)
 );
 
-ap040_decode #(.HAS_FPU(HAS_FPU)) u_id
+ap040_decode #(.HAS_FPU(HAS_FPU), .RAS(RAS)) u_id
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ea_stall), .flush(flush_id),
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1),

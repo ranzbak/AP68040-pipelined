@@ -143,7 +143,8 @@ typedef struct packed {
 	logic [1:0]  fcsel;        // data function code: 0 the SR's (S ? 5 : 1), 1 SFC, 2 DFC (MOVES)
 	logic [3:0]  exc_fmt;      // CL_EXC: frame format ($0, $2)
 	logic [31:0] exc_addr;     // CL_EXC format $2: the address field
-	logic [31:0] btarget;      // CL_BCC/BSR/DBCC: branch target
+	logic [31:0] btarget;      // CL_BCC/BSR/DBCC: branch target; CL_RTS with rpred: the predicted return address
+	logic        rpred;        // CL_RTS: ID redirected IF to btarget (the return-address stack's top)
 	logic [1:0]  size2;        // the destination EA's operand size (PACK/UNPK, RTR)
 	logic [4:0]  reg_c;        // a third register operand (CAS Du, DIV.L Dr, MUL.L Dh, BF offset)
 	logic [4:0]  reg_d;        // a fourth (bitfield width)

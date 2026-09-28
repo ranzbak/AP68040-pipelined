@@ -16,7 +16,7 @@ asm() {   # name dir -> $OUT/name.hex
 	( cd "$2" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OUT/$1.bin" "$1.s" ) &&
 	python3 "$T/bin2hex.py" "$OUT/$1.bin" "$OUT/$1.hex"
 }
-for p in sb_raw sb_order sb_serialize sb_lateberr nop_sync smc; do asm $p "$T/pipe_asm" || exit 1; done
+for p in sb_raw sb_order sb_serialize sb_lateberr nop_sync smc ras; do asm $p "$T/pipe_asm" || exit 1; done
 asm t_sbuf_pipe "$T/cache_asm" || exit 1
 asm t_fwd_pipe "$T/cache_asm" || exit 1
 asm t_dcache_pipe "$T/cache_asm" || exit 1
@@ -38,7 +38,7 @@ PY
 	R=$d/rtl
 	SRC="$R/ap040_pipe_pkg.sv $(ls $R/ap040_*.v | tr '\n' ' ')"
 	if [ "$b" = prog ]; then
-		iverilog -g2012 -DSTORE_BUF=1 -DBUS_MODE -I "$R" -o "$d/tb.vvp" "$T/tb_ap040_pipe_prog.v" "$T/tb_sb_check.v" $SRC > "$d/clog" 2>&1 ||
+		iverilog -g2012 -DSTORE_BUF=1 $xd -DBUS_MODE -I "$R" -o "$d/tb.vvp" "$T/tb_ap040_pipe_prog.v" "$T/tb_sb_check.v" $SRC > "$d/clog" 2>&1 ||
 			{ echo "  $n: MUTANT DOES NOT COMPILE"; return; }
 		cyc=$(sed -n 's/^; diff:.*--cycles \([0-9]*\).*/\1/p' "$T/pipe_asm/$prog.s" | head -1)
 		timeout 900 vvp "$d/tb.vvp" +prog="$OUT/$prog.hex" +expect="$T/pipe_asm/$prog.exp" +prof=1 +cycles=$(( ${cyc:-20000} * 8 )) > "$d/log" 2>&1
@@ -63,8 +63,8 @@ run_one sync_overtake ap040_pipe_bcu.v \
 	"!((DONE_REG != 0) && st_done_q);" prog sb_order &
 # (stage 2) the data read path ignores the FIFO overlap
 run_one ovl_ignored ap040_pipe_core.v \
-	"dfp_hit && !((STORE_BUF != 0) && sb_ovl);" \
-	"dfp_hit;" compat t_sbuf_pipe &
+	"dfp_hit && !((STORE_BUF != 0) && sb_ovl) && !d_rd_fwd;" \
+	"dfp_hit && !d_rd_fwd;" compat t_sbuf_pipe &
 # a serialising instruction does not wait for the FIFO
 run_one ser_nodrain ap040_pipe_core.v \
 	"wire older_busy  = eaf_valid || exe_valid || sb_busy;" \
@@ -109,6 +109,10 @@ run_one fwd_oldest ap040_pipe_bcu.v \
 run_one fwd_partial ap040_pipe_bcu.v \
 	"if (wbs_ok && wbs_fc == lk_fc && f_cov(wbs_addr, wbs_size, lk_addr, lk_size)) begin" \
 	"if (wbs_ok && wbs_fc == lk_fc && f_ovl(wbs_addr, wbs_size, lk_addr, lk_size)) begin" compat t_fwd_pipe -DFWD=1 &
+# a partial overlap with a FIFO store is forwarded
+run_one fwd_partial_fifo ap040_pipe_bcu.v \
+	"if (sb_f[fw_i] == lk_fc && f_cov(sb_a[fw_i], sb_s[fw_i], lk_addr, lk_size)) begin" \
+	"if (sb_f[fw_i] == lk_fc && f_ovl(sb_a[fw_i], sb_s[fw_i], lk_addr, lk_size)) begin" compat t_fwd_pipe -DFWD=1 &
 # any store in EX is taken for a BSR/JSR push
 run_one fwd_ex_any ap040_pipe_core.v \
 	"wire ex_push = eaf_valid && (eaf_o.cls == CL_BSR || eaf_o.cls == CL_JSR);" \
@@ -117,5 +121,15 @@ run_one fwd_ex_any ap040_pipe_core.v \
 run_one fwd_ex_late ap040_pipe_core.v \
 	"(FWD != 0) && dfp_look && dfp_fq1 && !older_store && dfp_ram && fw_ok;" \
 	"(FWD != 0) && dfp_look && dfp_fq1 && dfp_ram && fw_ok;" compat t_fwd_pipe -DFWD=1 &
+wait
+echo "== return-address stack mutants (RAS = 1; findings/catchup/plan.md step 2)"
+# EA-fetch trusts every prediction
+run_one ras_nocheck ap040_ea_fetch.v \
+	"wire        rts_ok     = (i.cls == CL_RTS) && i.rpred && (s_val_c == i.btarget);" \
+	"wire        rts_ok     = (i.cls == CL_RTS) && i.rpred;" prog ras -DRAS=1 &
+# the stack pops on RTS only, not on RTD/RTR (the stack goes out of step)
+run_one ras_rtd_nopop ap040_decode.v \
+	"end else if ((d.cls == CL_RTS || d.cls == CL_RTD || d.cls == CL_RTR) && ras_n != 4'd0) begin" \
+	"end else if (d.cls == CL_RTS && ras_n != 4'd0) begin" prog ras -DRAS=1 &
 wait
 

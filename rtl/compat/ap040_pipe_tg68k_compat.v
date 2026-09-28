@@ -51,7 +51,9 @@ module ap040_pipe_tg68k_compat
 	parameter AP040_STORE_BUF    = 0,
 	// findings/catchup/plan.md step 1: store-to-load forwarding (needs the
 	// data read path, AP040_IFP).  0: off, as before.
-	parameter AP040_FWD          = 0
+	parameter AP040_FWD          = 0,
+	// findings/catchup/plan.md step 2: ID's return-address stack.  0: off.
+	parameter AP040_RAS          = 0
 )
 (
 	input         clk,
@@ -335,7 +337,8 @@ ap040_pipe_core #(
 	.IFP(IFP_ON ? 1 : 0),
 	.DFP(IFP_ON ? 1 : 0),
 	.STORE_BUF(AP040_STORE_BUF),
-	.FWD(AP040_FWD)
+	.FWD(AP040_FWD),
+	.RAS(AP040_RAS)
 ) core (
 	.clk(clk),
 	.nreset(nreset),

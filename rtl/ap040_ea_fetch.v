@@ -2280,8 +2280,11 @@ assign halted    = (ph == P_HALT);
 // (the counter from the register file: a DBcc waits while EX writes it --
 // vdep -- so the loop test is off EX's result path, timing)
 
+// (findings/catchup/plan.md step 2) an RTS ID predicted right needs none:
+// the instructions behind it are already the return target's
+wire        rts_ok     = (i.cls == CL_RTS) && i.rpred && (s_val_c == i.btarget);
 wire        redir_now  = st.disp && st.dsel == 3'd0 && !flush &&
-                        (i.cls == CL_RTS || i.cls == CL_RTD || i.cls == CL_RTR ||
+                        ((i.cls == CL_RTS && !rts_ok) || i.cls == CL_RTD || i.cls == CL_RTR ||
                          ((i.cls == CL_JMP || i.cls == CL_JSR) && !eac_i.redirected) ||
                          ((i.cls == CL_BCC || i.cls == CL_DBCC) && !br_taken));
 wire [31:0] redir_pc_now = (i.cls == CL_RTS || i.cls == CL_RTD) ? s_val_c :

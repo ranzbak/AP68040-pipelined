@@ -297,8 +297,10 @@ function automatic logic [31:0] f_ext(input logic [31:0] d, input logic [31:0] a
                                       input logic [31:0] a2, input logic [1:0] s2);
 	logic [31:0] r; logic [2:0] n1, n2; logic [1:0] off; integer j;
 	n1 = nby(s1); n2 = nby(s2); off = a2[1:0] - a1[1:0]; r = 32'd0;
+	// (a byte outside the store reads 0: never used when the store covers
+	// the read, and no X in simulation when it does not)
 	for (j = 0; j < 4; j = j + 1)
-		if (j < n2) r[8 * (n2 - 1 - j) +: 8] = d[8 * (n1 - 1 - (off + j)) +: 8];
+		if (j < n2 && off + j < n1) r[8 * (n2 - 1 - j) +: 8] = d[8 * (n1 - 1 - (off + j)) +: 8];
 	return r;
 endfunction
 reg        fw_hit;

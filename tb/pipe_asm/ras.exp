@@ -1,0 +1,8 @@
+# findings/catchup/plan.md step 2: every return lands right, predicted or not.
+# Hand-computed: bits 1-7 of $7000 = the seven cases.
+halt 00000496
+m32 00007000 000000fe
+d0 00000000
+d5 0000004e
+d6 00000066
+isp 00001f00

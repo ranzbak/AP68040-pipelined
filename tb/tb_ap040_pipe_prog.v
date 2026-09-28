@@ -139,6 +139,9 @@ ap040_pipe_core #(
 `ifdef STORE_BUF
 	, .STORE_BUF(`STORE_BUF)
 `endif
+`ifdef RAS
+	, .RAS(`RAS)
+`endif
 `ifdef FPU_STUB
 	, .HAS_FPU(1)
 `endif

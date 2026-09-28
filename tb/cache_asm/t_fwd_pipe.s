@@ -14,7 +14,11 @@
 ;      a younger byte into it (partial), then the longword; a byte into a
 ;      word, then the word
 ;   5  store A, store B, read A: the older store answers
-;   6  1-5 again with translation on (4K pages, identity except logical
+;   7  an older longword store A, a younger overlapping store B, 0..5 ALU
+;      instructions, the read: a longword B (the read sees B, never A) and
+;      a word B into A's longword (a partial overlap with the youngest
+;      store: the read merges, never takes A or B alone)
+;   6  1-5 and 7 again with translation on (4K pages, identity except logical
 ;      page 2 -> physical $4000, t_dcache_pipe's tables), and a store/read
 ;      pair through the remapped page
 
@@ -103,6 +107,22 @@ again:
 	beq.s	.c5
 	failt	5
 .c5:
+; 7: an older store forwardable, a younger overlapping one in flight
+	moveq	#5,d5
+.l7:	lea	sh7,a4
+	move.l	d5,d2
+	lsl.l	#2,d2
+	move.l	(a4,d2.l),a4
+	lea	X+32,a2
+	jsr	(a4)			; d0 = the long read after A then long B, d1 = after A then word B
+	cmp.l	#$bbbbbbbb,d0
+	beq.s	.c7a
+	failt	7
+.c7a:	cmp.l	#$aaaabbbb,d1
+	beq.s	.c7b
+	failt	17
+.c7b:	dbra	d5,.l7
+
 	tst.b	d6
 	bne	.c6b
 ; 6: translation on, then all of it again
@@ -176,6 +196,38 @@ c7:	addq.l	#1,d0
 	rts
 c8:	addq.l	#1,d0
 	rts
+
+; case 7's shapes: \1 ALU instructions between the younger store B and
+; the read, so B is in EX, WB or the FIFO when the read looks up
+SH7	macro
+	move.l	d3,16(a2)		; three stores fill the FIFO,
+	move.l	d3,20(a2)		; so B waits in it
+	move.l	d3,24(a2)
+	move.l	#$aaaaaaaa,(a2)
+	move.l	#$bbbbbbbb,(a2)
+	rept	\1
+	add.l	d3,d3
+	endr
+	move.l	(a2),d0
+	move.l	d3,16(a2)
+	move.l	d3,20(a2)
+	move.l	d3,24(a2)
+	move.l	#$aaaaaaaa,4(a2)
+	move.w	#$bbbb,6(a2)
+	rept	\1
+	add.l	d3,d3
+	endr
+	move.l	4(a2),d1
+	rts
+	endm
+	cnop	0,4
+sh7:	dc.l	k0,k1,k2,k3,k4,k5
+k0:	SH7	0
+k1:	SH7	1
+k2:	SH7	2
+k3:	SH7	3
+k4:	SH7	4
+k5:	SH7	5
 
 ; case 2's shapes: store $a1b2c3d4 at X (a2), \1 ALU instructions, then
 ; the four bytes (summed: $a1+$b2+$c3+$d4 = $02ea), both words and the

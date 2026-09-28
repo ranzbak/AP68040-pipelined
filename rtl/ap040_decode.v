@@ -35,7 +35,13 @@ module ap040_decode
 	import ap040_pipe_pkg::*;
 #(
 	// 1: a full MC68040 with the FPU.  0 (the LC040 build): every well-formed
-	parameter HAS_FPU = 0
+	parameter HAS_FPU = 0,
+	// findings/catchup/plan.md step 2: an 8-entry return-address stack.
+	// BSR/JSR push their return address when ID emits them, RTS/RTD/RTR
+	// pop; an RTS popping an entry redirects IF to it, as a guessed-taken
+	// Bcc does, and carries it (btarget, rpred) for EA-fetch to check.  A
+	// push or pop on a path later flushed only costs a misprediction.
+	parameter RAS = 0
 )
 (
 	input             clk,
@@ -1638,9 +1644,33 @@ assign consume = (flush || stall_in) ? 2'd0 :
 assign consume_nf = stall_in ? 2'd0 :
                     fbad ? avail : complete ? need[1:0] : avail;
 
-// guess taken: Bcc/BRA/BSR redirect IF the clock they are emitted
-assign id_redirect_valid = emit && (d.cls == CL_BCC || d.cls == CL_BSR || d.cls == CL_DBCC);
-assign id_redirect_pc    = d.btarget;
+// the return-address stack (RAS)
+reg  [31:0] ras [0:7];
+reg   [2:0] ras_sp;          // the next free entry
+reg   [3:0] ras_n;           // entries held (0..8)
+wire [31:0] ras_top = ras[ras_sp - 3'd1];
+wire        ras_hit = (RAS != 0) && (d.cls == CL_RTS) && (ras_n != 4'd0);
+id_t d_ras;
+always @* begin
+	d_ras = d;
+	d_ras.rpred = ras_hit;
+	if (ras_hit) d_ras.btarget = ras_top;
+end
+always @(posedge clk)
+	if (!nreset) begin ras_sp <= 3'd0; ras_n <= 4'd0; end
+	else if (ce && emit && RAS != 0) begin
+		if (d.cls == CL_BSR || d.cls == CL_JSR) begin
+			ras[ras_sp] <= d.next_pc; ras_sp <= ras_sp + 3'd1;
+			if (ras_n != 4'd8) ras_n <= ras_n + 4'd1;
+		end else if ((d.cls == CL_RTS || d.cls == CL_RTD || d.cls == CL_RTR) && ras_n != 4'd0) begin
+			ras_sp <= ras_sp - 3'd1; ras_n <= ras_n - 4'd1;
+		end
+	end
+
+// guess taken: Bcc/BRA/BSR redirect IF the clock they are emitted; so does
+// an RTS the return-address stack predicts
+assign id_redirect_valid = emit && (d.cls == CL_BCC || d.cls == CL_BSR || d.cls == CL_DBCC || ras_hit);
+assign id_redirect_pc    = d_ras.btarget;
 
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -1658,7 +1688,7 @@ always @(posedge clk) begin
 		end else if (!stall_in) begin
 			if (done_i) begin
 				id_valid <= 1'b1;
-				id_o     <= d;
+				id_o     <= d_ras;
 				wcnt     <= 4'd0;
 				werr     <= 11'd0;
 			end else begin

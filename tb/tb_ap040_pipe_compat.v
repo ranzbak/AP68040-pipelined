@@ -256,11 +256,15 @@ end
 `ifndef FWD
 `define FWD 0
 `endif
+`ifndef RAS
+`define RAS 0
+`endif
 ap040_pipe_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
                      .AP040_POST_STORES(POST),
                      .AP040_FILL_CHANNEL(FILLCH),
                      .AP040_STORE_BUF(`STORE_BUF),
-                     .AP040_FWD(`FWD)) dut
+                     .AP040_FWD(`FWD),
+                     .AP040_RAS(`RAS)) dut
 (
 	.clk(clk),
 	.nreset(nreset),
