@@ -1215,6 +1215,9 @@ tb_sb_check u_sbc
 	      dut.core.g_bus.u_bcu.k_fifo && dut.core.g_bus.u_bcu.sp_fin),
 	.bf_a(dut.core.g_bus.u_bcu.sp_on ? dut.core.g_bus.u_bcu.sp_a : dut.core.g_bus.u_bcu.mem_addr),
 	.bf_s(dut.core.g_bus.u_bcu.sp_on ? dut.core.g_bus.u_bcu.sp_s : dut.core.g_bus.u_bcu.mem_size),
+	.sf_v(dut.core.g_bus.u_bcu.done && dut.core.g_bus.u_bcu.kind == 2'd0 && dut.core.g_bus.u_bcu.mem_flt &&
+	      !dut.core.g_bus.u_bcu.k_fifo && dut.core.g_bus.u_bcu.sp_on),
+	.sf_n(dut.core.g_bus.u_bcu.sp_i),
 	.br_v(dut.core.g_bus.u_bcu.go_rd), .br_a(dut.core.g_bus.u_bcu.dq_a),
 	.fr_v(dut.core.g_bus.u_bcu.rd_fast && dut.core.g_bus.u_bcu.dq_v),
 	.fr_a(dut.core.g_bus.u_bcu.dq_a), .fr_s(dut.core.g_bus.u_bcu.dq_s),

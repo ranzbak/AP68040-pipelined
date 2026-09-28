@@ -628,6 +628,7 @@ end else begin : g_bus
 		.clk(clk), .nreset(nreset), .ce(ce),
 		.st_v(STORE_POST ? (ce && retire && exe_o.st_v) : (exe_valid && exe_o.st_v && !wb_post)),
 		.sp_v(ce && retire && exe_o.st_v && wb_post),
+		.sp_wait(exe_valid && exe_o.st_v && wb_post),
 		.st_addr(exe_o.st_addr), .st_size(exe_o.st_size),
 		.st_data(exe_o.st_data), .st_fc(exe_o.st_fc), .st_rb(exe_o.st_rb), .mem_rb(),
 		.sb_full(sb_full), .sb_busy(sb_busy), .st_done(st_done), .st_ferr(st_ferr), .st_fatc(st_fatc), .st_fma(st_fma),

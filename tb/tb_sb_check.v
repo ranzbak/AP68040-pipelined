@@ -12,7 +12,10 @@
 // They must be the same sequence: a posted store is written after it      //
 // retires, a synchronous one before, but never out of order, never twice, //
 // never lost.  A POSTED store that bus-errors (bf_v, fatal) is dropped    //
-// from the program stream unwritten.                                       //
+// from the program stream unwritten.  A SYNCHRONOUS store split at a page  //
+// boundary (translation on) that faults on a later byte has written its   //
+// earlier bytes but never retires (the instruction restarts or completes  //
+// through WB1): sf_v drops those sf_n bytes from the bus stream.           //
 //                                                                          //
 // Two read rules, at the clock the read goes:                              //
 //   br_v  a read on the port (the slow path, which may be I/O): no retired //
@@ -54,6 +57,9 @@ module tb_sb_check #(parameter QN = 4096)
 	input         bf_v,
 	input  [31:0] bf_a,
 	input   [1:0] bf_s,
+	// a synchronous split store faulted after sf_n of its bytes were written
+	input         sf_v,
+	input   [1:0] sf_n,
 	// a read goes on the port / is answered by the data read path
 	input         br_v,
 	input  [31:0] br_a,
@@ -147,6 +153,10 @@ always @(posedge clk) begin
 				if (bt == bh && ph < pt && pa[ph % QN] == bf_a + k) begin ph = ph + 1; n_lost = n_lost + 1; end
 				else complain("faulted posted store is not the oldest unwritten one", bf_a + k);
 		end
+		if (sf_v)
+			for (k = 0; k < sf_n; k = k + 1)
+				if (bt > bh) bt = bt - 1;
+				else complain("faulted split store's bytes already matched", bw_a);
 		while (ph < pt && bh < bt) begin
 			if (pa[ph % QN] !== ba[bh % QN] || pd[ph % QN] !== bd[bh % QN]) begin
 				bad = bad + 1;

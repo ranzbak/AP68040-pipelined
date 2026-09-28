@@ -333,6 +333,9 @@ tb_sb_check u_sbc
 	      dut.g_bus.u_bcu.sp_fin),
 	.bf_a(dut.g_bus.u_bcu.sp_on ? dut.g_bus.u_bcu.sp_a : mem_addr),
 	.bf_s(dut.g_bus.u_bcu.sp_on ? dut.g_bus.u_bcu.sp_s : mem_size),
+	.sf_v(dut.g_bus.u_bcu.done && dut.g_bus.u_bcu.kind == 2'd0 && m_flt && !dut.g_bus.u_bcu.k_fifo &&
+	      dut.g_bus.u_bcu.sp_on),
+	.sf_n(dut.g_bus.u_bcu.sp_i),
 	.br_v(dut.g_bus.u_bcu.go_rd), .br_a(dut.g_bus.u_bcu.dq_a),
 	.fr_v(dut.g_bus.u_bcu.rd_fast && dut.g_bus.u_bcu.dq_v), .fr_a(dut.g_bus.u_bcu.dq_a), .fr_s(dut.g_bus.u_bcu.dq_s),
 	.occ_n(dut.g_bus.u_bcu.sb_cnt),

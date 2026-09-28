@@ -77,6 +77,7 @@ module ap040_pipe_bcu
 	input       [2:0] st_fc,
 	input             st_rb,      // (a CAS/CAS2 locked write-back: carried to mem_rb for the benches)
 	input             sp_v,       // (MIX) WB posts its store this enabled clock (st_* as for st_v)
+	input             sp_wait,    // (MIX) WB holds a store it will post (in the FIFO from the next clock)
 	output            sb_full,    // WB must hold a store (POST = 1)
 	output            st_done,    // (POST = 0) WB's store completes this clock ...
 	output            st_ferr,    // ... with an access error
@@ -188,7 +189,10 @@ wire go_st   = go_fifo || go_sync;
 // may be sending the older instruction's store to EX in that same clock
 // (an early read), and older_st sees it only once it is there.
 wire go_rd   = idle && !sp_on && (sb_cnt == 0) && !st_v && !older_st && dq_v && !rd_fast;
-wire go_if   = idle && !sp_on && !go_st && !go_rd && f_req;
+// (MIX) nor while WB holds a store it posts: it is older than any fetch,
+// and a refetch after self-modifying code (WB's wb_smc, in that very
+// clock) must not read the code before the store lands (smc.s)
+wire go_if   = idle && !sp_on && !go_st && !go_rd && f_req && !(MIX && sp_wait);
 assign f_gnt = go_if;
 
 wire done    = mem_req && (mem_ack || mem_flt);

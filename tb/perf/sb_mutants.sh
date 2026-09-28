@@ -16,7 +16,7 @@ asm() {   # name dir -> $OUT/name.hex
 	( cd "$2" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OUT/$1.bin" "$1.s" ) &&
 	python3 "$T/bin2hex.py" "$OUT/$1.bin" "$OUT/$1.hex"
 }
-for p in sb_raw sb_order sb_serialize sb_lateberr nop_sync; do asm $p "$T/pipe_asm" || exit 1; done
+for p in sb_raw sb_order sb_serialize sb_lateberr nop_sync smc; do asm $p "$T/pipe_asm" || exit 1; done
 asm t_sbuf_pipe "$T/cache_asm" || exit 1
 asm t_dcache_pipe "$T/cache_asm" || exit 1
 python3 "$T/mk_tmmu.py" "$AP040_REF/tb/asm/t_mmu.s" m9s > "$OUT/t_mmu_m9s.s" &&
@@ -90,6 +90,10 @@ run_one inv_gate ap040_cache.v \
 	"!store_inv_lost && !winv_pend && (cst != C_WINV);" \
 	"1'b1;" compat t_sbuf_pipe &
 wait
+# a fetch goes while WB holds a store it posts (the SMC refetch reads old code)
+run_one fetch_past_wb ap040_pipe_bcu.v \
+	"f_req && !(MIX && sp_wait);" \
+	"f_req;" prog smc &
 # the FIFO drains its NEWEST entry
 run_one fifo_lifo ap040_pipe_bcu.v \
 	"a = go_fifo ? sb_a[sb_rp] : st_addr;" \
