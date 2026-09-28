@@ -31,6 +31,7 @@ void *memcpy(void *d, const void *s, unsigned long n)
 	while (n--) *dd++ = *ss++;
 	return d;
 }
+#ifndef NO_MAIN
 #define REG16(a) (*(volatile unsigned short *)(a))
 extern void cache_on(void);
 int main(void)
@@ -44,3 +45,4 @@ int main(void)
 	REG16(0xF102) = 0x600D;
 	for (;;) ;
 }
+#endif

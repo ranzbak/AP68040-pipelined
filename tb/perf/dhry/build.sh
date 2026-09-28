@@ -15,4 +15,9 @@ m68k-linux-gnu-gcc -m68000 -c -o crt0.o crt0.S
 m68k-linux-gnu-gcc -m68000 -nostdlib -static -T dhry.ld -o dhry.elf crt0.o dhry_harness.o dhry_1.o dhry_2.o -lgcc
 m68k-linux-gnu-objcopy -O binary dhry.elf $OUT
 m68k-linux-gnu-objdump -d dhry.elf > dhry.lst
+# the SoC bench's variant: linked at \$41000000, entered at soc_main (first)
+m68k-linux-gnu-gcc \$F -DNO_MAIN -c -o dhry_lib.o dhry_harness.c
+m68k-linux-gnu-gcc \$F -DNRUNS=${SOCN:-10} -ffunction-sections -c -o dhry_soc.o dhry_soc.c
+m68k-linux-gnu-gcc -m68000 -nostdlib -static -T dhry_soc.ld -o dhry_soc.elf dhry_soc.o dhry_lib.o dhry_1.o dhry_2.o -lgcc
+m68k-linux-gnu-objcopy -O binary dhry_soc.elf dhry_soc.bin
 rm -f *.o"

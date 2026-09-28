@@ -1,3 +1,4 @@
 dhry.elf
 dhry.lst
 *.o
+dhry_soc.elf
