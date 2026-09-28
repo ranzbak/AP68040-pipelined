@@ -341,6 +341,9 @@ reg        done = 0;
 // "halted": the program must end in a double fault (the core halts,
 // M68040UM 7.6.3), not at the halt label
 reg want_halt = 0;
+// "maxclk <n>": the program must halt within n clocks -- a performance
+// regression test (a cycle budget the core has been measured to meet)
+integer max_clk = 0;
 always @(posedge clk)
 	if (nreset && ((dbg_wb_valid && dbg_wb_pc == halt_pc && !want_halt) || (want_halt && dut.dbg_halted))) done = 1;
 
@@ -486,6 +489,7 @@ initial begin
 			else if (key == "readonce") begin rc = $fscanf(fd, "%h", a); ro_at[n_ro] = a; ro_n[n_ro] = 0; n_ro = n_ro + 1; end
 			else if (key == "rbcount") rc = $fscanf(fd, "%d", want_rb);
 			else if (key == "halted") want_halt = 1;
+			else if (key == "maxclk") rc = $fscanf(fd, "%d", max_clk);
 			else if (key == "syncpc") begin rc = $fscanf(fd, "%h", a); sync_at[n_sync] = a; n_sync = n_sync + 1; end
 			else if (key == "berr") begin
 				rc = $fscanf(fd, "%h %s", a, key);
@@ -523,6 +527,7 @@ initial begin
 		else if (key == "readonce") rc = $fscanf(fd, "%h", v);
 		else if (key == "rbcount") rc = $fscanf(fd, "%d", v);
 		else if (key == "halted") ;
+		else if (key == "maxclk") rc = $fscanf(fd, "%d", v);
 		else if (key == "syncpc") rc = $fscanf(fd, "%h", v);
 		else if (key == "berr") rc = $fscanf(fd, "%h %s", v, key);
 		else if (key == "fc") rc = $fscanf(fd, "%h %d", a, v);
@@ -605,6 +610,10 @@ initial begin
 	if (want_rb >= 0 && n_rb != want_rb) begin
 		errors = errors + 1;
 		$display("FAIL: %0d locked write-backs, expected %0d", n_rb, want_rb);
+	end
+	if (max_clk != 0 && cycles > max_clk) begin
+		$display("FAIL: halted after %0d clocks, over the budget of %0d (maxclk)", cycles, max_clk);
+		errors = errors + 1;
 	end
 	if (errors == 0) $display("ALL TESTS PASSED (%0d checks, halt after %0d clocks)", nchk, cycles);
 	else $display("%0d CHECK(S) FAILED", errors);

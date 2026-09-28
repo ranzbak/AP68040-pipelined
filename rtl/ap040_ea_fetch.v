@@ -1776,9 +1776,13 @@ wire        fp_blast = (fp_k == fp_beats - 2'd1);
 wire        fp_need_res = fp_gen && (i.ext[15:13] == 3'b011);
 // (M10.2) a control-register move sends the unit no command, so what stands
 // in for the interlock is `every selected register has been transferred`
+// (perf 2026-09-28) released on the unit's `accepted` in the clock it rises,
+// not on its latched copy a clock later: one clock off every FP instruction
+// that is not a store.  The exception check below takes the raw exc_req the
+// same way, so a trap raised with `accepted` still wins over the release.
 wire        fp_ok  = fp_cnd ? fp_crd :
                      (fp_cr || fp_mvm || fp_sv || fp_rs) ? fp_crd
-                                       : (fp_live && (fp_dn || (fp_acc && !fp_need_res)));
+                                       : (fp_live && (fp_dn || ((fp_acc || fp_accepted) && !fp_need_res)));
 function automatic ex_t fpu_uop(input ex_t x0, input logic [31:0] rv);
 	ex_t y;
 	y = x0; y.c = rv;
@@ -2094,7 +2098,8 @@ wire stp_t st_i = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, 
                                      (fp_mvm || fp_sv || fp_scc) ? (fp_crd && fp_k == 2'd3) : (fp_k == fp_beats),
                                      fp_ok, fp_mem_dst,
                                      (HAS_FPU != 0) && fp_pend && !fp_pex, fp_pvec, i.pc,
-                                     (HAS_FPU != 0) && fp_ae, fp_avec, fp_need_res,
+                                     (HAS_FPU != 0) && (fp_ae || (fp_live && fp_exc_req)),
+                                     fp_ae ? fp_avec : fp_exc_vec, fp_need_res,
                                      (HAS_FPU != 0) && fp_fmte,
                                      (HAS_FPU != 0) && fp_bsun_go && (ph == P_FPU) && !fp_crd,
                                      (HAS_FPU != 0) && fp_trapcc && fp_ctk && !fp_bsun_go),
