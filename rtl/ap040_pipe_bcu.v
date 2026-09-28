@@ -62,7 +62,14 @@ module ap040_pipe_bcu
 	// are older).  The core posts only stores that cannot fault (RAM window,
 	// translation off); a bus error on one is fatal (st_err).  0: the FIFO
 	// is never used and everything is as before, clock for clock.
-	parameter MIX = 0
+	parameter MIX = 0,
+	// findings/catchup/plan.md step 1: store-to-load forwarding.  1: at the
+	// data read path's lookup, the read is compared with WB's store and the
+	// FIFO's, youngest first; if the youngest one it overlaps covers it
+	// whole (same FC, not a locked write), fw_ok says so the next clock
+	// with the read's value in fw_data, and the core may answer the slot
+	// from it (rd_fwd) instead of waiting for the store to reach memory.
+	parameter FWD = 0
 )
 (
 	input             clk,
@@ -93,6 +100,24 @@ module ap040_pipe_bcu
 	input       [1:0] lk_size,
 	output reg        sb_ovl,
 	output            k_fifo_o,   // (MIX) the store on the port is the FIFO's
+	// (FWD) forwarding: the lookup's function code, WB's store as it stands
+	// (wbs_ok: one a read may take its bytes from), the verdict, the answer
+	input       [2:0] lk_fc,
+	// EX's BSR/JSR push (the youngest store; its address and data are EX's
+	// input register, not ALU output): a return address the RTS reads
+	input             exs_v,
+	input      [31:0] exs_addr,
+	input      [31:0] exs_data,
+	input       [2:0] exs_fc,
+	input             wbs_v,
+	input             wbs_ok,
+	input      [31:0] wbs_addr,
+	input       [1:0] wbs_size,
+	input      [31:0] wbs_data,
+	input       [2:0] wbs_fc,
+	output reg        fw_ok,
+	output reg [31:0] fw_data,
+	input             rd_fwd,
 
 	// data reads (EA-fetch)
 	input             rd_req,
@@ -188,7 +213,7 @@ wire go_st   = go_fifo || go_sync;
 // A read goes from the slot, never in the clock it is requested: EA-fetch
 // may be sending the older instruction's store to EX in that same clock
 // (an early read), and older_st sees it only once it is there.
-wire go_rd   = idle && !sp_on && (sb_cnt == 0) && !st_v && !older_st && dq_v && !rd_fast;
+wire go_rd   = idle && !sp_on && (sb_cnt == 0) && !st_v && !older_st && dq_v && !rd_fast && !rd_fwd;
 // (MIX) nor while WB holds a store it posts: it is older than any fetch,
 // and a refetch after self-modifying code (WB's wb_smc, in that very
 // clock) must not read the code before the store lands (smc.s)
@@ -253,6 +278,62 @@ always @* begin
 			lk_hit = 1'b1;
 end
 
+// (FWD) byte ranges: does [a2, a2+n2) meet [a1, a1+n1), does it lie inside
+// it, and the read's value taken out of the store's bytes (right-aligned)
+function automatic logic [2:0] nby(input logic [1:0] sz);
+	return (sz == SZ_L) ? 3'd4 : (sz == SZ_W) ? 3'd2 : 3'd1;
+endfunction
+function automatic logic f_ovl(input logic [31:0] a1, input logic [1:0] s1, input logic [31:0] a2, input logic [1:0] s2);
+	logic [32:0] e1, e2;
+	e1 = {1'b0, a1} + nby(s1); e2 = {1'b0, a2} + nby(s2);
+	return ({1'b0, a2} < e1) && ({1'b0, a1} < e2);
+endfunction
+function automatic logic f_cov(input logic [31:0] a1, input logic [1:0] s1, input logic [31:0] a2, input logic [1:0] s2);
+	logic [32:0] e1, e2;
+	e1 = {1'b0, a1} + nby(s1); e2 = {1'b0, a2} + nby(s2);
+	return (a2 >= a1) && (e2 <= e1);
+endfunction
+function automatic logic [31:0] f_ext(input logic [31:0] d, input logic [31:0] a1, input logic [1:0] s1,
+                                      input logic [31:0] a2, input logic [1:0] s2);
+	logic [31:0] r; logic [2:0] n1, n2; logic [1:0] off; integer j;
+	n1 = nby(s1); n2 = nby(s2); off = a2[1:0] - a1[1:0]; r = 32'd0;
+	for (j = 0; j < 4; j = j + 1)
+		if (j < n2) r[8 * (n2 - 1 - j) +: 8] = d[8 * (n1 - 1 - (off + j)) +: 8];
+	return r;
+endfunction
+reg        fw_hit;
+reg [31:0] fw_d;
+reg        fw_done;
+reg [PW-1:0] fw_i;
+integer    qq;
+always @* begin
+	fw_hit = 1'b0; fw_d = 32'd0; fw_done = 1'b0; fw_i = '0;
+	// EX's push is the youngest
+	if (exs_v && f_ovl(exs_addr, SZ_L, lk_addr, lk_size)) begin
+		fw_done = 1'b1;
+		if (exs_fc == lk_fc && f_cov(exs_addr, SZ_L, lk_addr, lk_size)) begin
+			fw_hit = 1'b1; fw_d = f_ext(exs_data, exs_addr, SZ_L, lk_addr, lk_size);
+		end
+	end
+	// then WB's store
+	if (!fw_done && wbs_v && f_ovl(wbs_addr, wbs_size, lk_addr, lk_size)) begin
+		fw_done = 1'b1;
+		if (wbs_ok && wbs_fc == lk_fc && f_cov(wbs_addr, wbs_size, lk_addr, lk_size)) begin
+			fw_hit = 1'b1; fw_d = f_ext(wbs_data, wbs_addr, wbs_size, lk_addr, lk_size);
+		end
+	end
+	// then the FIFO, newest entry first
+	for (qq = 1; qq <= SB_N; qq = qq + 1) begin
+		fw_i = sb_wp - qq[PW-1:0];
+		if (!fw_done && sb_vld[fw_i] && f_ovl(sb_a[fw_i], sb_s[fw_i], lk_addr, lk_size)) begin
+			fw_done = 1'b1;
+			if (sb_f[fw_i] == lk_fc && f_cov(sb_a[fw_i], sb_s[fw_i], lk_addr, lk_size)) begin
+				fw_hit = 1'b1; fw_d = f_ext(sb_d[fw_i], sb_a[fw_i], sb_s[fw_i], lk_addr, lk_size);
+			end
+		end
+	end
+end
+
 integer k;
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -268,7 +349,7 @@ always @(posedge clk) begin
 			sb_a[k] <= 32'd0; sb_d[k] <= 32'd0; sb_s[k] <= SZ_L; sb_f[k] <= 3'd5; sb_b[k] <= 1'b0;
 			sb_vld[k] <= 1'b0; sb_lo[k] <= 10'd0; sb_hi[k] <= 10'd0;
 		end
-		sb_ovl <= 1'b0;
+		sb_ovl <= 1'b0; fw_ok <= 1'b0; fw_data <= 32'd0;
 		mem_rb <= 1'b0;
 		sp_on <= 1'b0; sp_i <= 2'd0; sp_s <= SZ_L; sp_a <= 32'd0; sp_d <= 32'd0; sp_acc <= 24'd0;
 	end else if (ce) begin
@@ -278,6 +359,7 @@ always @(posedge clk) begin
 		// WB in this clock, and the core's st_quiet refuses the fast answer
 		// for that)
 		if (lk_v) sb_ovl <= MIX && lk_hit;
+		if (lk_v) begin fw_ok <= (FWD != 0) && fw_hit; fw_data <= fw_d; end
 		// a store committed by WB (posted)
 		if ((POST && st_v) || (MIX && sp_v)) begin
 			sb_vld[sb_wp] <= 1'b1; sb_lo[sb_wp] <= st_addr[11:2]; sb_hi[sb_wp] <= lw_last(st_addr, st_size);
@@ -291,9 +373,9 @@ always @(posedge clk) begin
 		// a data read request waits in the slot
 		if (rd_req) begin dq_v <= 1'b1; dq_a <= rd_addr; dq_s <= rd_size; dq_f <= rd_fc; dq_l <= rd_lk; end
 		// ... unless the data read path answers it (M14 step 3)
-		if (rd_fast && dq_v) begin
+		if ((rd_fast || rd_fwd) && dq_v) begin
 			dq_v <= 1'b0;
-			rd_ack <= 1'b1; rd_data <= rd_fast_data;
+			rd_ack <= 1'b1; rd_data <= rd_fwd ? fw_data : rd_fast_data;
 			rd_err <= 1'b0; rd_atc <= 1'b0; rd_ma <= 1'b0;
 		end
 		// completion

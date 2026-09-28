@@ -65,7 +65,12 @@ module ap040_pipe_core
 	// the BCU's FIFO and WB moves on; every other store stays synchronous.
 	// 2 the same hardware with posting never chosen (the A/B reference: it
 	// must be clock-identical to 0).  0 synchronous stores only, as before.
-	parameter         STORE_BUF          = 0
+	parameter         STORE_BUF          = 0,
+	// (BUS = 1, DFP = 1; findings/catchup/plan.md step 1) store-to-load
+	// forwarding: a read that WB's store or a posted one fully covers is
+	// answered from it the clock after the lookup, when the wrapper says the
+	// location is RAM (dfp_ram).  0: every such read waits for the store.
+	parameter         FWD                = 0
 )
 (
 	input  clk,
@@ -231,6 +236,7 @@ module ap040_pipe_core
 	output  [1:0] dfp_size,
 	output  [2:0] dfp_fc,
 	input         dfp_hit,
+	input         dfp_ram,       // (FWD) the looked-up read's location is RAM (dfp_hit without the tag hit)
 	input  [31:0] dfp_data
 );
 
@@ -530,14 +536,25 @@ end else begin : g_bus
 	// (sb_ovl, a register the next clock).  A synchronous store on the port
 	// blocks every read, as before.
 	wire sb_ovl, sb_kfifo;
+	wire d_rd_fwd, fw_ok;
+	// EX holds a BSR/JSR: its store is the push (execute.v's CL_BSR/CL_JSR
+	// arm sets its address, data and size whatever the micro-op carries)
+	wire ex_push = eaf_valid && (eaf_o.cls == CL_BSR || eaf_o.cls == CL_JSR);
+	wire [31:0] fw_data;
 	wire st_quiet = !(older_store || (exe_valid && exe_o.st_v)) &&
 	                !(mem_req && mem_write && !((STORE_BUF != 0) && sb_kfifo));
 	if (DFP != 0) begin : g_dfp
-		reg dfp_look, dfp_q1;
+		reg dfp_look, dfp_q1, dfp_fq1;
 		always @(posedge clk)
-			if (!nreset) begin dfp_look <= 1'b0; dfp_q1 <= 1'b0; end
-			else if (ce) begin dfp_look <= d_rd_req; dfp_q1 <= st_quiet; end
-		assign d_rd_fast = dfp_look && dfp_q1 && st_quiet && dfp_hit && !((STORE_BUF != 0) && sb_ovl);
+			if (!nreset) begin dfp_look <= 1'b0; dfp_q1 <= 1'b0; dfp_fq1 <= 1'b0; end
+			else if (ce) begin dfp_look <= d_rd_req; dfp_q1 <= st_quiet; dfp_fq1 <= !older_store || ex_push; end
+		// (FWD) forwarded: no store in EX in the answer clock (one entering
+		// EX in the issue clock is seen only now), and none in the issue
+		// clock but a BSR/JSR push (its data is EX's input register, not ALU
+		// output); that push, WB's store and the FIFO's were compared at the
+		// lookup (fw_ok)
+		assign d_rd_fwd  = (FWD != 0) && dfp_look && dfp_fq1 && !older_store && dfp_ram && fw_ok;
+		assign d_rd_fast = dfp_look && dfp_q1 && st_quiet && dfp_hit && !((STORE_BUF != 0) && sb_ovl) && !d_rd_fwd;
 		// a locked RMW's read never takes the fast path: it goes out of the
 		// BCU with mem_lock, where the MMU checks write protection on it
 		assign dfp_req  = d_rd_req && ce && !d_rd_lk;
@@ -546,11 +563,12 @@ end else begin : g_bus
 		assign dfp_fc   = d_rd_fc;
 	end else begin : g_nodfp
 		assign d_rd_fast = 1'b0;
+		assign d_rd_fwd  = 1'b0;
 		assign dfp_req  = 1'b0;
 		assign dfp_addr = 32'd0;
 		assign dfp_size = 2'd0;
 		assign dfp_fc   = 3'd0;
-		wire unused_dfp = dfp_hit | st_quiet | sb_ovl;
+		wire unused_dfp = dfp_hit | st_quiet | sb_ovl | dfp_ram | fw_ok | (|fw_data);
 	end
 
 	// The BCU's fetch slot (b_f_*): IF's own request with IFP = 0; with
@@ -623,7 +641,8 @@ end else begin : g_bus
 		assign ifp_s    = 1'b0;
 		wire unused_ifp = ifp_hit | ifp_try | (|ifp_data);
 	end
-	ap040_pipe_bcu #(.POST(STORE_POST), .DONE_REG(STDONE_REG), .MIX((STORE_POST == 0 && STORE_BUF != 0) ? 1 : 0)) u_bcu
+	ap040_pipe_bcu #(.POST(STORE_POST), .DONE_REG(STDONE_REG), .MIX((STORE_POST == 0 && STORE_BUF != 0) ? 1 : 0),
+	                 .FWD((DFP != 0) ? FWD : 0)) u_bcu
 	(
 		.clk(clk), .nreset(nreset), .ce(ce),
 		.st_v(STORE_POST ? (ce && retire && exe_o.st_v) : (exe_valid && exe_o.st_v && !wb_post)),
@@ -634,6 +653,10 @@ end else begin : g_bus
 		.sb_full(sb_full), .sb_busy(sb_busy), .st_done(st_done), .st_ferr(st_ferr), .st_fatc(st_fatc), .st_fma(st_fma),
 		.older_st(older_store || (exe_valid && exe_o.st_v)),   // (registered state only: timing)
 		.lk_v(ce && d_rd_req), .lk_addr(d_rd_addr), .lk_size(d_rd_size), .sb_ovl(sb_ovl), .k_fifo_o(sb_kfifo),
+		.lk_fc(d_rd_fc), .exs_v(ex_push), .exs_addr(eaf_o.daddr), .exs_data(eaf_o.next_pc), .exs_fc(eaf_o.st_fc),
+		.wbs_v(exe_valid && exe_o.st_v), .wbs_ok(!exe_o.stf.lk),
+		.wbs_addr(exe_o.st_addr), .wbs_size(exe_o.st_size), .wbs_data(exe_o.st_data), .wbs_fc(exe_o.st_fc),
+		.fw_ok(fw_ok), .fw_data(fw_data), .rd_fwd(d_rd_fwd),
 		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc), .rd_lk(d_rd_lk),
 		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(d_rd_err),
 		.rd_fast(d_rd_fast), .rd_fast_data(dfp_data),

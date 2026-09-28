@@ -253,10 +253,14 @@ end
 `ifndef STORE_BUF
 `define STORE_BUF 0
 `endif
+`ifndef FWD
+`define FWD 0
+`endif
 ap040_pipe_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
                      .AP040_POST_STORES(POST),
                      .AP040_FILL_CHANNEL(FILLCH),
-                     .AP040_STORE_BUF(`STORE_BUF)) dut
+                     .AP040_STORE_BUF(`STORE_BUF),
+                     .AP040_FWD(`FWD)) dut
 (
 	.clk(clk),
 	.nreset(nreset),

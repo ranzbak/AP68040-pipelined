@@ -48,7 +48,10 @@ module ap040_pipe_tg68k_compat
 	// that cannot fault (translation off, to chip or fast RAM) into a 4-entry
 	// FIFO in front of the MMU; 2 is the same hardware never posting (the A/B
 	// reference, clock-identical to 0); 0 synchronous stores only.
-	parameter AP040_STORE_BUF    = 0
+	parameter AP040_STORE_BUF    = 0,
+	// findings/catchup/plan.md step 1: store-to-load forwarding (needs the
+	// data read path, AP040_IFP).  0: off, as before.
+	parameter AP040_FWD          = 0
 )
 (
 	input         clk,
@@ -315,7 +318,7 @@ localparam IFP_ON = (AP040_IFP != 0) && (AP040_ENABLE_CACHE != 0);
 wire        ifp_req, ifp_s, ifp_hit, ifp_try;
 wire [31:0] ifp_addr, ifp_data;
 // the data read path (plan M14 step 3)
-wire        dfp_req, dfp_hit;
+wire        dfp_req, dfp_hit, dfp_ram;
 wire [31:0] dfp_addr, dfp_data;
 wire  [1:0] dfp_size;
 wire  [2:0] dfp_fc;
@@ -331,7 +334,8 @@ ap040_pipe_core #(
 	.CINV(1),
 	.IFP(IFP_ON ? 1 : 0),
 	.DFP(IFP_ON ? 1 : 0),
-	.STORE_BUF(AP040_STORE_BUF)
+	.STORE_BUF(AP040_STORE_BUF),
+	.FWD(AP040_FWD)
 ) core (
 	.clk(clk),
 	.nreset(nreset),
@@ -399,7 +403,7 @@ ap040_pipe_core #(
 	.ifp_req(ifp_req), .ifp_addr(ifp_addr), .ifp_s(ifp_s),
 	.ifp_try(ifp_try), .ifp_hit(ifp_hit), .ifp_data(ifp_data),
 	.dfp_req(dfp_req), .dfp_addr(dfp_addr), .dfp_size(dfp_size), .dfp_fc(dfp_fc),
-	.dfp_hit(dfp_hit), .dfp_data(dfp_data)
+	.dfp_hit(dfp_hit), .dfp_ram(dfp_ram), .dfp_data(dfp_data)
 );
 
 // the FPU (M10.1 step 3): lifted from the reference unchanged (02ebcee),
@@ -648,6 +652,8 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 	wire dfp_thit;
 	assign dfp_hit = IFP_ON && dfp_ok_q && dfp_tok && !dfp_tci &&
 	                 (cache_allow_all || da_win) && dfp_thit;
+	// (forwarding) the same without the tag hit: the location is RAM
+	assign dfp_ram = IFP_ON && dfp_ok_q && dfp_tok && !dfp_tci && (cache_allow_all || da_win);
 
 	ap040_cache #(
 		.POST_STORES(AP040_POST_STORES),
@@ -732,6 +738,7 @@ else begin : g_nocache
 	assign ifp_hit   = 1'b0;    // no cache, no instruction read path
 	assign ifp_try   = 1'b0;
 	assign dfp_hit   = 1'b0;
+	assign dfp_ram   = 1'b0;
 	assign dfp_data  = 32'd0;
 	wire unused_dfp = dfp_req | (|dfp_addr) | (|dfp_size) | (|dfp_fc);
 	assign ifp_data  = 32'd0;
