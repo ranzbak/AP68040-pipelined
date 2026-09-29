@@ -306,15 +306,24 @@ end
 function automatic logic [2:0] nby(input logic [1:0] sz);
 	return (sz == SZ_L) ? 3'd4 : (sz == SZ_W) ? 3'd2 : 3'd1;
 endfunction
-function automatic logic f_ovl(input logic [31:0] a1, input logic [1:0] s1, input logic [31:0] a2, input logic [1:0] s2);
-	logic [32:0] e1, e2;
-	e1 = {1'b0, a1} + nby(s1); e2 = {1'b0, a2} + nby(s2);
-	return ({1'b0, a2} < e1) && ({1'b0, a1} < e2);
+// (timing: 12-bit arithmetic on the page offset, never a 33-bit add)
+// f_ovl: may the two meet -- a longword index (addr[11:2]) of one equals one
+// of the other's; conservative (an alias in another page counts)
+function automatic logic [11:0] f_end(input logic [31:0] a, input logic [1:0] sz);
+	return a[11:0] + ((sz == SZ_L) ? 12'd3 : (sz == SZ_W) ? 12'd1 : 12'd0);
 endfunction
+function automatic logic f_ovl(input logic [31:0] a1, input logic [1:0] s1, input logic [31:0] a2, input logic [1:0] s2);
+	logic [11:0] e1, e2;
+	e1 = f_end(a1, s1); e2 = f_end(a2, s2);
+	return (a1[11:2] == a2[11:2]) || (a1[11:2] == e2[11:2]) || (e1[11:2] == a2[11:2]) || (e1[11:2] == e2[11:2]);
+endfunction
+// f_cov: does [a2, a2+n2) lie inside [a1, a1+n1) -- exact: the same page,
+// neither crossing it, and the byte range inside
 function automatic logic f_cov(input logic [31:0] a1, input logic [1:0] s1, input logic [31:0] a2, input logic [1:0] s2);
-	logic [32:0] e1, e2;
-	e1 = {1'b0, a1} + nby(s1); e2 = {1'b0, a2} + nby(s2);
-	return (a2 >= a1) && (e2 <= e1);
+	logic [11:0] e1, e2;
+	e1 = f_end(a1, s1); e2 = f_end(a2, s2);
+	return (a1[31:12] == a2[31:12]) && (e1 >= a1[11:0]) && (e2 >= a2[11:0]) &&
+	       (a2[11:0] >= a1[11:0]) && (e2 <= e1);
 endfunction
 function automatic logic [31:0] f_ext(input logic [31:0] d, input logic [31:0] a1, input logic [1:0] s1,
                                       input logic [31:0] a2, input logic [1:0] s2);
