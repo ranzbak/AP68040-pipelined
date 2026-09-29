@@ -54,7 +54,10 @@ module ap040_execute
 	output     [31:0] fw_st_addr,
 	output      [1:0] fw_st_size,
 	output     [31:0] fw_st_data,
+	output      [2:0] fw_st_fc,
 	input             fw_st_ram,  // (the wrapper's window on fw_st_addr) the store goes to RAM
+	input             fw_st_pt,   // (SB_MMU) fw_st_addr's page is in the core's postable-page table
+	input       [1:0] fw_st_ep,   // ... the table's epoch
 
 	output            ex_redirect,
 	output     [31:0] ex_redirect_pc,
@@ -404,6 +407,7 @@ assign fw_st_v    = eaf_valid && w.st_v;
 assign fw_st_addr = w.st_addr;
 assign fw_st_size = w.st_size;
 assign fw_st_data = w.st_data;
+assign fw_st_fc   = w.st_fc;
 
 // the CCR this micro-op leaves, for EA-fetch's branch resolution
 assign fw_ccr_v  = eaf_valid && (w.ccr_v || w.sr_v);
@@ -443,6 +447,8 @@ always @(posedge clk) begin
 			// (findings/storebuf/plan.md) a store WB may post: it goes to
 			// RAM, is not a locked read-modify-write's, and is not MOVES
 			exe_o.st_post <= w.st_v && fw_st_ram && !w.stf.lk && !w.stf.moves;
+			exe_o.st_pt   <= w.st_v && fw_st_pt && !w.stf.lk && !w.stf.moves;
+			exe_o.st_ep   <= fw_st_ep;
 		end
 	end
 end

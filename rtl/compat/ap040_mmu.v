@@ -105,6 +105,12 @@ module ap040_mmu
 	output     [31:0] phys_addr,
 	output            cache_inhibit,
 	output            m_nocache,
+	// (store buffer stage 4, findings/storebuf/plan.md) the write forwarded
+	// now could have been posted: a TTR hit that neither write-protects nor
+	// inhibits, or an ATC hit that passed -- so writable, M already set, S
+	// allowed -- and cacheable.  Latched at forwarding, with the physical
+	// address; valid while the request is held (m_ack's clock included).
+	output            m_postok,
 
 	// instruction-side translation (IFP = 1): launched with the instruction
 	// read path's lookup (ifp_en at an enabled edge, the LOGICAL fetch
@@ -388,18 +394,24 @@ wire pass_ok = c_req && !c_flt && !need_walk && !ttr_fault && !atc_fault &&
 // what m_* shows.  It lets go if the core drops its request.
 reg        pass_hold;
 reg [31:0] pass_pa;
+reg        postok_q;
+wire       postok_now = c_write && !c_lock &&
+                        (ttr_hit ? (!ttr_w && !ttr_cm[1]) : (tc_e && atc_hit && !h_cm[1]));
 always @(posedge clk) begin
-	if (!nreset)
+	if (!nreset) begin
 		pass_hold <= 1'b0;
-	else if (ce) begin
+		postok_q  <= 1'b0;
+	end else if (ce) begin
 		if (pass_hold) begin
 			if (m_ack || !c_req) pass_hold <= 1'b0;
 		end else if (pass_ok && !m_ack) begin
 			pass_hold <= 1'b1;
 			pass_pa   <= pa_out;
+			postok_q  <= postok_now;
 		end
 	end
 end
+assign m_postok = pass_hold && postok_q;
 
 assign m_req   = pass_hold ? c_req : pass_ok;
 assign m_write = c_write;

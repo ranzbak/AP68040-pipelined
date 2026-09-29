@@ -156,7 +156,7 @@ ap040_pipe_core #(
 	.mem_req(mem_req), .mem_write(mem_write), .mem_instr(mem_instr), .mem_size(mem_size),
 	.mem_addr(mem_addr), .mem_wdata(mem_wdata), .mem_fc(mem_fc),
 	.mem_ack(m_ack), .mem_rdata(m_rdata), .mem_flt(m_flt), .mem_atc(1'b0), .bus_st_err(),
-	.stw_addr(stw_addr), .stw_ram(stw_ram),
+	.stw_addr(stw_addr), .stw_ram(stw_ram), .mem_postok(1'b0),
 	.dbg_if_valid(), .dbg_if_pc(), .dbg_id_valid(), .dbg_id_pc(),
 	.dbg_eac_valid(), .dbg_eac_pc(), .dbg_eaf_valid(), .dbg_eaf_pc(),
 	.dbg_ex_valid(), .dbg_ex_pc(), .dbg_wb_valid(dbg_wb_valid), .dbg_wb_pc(dbg_wb_pc),

@@ -79,7 +79,12 @@ module ap040_pipe_core
 	parameter         PRECISE            = 0,
 	// (BUS = 1; findings/catchup/plan.md) split misaligned data transfers
 	// into aligned pieces the cache serves (ap040_pipe_bcu MISPLIT)
-	parameter         MISPLIT            = 0
+	parameter         MISPLIT            = 0,
+	// (STORE_BUF = 1; findings/storebuf/plan.md stage 4) with translation on,
+	// post a store to a page a synchronous store has proved postable
+	// (mem_postok with its acknowledge): the core keeps 4 such pages,
+	// flushed by PFLUSH and by a MOVEC to TC, URP, SRP or a TTR.
+	parameter         SB_MMU             = 0
 )
 (
 	input  clk,
@@ -116,6 +121,7 @@ module ap040_pipe_core
 	// cannot fault (chip RAM, fast RAM) -- combinational, registered here
 	output [31:0] stw_addr,
 	input         stw_ram,
+	input         mem_postok,    // (SB_MMU) with a store's mem_ack: its page may take posted stores
 
 	// status for the wrapper (cacr_out/vbr_out, debug_status)
 	output [31:0] cacr_q,
@@ -253,6 +259,7 @@ module ap040_pipe_core
 // (declared before the bus controller's generate block uses them)
 wire        fw_st_v;
 wire [31:0] fw_st_addr, fw_st_data;
+wire  [2:0] fw_st_fc;
 wire  [1:0] fw_st_size;
 wire        q_v0, q_v1;  wire [31:0] q_pc0;  wire [15:0] q_w0, q_w1;  wire [1:0] id_consume, id_consume_nf;
 // self-modifying code: the code the stages younger than EX hold
@@ -329,8 +336,49 @@ reg [31:0] cacr;
 // MMU registers: stored with the reference's write masks (lib/AP68040
 // ap040_core.v S_MOVEC2); they drive the MMU outside (M7)
 reg [31:0] tc, itt0, itt1, dtt0, dtt1, mmusr, urp, srp;
-assign wb_post = (BUS != 0) && (STORE_POST == 0) && (STORE_BUF == 1) && exe_o.st_post &&
-                 !tc[15] && !(dtt0[15] && dtt0[2]) && !(dtt1[15] && dtt1[2]);
+// (SB_MMU) the postable-page table: a synchronous store the MMU forwarded
+// without a fault or a walk, writable, cacheable, to RAM (mem_postok) makes
+// its logical page (4K granularity) and function code an entry; a store in
+// EX to such a page may be posted.  Every translation change a 68040 must
+// follow with PFLUSH -- or a MOVEC to TC, URP, SRP or a TTR -- empties it
+// and advances the epoch, which a store looked up before the change carries
+// and WB compares.
+reg        pg_v [0:3];
+reg [19:0] pg_a [0:3];
+reg  [2:0] pg_f [0:3];
+reg  [1:0] pg_rr, pg_ep;
+wire       pg_clear = pf_req ||
+                      (commit && exe_o.creg_v && (exe_o.creg_sel == CR_TC || exe_o.creg_sel == CR_URP ||
+                       exe_o.creg_sel == CR_SRP || exe_o.creg_sel == CR_ITT0 || exe_o.creg_sel == CR_ITT1 ||
+                       exe_o.creg_sel == CR_DTT0 || exe_o.creg_sel == CR_DTT1));
+wire       pg_rec;             // (from the bus controller) a store to record
+wire [11:0] fw_st_end = fw_st_addr[11:0] + ((fw_st_size == SZ_L) ? 12'd3 : (fw_st_size == SZ_W) ? 12'd1 : 12'd0);
+wire       fw_st_pt = (SB_MMU != 0) && (fw_st_end >= fw_st_addr[11:0]) &&
+                      ((pg_v[0] && pg_a[0] == fw_st_addr[31:12] && pg_f[0] == fw_st_fc) ||
+                       (pg_v[1] && pg_a[1] == fw_st_addr[31:12] && pg_f[1] == fw_st_fc) ||
+                       (pg_v[2] && pg_a[2] == fw_st_addr[31:12] && pg_f[2] == fw_st_fc) ||
+                       (pg_v[3] && pg_a[3] == fw_st_addr[31:12] && pg_f[3] == fw_st_fc));
+wire       pg_have = (pg_v[0] && pg_a[0] == mem_addr[31:12] && pg_f[0] == mem_fc) ||
+                     (pg_v[1] && pg_a[1] == mem_addr[31:12] && pg_f[1] == mem_fc) ||
+                     (pg_v[2] && pg_a[2] == mem_addr[31:12] && pg_f[2] == mem_fc) ||
+                     (pg_v[3] && pg_a[3] == mem_addr[31:12] && pg_f[3] == mem_fc);
+integer pgk;
+always @(posedge clk)
+	if (!nreset) begin
+		for (pgk = 0; pgk < 4; pgk = pgk + 1) pg_v[pgk] <= 1'b0;
+		pg_rr <= 2'd0; pg_ep <= 2'd0;
+	end else if (ce) begin
+		if (pg_clear) begin
+			for (pgk = 0; pgk < 4; pgk = pgk + 1) pg_v[pgk] <= 1'b0;
+			pg_ep <= pg_ep + 2'd1;
+		end else if ((SB_MMU != 0) && tc[15] && pg_rec && mem_postok && !pg_have) begin
+			pg_v[pg_rr] <= 1'b1; pg_a[pg_rr] <= mem_addr[31:12]; pg_f[pg_rr] <= mem_fc;
+			pg_rr <= pg_rr + 2'd1;
+		end
+	end
+assign wb_post = (BUS != 0) && (STORE_POST == 0) && (STORE_BUF == 1) &&
+                 (tc[15] ? ((SB_MMU != 0) && exe_o.st_pt && exe_o.st_ep == pg_ep)
+                         : (exe_o.st_post && !(dtt0[15] && dtt0[2]) && !(dtt1[15] && dtt1[2])));
 assign stw_addr = fw_st_addr;
 
 always @(posedge clk) begin
@@ -528,6 +576,7 @@ generate if (BUS == 0) begin : g_l1
 	assign mem_req = 1'b0; assign mem_write = 1'b0; assign mem_instr = 1'b0; assign mem_size = 2'd0;
 	assign mem_addr = 32'd0; assign mem_wdata = 32'd0; assign mem_fc = 3'd0; assign bus_st_err = 1'b0;
 	assign mem_lock = 1'b0;
+	assign pg_rec = 1'b0;
 	assign d_rd_err = 1'b0; assign d_rd_atc = 1'b0; assign d_rd_ma = 1'b0;
 	assign f_err = 1'b0; assign f_atc = 1'b0;
 	assign ifp_req = 1'b0; assign ifp_addr = 32'd0; assign ifp_s = 1'b0;
@@ -690,7 +739,7 @@ end else begin : g_bus
 		.lk_fc(d_rd_fc), .exs_v(ex_push), .exs_addr(eaf_o.daddr), .exs_data(eaf_o.next_pc), .exs_fc(eaf_o.st_fc),
 		.wbs_v(exe_valid && exe_o.st_v), .wbs_ok(!exe_o.stf.lk),
 		.wbs_addr(exe_o.st_addr), .wbs_size(exe_o.st_size), .wbs_data(exe_o.st_data), .wbs_fc(exe_o.st_fc),
-		.fw_ok(fw_ok), .fw_data(fw_data), .rd_fwd(d_rd_fwd), .dq_a_o(slot_a), .dq_s_o(slot_s),
+		.fw_ok(fw_ok), .fw_data(fw_data), .rd_fwd(d_rd_fwd), .dq_a_o(slot_a), .dq_s_o(slot_s), .st_sync_ok(pg_rec),
 		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc), .rd_lk(d_rd_lk),
 		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(d_rd_err),
 		.rd_fast(d_rd_fast), .rd_fast_data(dfp_data),
@@ -759,6 +808,7 @@ ap040_ea_calc #(.HAS_FPU(HAS_FPU)) u_eac
 	.p_ex_u0_val(eaf_o.sp_v ? eaf_o.sp_val : eaf_o.u0_val),
 	.p_ex_u1_v(eaf_o.u1_v), .p_ex_u1_r(eaf_o.u1_r), .p_ex_u1_val(eaf_o.u1_val),
 	.p_ex_store(older_store),
+	.p_ex_sr(eaf_valid && eaf_o.sr_v),
 	.ea_stall(ea_stall),
 	.early_v(early_v), .early(early_rd),
 	.eac_redir_v(eac_redir_v), .eac_redir_pc(eac_redir_pc),
@@ -878,8 +928,8 @@ ap040_execute #(.HAS_FPU(HAS_FPU)) u_ex
 	.ex_stall(ex_stall),
 	.fw_w0_v(fw_w0_v), .fw_w0_r(fw_w0_r), .fw_w0_val(fw_w0_val),
 	.fw_ccr_v(fw_ccr_v), .fw_ccr(fw_ccr),
-	.fw_st_v(fw_st_v), .fw_st_addr(fw_st_addr), .fw_st_size(fw_st_size), .fw_st_data(fw_st_data),
-	.fw_st_ram(stw_ram),
+	.fw_st_v(fw_st_v), .fw_st_addr(fw_st_addr), .fw_st_size(fw_st_size), .fw_st_data(fw_st_data), .fw_st_fc(fw_st_fc),
+	.fw_st_ram(stw_ram), .fw_st_pt(fw_st_pt), .fw_st_ep(pg_ep),
 	.ex_redirect(ex_redirect), .ex_redirect_pc(ex_redirect_pc), .ex_redirect_s(ex_redirect_s),
 	.exe_valid(exe_valid), .exe_o(exe_o)
 );

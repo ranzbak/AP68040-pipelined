@@ -108,6 +108,7 @@ module ap040_pipe_bcu
 	input       [1:0] lk_size,
 	output reg        sb_ovl,
 	output            k_fifo_o,   // (MIX) the store on the port is the FIFO's
+	output            st_sync_ok, // a synchronous store completed whole this clock (no fault, not split)
 	output     [31:0] dq_a_o,     // the data read slot's address and size (the core's
 	output      [1:0] dq_s_o,     // answer-clock overlap check, PRECISE)
 	// (FWD) forwarding: the lookup's function code, WB's store as it stands
@@ -207,6 +208,7 @@ reg  [1:0] kind;           // what the transfer in progress is
 reg        k_fifo;         // (kind K_ST) the store came from the FIFO, not from WB
 assign k_fifo_o = k_fifo;
 assign dq_a_o = dq_a;
+assign st_sync_ok = done && (kind == K_ST) && !k_fifo && !sp_on && !mem_flt;
 assign dq_s_o = dq_s;
 
 // page-crossing split state (see below)

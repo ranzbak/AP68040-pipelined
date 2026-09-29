@@ -19,6 +19,7 @@ asm() {   # name dir -> $OUT/name.hex
 for p in sb_raw sb_order sb_serialize sb_lateberr nop_sync smc ras misplit; do asm $p "$T/pipe_asm" || exit 1; done
 asm t_sbuf_pipe "$T/cache_asm" || exit 1
 asm t_fwd_pipe "$T/cache_asm" || exit 1
+asm t_sbmmu_pipe "$T/cache_asm" || exit 1
 asm t_dcache_pipe "$T/cache_asm" || exit 1
 python3 "$T/mk_tmmu.py" "$AP040_REF/tb/asm/t_mmu.s" m9s > "$OUT/t_mmu_m9s.s" &&
 ( cd "$OUT" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o t_mmu_m9s.bin t_mmu_m9s.s ) &&
@@ -149,5 +150,19 @@ run_one pre_no_ans ap040_pipe_core.v \
 run_one pre_lo_only ap040_pipe_core.v \
 	"return (a1[11:2] == a2[11:2]) || (a1[11:2] == e2[11:2]) || (e1[11:2] == a2[11:2]) || (e1[11:2] == e2[11:2]);" \
 	"return (a1[11:2] == a2[11:2]);" compat t_sbuf_pipe "-DPRECISE=1 -DFWD=1" &
+wait
+echo "== stage 4 and the SR hazard (findings/storebuf/plan.md)"
+# EA-calc does not wait for an SR write in EX (the handler reads the wrong stack)
+run_one sr_hazard ap040_ea_calc.v \
+	"wire hazard = id_valid && (p_eaf_blk || p_ex_sr ||" \
+	"wire hazard = id_valid && (p_eaf_blk ||" compat t_sbmmu_pipe "-DPRECISE=1" &
+# the postable-page table is not emptied by PFLUSH
+run_one pg_noflush ap040_pipe_core.v \
+	"wire       pg_clear = pf_req ||" \
+	"wire       pg_clear = 1'b0 ||" compat t_sbmmu_pipe "-DSB_MMU=1" &
+# the table ignores the function code (a user store to a supervisor page)
+run_one pg_nofc ap040_pipe_core.v \
+	"((pg_v[0] && pg_a[0] == fw_st_addr[31:12] && pg_f[0] == fw_st_fc) ||" \
+	"((pg_v[0] && pg_a[0] == fw_st_addr[31:12]) ||" compat t_sbmmu_pipe "-DSB_MMU=1" &
 wait
 

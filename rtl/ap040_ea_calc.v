@@ -62,6 +62,7 @@ module ap040_ea_calc
 	input             p_ex_u1_v, input [4:0] p_ex_u1_r, input [31:0] p_ex_u1_val,
 
 	input             p_ex_store, // EX holds a store that has not reached memory
+	input             p_ex_sr,    // EX holds a micro-op that writes SR (not yet in sr_in)
 
 	output            ea_stall,   // to ID
 
@@ -122,7 +123,15 @@ wire [33:0] f_db = fwd(r_db, rd_db, p_eaf_v, p_eaf, p_ex_v, p_ex_w0_v, p_ex_w0_r
 wire [33:0] f_di = fwd(r_di, rd_di, p_eaf_v, p_eaf, p_ex_v, p_ex_w0_v, p_ex_w0_r,
                        p_ex_u0_v, p_ex_u0_r, p_ex_u0_val, p_ex_u1_v, p_ex_u1_r, p_ex_u1_val);
 
-wire hazard = id_valid && (p_eaf_blk ||
+// An older micro-op in EX that writes SR -- an exception's or RTE's last,
+// a MOVE to SR -- can change S or M, and so which stack A7 is (resolve_sp
+// reads sr_in, where only WB's SR is written through).  It normally reaches
+// WB the next clock, before a younger instruction gets here; but WB may be
+// holding a synchronous store (translation on), and EX's redirect already
+// went out: the handler's first instruction then computed (d16,A7) on the
+// old stack and read it early (t_sbmmu_pipe, the user-mode S fault; hidden
+// until the data read path answered the handler's vector read at once).
+wire hazard = id_valid && (p_eaf_blk || p_ex_sr ||
                            (use_sb && f_sb[33]) || (use_si && f_si[33]) ||
                            (use_db && f_db[33]) || (use_di && f_di[33]));
 

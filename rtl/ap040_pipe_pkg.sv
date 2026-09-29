@@ -323,6 +323,8 @@ typedef struct packed {
 	logic        st_rb;        // locked write-back (trace benches: not a data write the reference makes)
 	logic [2:0]  st_fc;        // function code (MOVES: DFC; else supervisor/user data)
 	logic        st_post;      // (STORE_BUF) EX's verdict: RAM window, not locked, not MOVES
+	logic        st_pt;        // (SB_MMU) ... translation on: the page is in the postable-page table
+	logic [1:0]  st_ep;        // ... the table's epoch at that lookup
 	stf_t        stf;          // for an access error on the store (M6)
 	logic        creg_v; logic [3:0] creg_sel; logic [31:0] creg_val;
 	logic        exc;   logic [31:0] exc_sp;

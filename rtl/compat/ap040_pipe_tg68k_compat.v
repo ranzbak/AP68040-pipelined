@@ -59,7 +59,11 @@ module ap040_pipe_tg68k_compat
 	parameter AP040_PRECISE      = 0,
 	// findings/catchup/plan.md: misaligned data transfers split into
 	// aligned pieces the cache serves.  0: bypass as before.
-	parameter AP040_MISPLIT      = 0
+	parameter AP040_MISPLIT      = 0,
+	// findings/storebuf/plan.md stage 4: with translation on, a store to a
+	// page a synchronous store has proved postable is posted as well (the
+	// core's page table, the MMU's m_postok).  Needs AP040_STORE_BUF = 1.
+	parameter AP040_SB_MMU       = 0
 )
 (
 	input         clk,
@@ -236,7 +240,7 @@ wire        mm_req, mm_write, mm_instr;
 wire  [1:0] mm_size;
 wire [31:0] mm_addr, mm_wdata;
 wire  [2:0] mm_fc;
-wire        mm_ack, mm_nocache;
+wire        mm_ack, mm_nocache, mm_postok;
 wire [31:0] mm_rdata;
 
 // cache to bus adapter
@@ -315,6 +319,14 @@ always @(posedge clk) begin
 	sw_z3b1 <= cache_z3_base1; sw_z3e1 <= cache_z3_ena1;
 	sw_z2e  <= cache_z2_ena;
 end
+// (stage 4) the MMU's verdict on the write it forwards, and the same RAM
+// window on its PHYSICAL address (valid with the write's acknowledge)
+wire mem_postok = mm_postok &&
+               (cache_allow_all ? (mm_addr[15:8] != 8'hF1) :
+                (((mm_addr[31:27] == sw_z3b0) && sw_z3e0) ||
+                 ((mm_addr[31:28] == sw_z3b1) && sw_z3e1) ||
+                 (!mm_addr[31:24] && (mm_addr[23] ^ |mm_addr[22:21]) && sw_z2e) ||
+                 (mm_addr[31:21] == 11'd0)));
 wire stw_ram = cache_allow_all ? (stw_addr[15:8] != 8'hF1) :
                (((stw_addr[31:27] == sw_z3b0) && sw_z3e0) ||
                 ((stw_addr[31:28] == sw_z3b1) && sw_z3e1) ||
@@ -346,7 +358,8 @@ ap040_pipe_core #(
 	.FWD(AP040_FWD),
 	.RAS(AP040_RAS),
 	.PRECISE(AP040_PRECISE),
-	.MISPLIT(AP040_MISPLIT)
+	.MISPLIT(AP040_MISPLIT),
+	.SB_MMU(AP040_SB_MMU)
 ) core (
 	.clk(clk),
 	.nreset(nreset),
@@ -372,6 +385,7 @@ ap040_pipe_core #(
 	.mem_flt(mem_flt),
 	.mem_atc(mem_flt_mmu),
 	.stw_addr(stw_addr), .stw_ram(stw_ram),
+	.mem_postok(mem_postok),
 	.bus_st_err(core_st_err),
 
 	.cacr_q(cacr_out),
@@ -469,7 +483,7 @@ ap040_mmu #(.IFP(IFP_ON ? 1 : 0)) mmu (
 	.walker_req(walker_req), .walker_we(walker_we), .walker_addr(walker_addr),
 	.walker_wdat(walker_wdat), .walker_ack(walker_ack), .walker_data(walker_data),
 	.walker_berr(walker_berr),
-	.phys_addr(mmu_addr_phys), .cache_inhibit(mmu_cache_inhibit), .m_nocache(mm_nocache),
+	.phys_addr(mmu_addr_phys), .cache_inhibit(mmu_cache_inhibit), .m_nocache(mm_nocache), .m_postok(mm_postok),
 	.ifp_en(ifp_req), .ifp_addr(ifp_addr), .ifp_s(ifp_s),
 	.ifp_ok(ifp_tok), .ifp_pa(ifp_pa), .ifp_ci(ifp_tci),
 	.dfp_en(dfp_req), .dfp_addr(dfp_addr), .dfp_fc(dfp_fc),
@@ -499,6 +513,7 @@ assign mm_addr   = mem_addr;
 assign mm_wdata  = mem_wdata;
 assign mm_fc     = mem_fc;
 assign mm_nocache = 1'b0;
+assign mm_postok  = 1'b0;
 assign mem_ack   = mm_ack;
 assign mem_rdata = mm_rdata;
 assign mem_flt_mmu = 1'b0;
