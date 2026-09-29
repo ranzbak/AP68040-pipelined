@@ -120,8 +120,11 @@ run_one fwd_ex_any ap040_pipe_core.v \
 	"wire ex_push = older_store;" compat t_fwd_pipe -DFWD=1 &
 # a store entering EX in the issue clock is not waited for
 run_one fwd_ex_late ap040_pipe_core.v \
-	"(FWD != 0) && dfp_look && dfp_fq1 && !older_store && dfp_ram && fw_ok;" \
-	"(FWD != 0) && dfp_look && dfp_fq1 && dfp_ram && fw_ok;" compat t_fwd_pipe -DFWD=1 &
+	"(FWD != 0) && dfp_look && dfp_fq1 && ((PRECISE != 0) ? !ex_st_ans : !older_store) &&" \
+	"(FWD != 0) && dfp_look && dfp_fq1 &&" compat t_fwd_pipe -DFWD=1 &
+run_one fwd_ex_late_pre ap040_pipe_core.v \
+	"(FWD != 0) && dfp_look && dfp_fq1 && ((PRECISE != 0) ? !ex_st_ans : !older_store) &&" \
+	"(FWD != 0) && dfp_look && dfp_fq1 &&" compat t_fwd_pipe "-DFWD=1 -DPRECISE=1" &
 wait
 echo "== return-address stack mutants (RAS = 1; findings/catchup/plan.md step 2)"
 # EA-fetch trusts every prediction
