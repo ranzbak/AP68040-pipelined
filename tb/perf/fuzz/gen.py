@@ -29,6 +29,7 @@ def rebase(a):
 
 sub_n = 0
 subs = []
+user = [False]
 def body(n, depth):
     global sub_n
     for _ in range(n):
@@ -63,6 +64,19 @@ def body(n, depth):
             if R.randrange(2): e(f"movem.l\t{regs},-({a})")
             else: e(f"movem.l\t({a})+,{regs}")
             rebase(a)
+        elif k < 81 and depth == 0:
+            # an exception: the handler reads its own frame.  Often right
+            # behind a synchronous store (the I/O counter), so the exception's
+            # last micro-op waits in EX while WB holds it (the SR hazard)
+            if R.randrange(2): e(f"move.w\t{dreg()},$f1f4")
+            e(f"trap\t#{R.randrange(0, 3)}")
+        elif k < 82 and depth == 0 and not user[0]:
+            # a stretch in user mode, left with TRAP #15
+            user[0] = True
+            e("andi.w\t#$dfff,sr")
+        elif k < 83 and depth == 0 and user[0]:
+            user[0] = False
+            e("trap\t#15")
         elif k < 84 and depth == 0:
             sub_n += 1
             subs.append((f"sub{sub_n}", R.randrange(3, 12)))
@@ -75,7 +89,9 @@ def body(n, depth):
             e(f"move.l\t(sp)+,{dreg()}")
         else: rebase(areg())
 
-L.append("\torg\t0\n\tdc.l\t$7000\n\tdc.l\tstart\n\trept\t254\n\tdc.l\tunexp\n\tendr\n\torg\t$400")
+L.append("\torg\t0\n\tdc.l\t$7000\n\tdc.l\tstart\n\trept\t30\n\tdc.l\tunexp\n\tendr\n"
+         "\tdc.l\ttrp0,trp1,trp2\n\trept\t12\n\tdc.l\tunexp\n\tendr\n\tdc.l\ttrp15\n"
+         "\trept\t208\n\tdc.l\tunexp\n\tendr\n\torg\t$400")
 L.append("start:")
 e("move.l\t#$80008000,d0"); e("movec\td0,cacr"); e("cpusha\tbc")
 e("clr.w\t$f1f6")                          # the write counter
@@ -92,7 +108,9 @@ e("lea\t$2000,a0"); e("move.w\t#$3ff,d7"); e(f"move.l\t#${R.getrandbits(32):08x}
 L.append("init:\tmove.l\td0,(a0)+"); e("rol.l\t#5,d0"); e("add.l\t#$9e3779b9,d0"); e("dbra\td7,init")
 for i in range(7): e(f"move.l\t#${R.getrandbits(32):08x},d{i}")
 for i in range(4): rebase(f"a{i}")
+e("lea\t$6c00,a4"); e("move.l\ta4,usp")
 body(nops, 0)
+if user[0]: e("trap\t#15")
 # the results: the work area and the registers
 e("lea\t$2000,a4"); e("lea\t$3000,a5"); e("move.w\t#$2ff,d7")
 L.append("cpy:\tmove.l\t(a4)+,(a5)+"); e("dbra\td7,cpy")
@@ -102,6 +120,15 @@ e("move.w\t$f1f6,$3c40")                   # I/O writes counted (DE off: from me
 e("move.w\t#$600d,$f102")
 L.append("halt:\tbra.s\thalt")
 L.append("unexp:\tmove.w\t#99,$f100\n\tmove.w\t#$bad0,$f102\n.u:\tbra.s\t.u")
+# the handlers: read the frame (SR and PC), a few operations, return
+for t in range(3):
+    L.append(f"trp{t}:")
+    e(f"move.w\t(sp),{dreg()}")
+    e(f"move.l\t2(sp),{dreg()}")
+    e(f"move.w\t6(sp),{dreg()}")
+    body(R.randrange(2, 6), 1)
+    e("rte")
+L.append("trp15:\tori.w\t#$2000,(sp)\n\trte")
 for name, n in subs:
     L.append(f"{name}:")
     body(n, 1)
