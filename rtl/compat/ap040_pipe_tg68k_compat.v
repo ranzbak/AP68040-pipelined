@@ -319,14 +319,16 @@ always @(posedge clk) begin
 	sw_z3b1 <= cache_z3_base1; sw_z3e1 <= cache_z3_ena1;
 	sw_z2e  <= cache_z2_ena;
 end
-// (stage 4) the MMU's verdict on the write it forwards, and the same RAM
-// window on its PHYSICAL address (valid with the write's acknowledge)
+// (stage 4) the MMU's verdict on the write it forwards, and a RAM window on
+// its PHYSICAL address (valid with the write's acknowledge): the DDR3 board
+// (Z3 board 1) only.  Posting into the SDRAM as well (chip RAM, the Zorro II
+// and SDRAM Zorro III boards) corrupted the HDF, icons and loaded code on
+// the board (stage_cu6, 2026-09-29) while every simulation stayed clean;
+// DDR3 only (stage_cu8) is stable and gives xSysInfo 1.01.  The SDRAM
+// cause is open (findings/storebuf/results.md).
 wire mem_postok = mm_postok &&
                (cache_allow_all ? (mm_addr[15:8] != 8'hF1) :
-                (((mm_addr[31:27] == sw_z3b0) && sw_z3e0) ||
-                 ((mm_addr[31:28] == sw_z3b1) && sw_z3e1) ||
-                 (!mm_addr[31:24] && (mm_addr[23] ^ |mm_addr[22:21]) && sw_z2e) ||
-                 (mm_addr[31:21] == 11'd0)));
+                ((mm_addr[31:28] == sw_z3b1) && sw_z3e1));
 wire stw_ram = cache_allow_all ? (stw_addr[15:8] != 8'hF1) :
                (((stw_addr[31:27] == sw_z3b0) && sw_z3e0) ||
                 ((stw_addr[31:28] == sw_z3b1) && sw_z3e1) ||
