@@ -6,11 +6,16 @@ data); the program mixes plain moves, read-modify-writes, store-then-load
 pairs, misaligned copy loops, MOVEM and calls.  At the end it copies the
 work area to $3000 and the registers to $3C00 (the bench dumps $3000-$3FFF)
 and reports $600D."""
-import random, sys
+import os, random, sys
 
 seed = int(sys.argv[1]); out = sys.argv[2]
 nops = int(sys.argv[3]) if len(sys.argv) > 3 else 300
 R = random.Random(seed)
+# GEN_IRQ=1: level-2 interrupts ($F148) land anywhere in the program; the
+# handler stores to and checks up to six more pages ($8000-$DFFF), so with
+# translation on the core's postable-page table (SB_MMU) replaces entries
+irq = os.environ.get("GEN_IRQ", "0") == "1"
+IR = random.Random(seed ^ 0x5eed)   # (its own stream: the program stays the same)
 L = []
 def e(s): L.append("\t" + s)
 
@@ -89,7 +94,9 @@ def body(n, depth):
             e(f"move.l\t(sp)+,{dreg()}")
         else: rebase(areg())
 
-L.append("\torg\t0\n\tdc.l\t$7000\n\tdc.l\tstart\n\trept\t30\n\tdc.l\tunexp\n\tendr\n"
+L.append("\torg\t0\n\tdc.l\t$7000\n\tdc.l\tstart\n" +
+         ("\trept\t24\n\tdc.l\tunexp\n\tendr\n\tdc.l\tirq2\n\trept\t5\n\tdc.l\tunexp\n\tendr\n" if irq else
+          "\trept\t30\n\tdc.l\tunexp\n\tendr\n") +
          "\tdc.l\ttrp0,trp1,trp2\n\trept\t12\n\tdc.l\tunexp\n\tendr\n\tdc.l\ttrp15\n"
          "\trept\t208\n\tdc.l\tunexp\n\tendr\n\torg\t$400")
 L.append("start:")
@@ -109,8 +116,15 @@ L.append("init:\tmove.l\td0,(a0)+"); e("rol.l\t#5,d0"); e("add.l\t#$9e3779b9,d0"
 for i in range(7): e(f"move.l\t#${R.getrandbits(32):08x},d{i}")
 for i in range(4): rebase(f"a{i}")
 e("lea\t$6c00,a4"); e("move.l\ta4,usp")
+if irq:
+    e("move.w\t#$2000,sr")                # interrupts on
+    e(f"move.w\t#{IR.randrange(100, 2000)},$f148")
 body(nops, 0)
 if user[0]: e("trap\t#15")
+if irq:
+    e("ori.w\t#$0700,sr"); e("move.w\t#0,$f148"); e("move.w\t#0,$f110")
+    e("tst.l\t$4000")                     # an interrupt was taken
+    e("beq\tirqnone")
 # the results: the work area and the registers
 e("lea\t$2000,a4"); e("lea\t$3000,a5"); e("move.w\t#$2ff,d7")
 L.append("cpy:\tmove.l\t(a4)+,(a5)+"); e("dbra\td7,cpy")
@@ -129,6 +143,30 @@ for t in range(3):
     body(R.randrange(2, 6), 1)
     e("rte")
 L.append("trp15:\tori.w\t#$2000,(sp)\n\trte")
+if irq:
+    # the interrupt handler: every register saved, the request released,
+    # stores of every size and alignment to random pages, each read back
+    L.append("irq2:\tmovem.l\td0-d7/a0-a6,-(sp)")
+    e("move.w\t#0,$f110")
+    e("addq.l\t#1,$4000")
+    for k in range(IR.randrange(2, 7)):
+        pg = IR.randrange(8, 14)
+        off = IR.randrange(0, 0xff0)
+        e(f"lea\t${pg:x}{off:03x},a0")
+        for j in range(IR.randrange(1, 4)):
+            s = IR.choice(SZ); v = IR.getrandbits(8 if s == "b" else 16 if s == "w" else 32)
+            d = IR.randrange(0, 12)
+            e(f"move.{s}\t#${v:x},{d}(a0)")
+            e(f"cmp.{s}\t#${v:x},{d}(a0)")
+            e("bne\tirqbad")
+        if IR.randrange(2):
+            e("movem.l\td0-d3,-(a0)"); e("movem.l\t(a0)+,d4-d7")
+            e("cmp.l\td0,d4"); e("bne\tirqbad"); e("cmp.l\td3,d7"); e("bne\tirqbad")
+    e(f"move.w\t#{IR.randrange(300, 3000)},$f148")
+    e("movem.l\t(sp)+,d0-d7/a0-a6")
+    e("rte")
+    L.append("irqbad:\tmove.w\t#98,$f100\n\tmove.w\t#$bad0,$f102\n.i:\tbra.s\t.i")
+    L.append("irqnone:\tmove.w\t#97,$f100\n\tmove.w\t#$bad0,$f102\n.n:\tbra.s\t.n")
 for name, n in subs:
     L.append(f"{name}:")
     body(n, 1)
