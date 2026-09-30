@@ -202,9 +202,12 @@ dpram #(7, ROWW) ctag_ram
 	.data_a    (tag_wdat),
 	.wren_a    (ce & tag_we),
 	.q_a       (tag_q),
+	// (findings/copyback/plan.md S1b) port B no longer writes: a row
+	// clear is a clear of the valid bits in flops (vb), and the tags stay,
+	// so a dirty line's tag survives a clear that spares it
 	.address_b (inv_idx),
 	.data_b    ({ROWW{1'b0}}),
-	.wren_b    (inv_wren),
+	.wren_b    (1'b0),
 	.q_b       ()
 );
 
@@ -311,18 +314,32 @@ reg  [31:0] rdata_r;
 // and old data on a collision (dpram's rdw_mixed OLD_DATA).  In flops, a
 // clear can spare ways: vb_keep names the ways a row clear leaves valid (none
 // yet; the copyback cache's dirty lines).
+// (S1b) The round-robin victim pointer lives beside them, since port B no
+// longer zeroes the row: a row clear resets it, as the zero row did.
 reg  [3:0] vb [0:127];
 reg  [3:0] vq;
+reg  [1:0] rrb [0:127];
+reg  [1:0] rq;
 wire [3:0] vb_keep = 4'd0;
 integer vbk;
 always @(posedge clk) begin
 	if (!nreset) begin
-		for (vbk = 0; vbk < 128; vbk = vbk + 1) vb[vbk] <= 4'd0;
+		for (vbk = 0; vbk < 128; vbk = vbk + 1) begin
+			vb[vbk]  <= 4'd0;
+			rrb[vbk] <= 2'd0;
+		end
 	end else begin
-		if (ce & tag_we) vb[tag_widx] <= tag_wdat[91:88];
-		if (inv_wren)    vb[inv_idx]  <= vb[inv_idx] & vb_keep;
+		if (ce & tag_we) begin
+			vb[tag_widx]  <= tag_wdat[91:88];
+			rrb[tag_widx] <= tag_wdat[93:92];
+		end
+		if (inv_wren) begin
+			vb[inv_idx]  <= vb[inv_idx] & vb_keep;
+			rrb[inv_idx] <= 2'd0;
+		end
 	end
 	vq <= vb[tag_we ? tag_widx : tag_ridx];
+	rq <= rrb[tag_we ? tag_widx : tag_ridx];
 end
 
 wire [21:0] t_w0 = tag_q[21:0];
@@ -539,7 +556,7 @@ assign tag_we    = ((cst == C_TAGW) && !fill_snooped && !snoop_fill_row) ||
                    ((cst == C_SWEEP) && sweep_hit);
 assign tag_widx  = (cst == C_SWEEP) ? sweep_cnt : r_row;
 assign tag_wdat  = (cst == C_SWEEP) ? {ROWW{1'b0}}
-                                    : {tag_q[93:92] + 2'd1, val_next, tags_next};
+                                    : {rq + 2'd1, val_next, tags_next};
 
 // Port B: a store invalidates the data-bank set it touches, and the next
 // set when the transfer crosses the line.  A cleared row needs no
@@ -901,7 +918,7 @@ always @(posedge clk) begin
 					cst <= C_IDLE;
 				end
 				else begin
-					r_way <= tag_q[93:92];   // round-robin victim
+					r_way <= rq;   // round-robin victim
 					r_beat <= 0;
 					r_issued <= 0;
 					if (dr_active) begin
