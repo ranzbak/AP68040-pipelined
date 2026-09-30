@@ -6,7 +6,9 @@
 // 4KB per side: 64 sets x 4 ways x 16 byte lines, physically tagged        //
 // (sits between the MMU and the 16-bit bus adapter). Write-through, no    //
 // write-allocate: every store goes to memory, so no dirty state ever      //
-// exists and CPUSH degenerates to CINV.  A store that fits one aligned    //
+// exists and CPUSH degenerates to CINV -- unless COPYBACK is set: then a  //
+// store hit on a copyback page stays in the line (dirty) until the line  //
+// is pushed (findings/copyback/plan.md, see C_PUSH).  A store that fits one aligned //
 // longword and hits a resident data line updates that line in place, as  //
 // the 68040 does in write-through mode (plan X3.2); a store that cannot   //
 // be merged (misaligned, line-crossing, cache-inhibited, or with the data //
@@ -41,7 +43,14 @@ module ap040_cache
 	// Plan M14 (AP68040-pipelined): a second, pipelined READ port into the
 	// instruction bank -- see "instruction read path" below.  0 leaves the
 	// module exactly as lifted.
-	parameter IFP = 0
+	parameter IFP = 0,
+	// findings/copyback/plan.md S2: a store that hits a line of a copyback
+	// page (c_cb) updates the line and marks it dirty instead of writing
+	// memory; a dirty line is written back ("pushed") before it is evicted,
+	// before any access that bypasses the cache touches its set, and by
+	// every CINV/CPUSH of the data cache.  Needs POST_STORES = 1.  0: the
+	// cache is write-through, exactly as before.
+	parameter COPYBACK = 0
 )
 (
 	input             clk,
@@ -65,6 +74,7 @@ module ap040_cache
 	input      [31:0] c_wdata,
 	input       [2:0] c_fc,
 	input             c_nocache,
+	input             c_cb,        // (COPYBACK) a copyback page in the copyback window
 	output            c_ack,
 	output     [31:0] c_rdata,
 
@@ -272,6 +282,35 @@ localparam C_PASS  = 4'd6;
 localparam C_SWEEP = 4'd7;   // reset / CINV: walk the rows clearing them
 localparam C_FILLC = 4'd8;   // A1: line requested over the fill channel
 localparam C_FILLW = 4'd9;   // A1: the delivered line goes into the way
+localparam C_PUSH  = 4'd10;  // (COPYBACK) write dirty ways of a data-bank set back
+
+// (COPYBACK) Dirty bits, one per data-bank line.  A row clear spares the
+// dirty ways (vb_keep): a dirty line is only ever dropped after it has been
+// pushed.  Only the DDR3 board's lines can be dirty (the wrapper's window),
+// and nothing but the CPU writes that memory, so a snoop never names one.
+reg   [3:0] db [0:63];
+// The push sequence (C_PUSH): the ways in p_mask of data-bank set p_set,
+// lowest first.  For each: four longwords read from the data RAM into
+// pbuf (p_ph 0), then written to memory one at a time on the master side
+// (p_ph 1), a clock with m_req low between them so each write carries the
+// buffer's settled word.  p_ret: where the FSM goes when the mask is empty.
+localparam P_IDLE  = 2'd0;   // back to C_IDLE (the held request is re-examined)
+localparam P_LOOK  = 2'd1;   // back to C_LOOK (a miss whose victim was dirty)
+localparam P_SWEEP = 2'd2;   // back to C_SWEEP (CINV/CPUSH, the same row)
+reg   [5:0] p_set;
+reg   [3:0] p_mask;
+reg   [1:0] p_way;
+reg         p_ph;
+reg   [2:0] p_rb;
+reg   [1:0] p_wb;
+reg         p_req;
+reg  [21:0] p_tag;
+reg  [31:0] pbuf0, pbuf1, pbuf2, pbuf3;
+reg   [1:0] p_ret;
+function [1:0] low_way;
+	input [3:0] m;
+	low_way = m[0] ? 2'd0 : m[1] ? 2'd1 : m[2] ? 2'd2 : 2'd3;
+endfunction
 
 reg   [3:0] cst;
 reg [127:0] fill_line;       // the channel's payload, drained by C_FILLW
@@ -312,15 +351,15 @@ reg  [31:0] rdata_r;
 // tag write, and port B's row clear, which wins in the same edge as it does
 // in the RAM -- and are read like the row, registered on port A's address
 // and old data on a collision (dpram's rdw_mixed OLD_DATA).  In flops, a
-// clear can spare ways: vb_keep names the ways a row clear leaves valid (none
-// yet; the copyback cache's dirty lines).
+// clear can spare ways: vb_keep names the ways a row clear leaves valid --
+// the dirty lines (COPYBACK), which are only dropped after a push.
 // (S1b) The round-robin victim pointer lives beside them, since port B no
 // longer zeroes the row: a row clear resets it, as the zero row did.
 reg  [3:0] vb [0:127];
 reg  [3:0] vq;
 reg  [1:0] rrb [0:127];
 reg  [1:0] rq;
-wire [3:0] vb_keep = 4'd0;
+wire [3:0] vb_keep = ((COPYBACK != 0) && !inv_idx[6]) ? db[inv_idx[5:0]] : 4'd0;
 integer vbk;
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -429,11 +468,12 @@ wire       snoop_st_row_pass = s_stb && (s_addr[9:4] == r_row[5:0]);
 // Cache-inhibited stores (IO, serialized pages) stay synchronous, so an
 // IO write still completes before the next instruction.
 reg        st_posted;
+reg        r_cb;       // (COPYBACK) the update-path store is to a copyback page
 reg [31:0] r_wdata;
 reg  [2:0] r_fc;
 wire       st_post_ok = (POST_STORES != 0) && c_write && !c_nocache &&
                         !c_instr;
-assign post_busy = st_posted | dr_active;
+assign post_busy = st_posted | dr_active | (cst == C_PUSH);
 
 // Snoop-vs-fill and snoop-vs-lookup collisions (5.2).  A snoop hitting
 // the row of an in-flight fill poisons it: the fill's data may predate
@@ -518,24 +558,56 @@ reg  [6:0] ci_inv_row;
 // held until it ends.  The handover is seamless -- dr_* holds the same
 // address and data the first C_PASS cycle presented, so an adapter that
 // already latched the request sees no change.
+// (COPYBACK) A push owns the master side while it writes (push_out): it
+// starts only with the drain idle, and no fill or pass runs meanwhile.  A
+// copyback store is not issued in its first C_PASS clock -- that clock
+// decides whether it hit (and stays in the cache) or drains to memory.
+wire        push_out = (cst == C_PUSH) && p_ph && p_req;
+wire [31:0] pbuf_w   = (p_wb == 2'd0) ? pbuf0 : (p_wb == 2'd1) ? pbuf1 :
+                       (p_wb == 2'd2) ? pbuf2 : pbuf3;
 assign m_req   = dr_active   ? 1'b1 :
-                 fill_active ? 1'b1 : (pass_active ? (c_req | st_posted) : 1'b0);
+                 push_out    ? 1'b1 :
+                 fill_active ? 1'b1 :
+                 (pass_active ? ((c_req & ~st_posted) | (st_posted & ~(st_chk & r_cb))) : 1'b0);
 assign m_write = dr_active   ? 1'b1 :
+                 push_out    ? 1'b1 :
                  fill_active ? 1'b0 : (st_posted ? 1'b1 : c_write);
-assign m_instr = (dr_active | st_posted) ? 1'b0 : c_instr;
+assign m_instr = (dr_active | st_posted | push_out) ? 1'b0 : c_instr;
 assign m_size  = dr_active   ? dr_size :
+                 push_out    ? `AP040_SZ_L :
                  fill_active ? `AP040_SZ_L : (st_posted ? r_size : c_size);
 assign m_addr  = dr_active   ? dr_addr :
+                 push_out    ? {p_tag, p_set, p_wb, 2'b00} :
                  fill_active ? {r_addr[31:4], r_beat, 2'b00}
                              : (st_posted ? r_addr : c_addr);
-assign m_wdata = dr_active ? dr_wdata : (st_posted ? r_wdata : c_wdata);
-assign m_fc    = dr_active ? dr_fc    : (st_posted ? r_fc    : c_fc);
+assign m_wdata = dr_active ? dr_wdata : push_out ? pbuf_w : (st_posted ? r_wdata : c_wdata);
+assign m_fc    = dr_active ? dr_fc    : push_out ? 3'd5   : (st_posted ? r_fc    : c_fc);
 
 // A posted store was acknowledged from ack_r at acceptance; the memory
 // acknowledge that ends its drain must NOT reach the core, which by then
 // may be holding an unrelated request that would take it as its own.
 assign c_ack   = (pass_active && !st_posted) ? m_ack : ack_r;
 assign c_rdata = pass_active ? m_rdata : rdata_r;
+
+// (COPYBACK) An access that bypasses the cache -- a read that cannot be
+// served, a store that cannot merge -- would read or write memory under a
+// dirty line of its set (or of the next set, crossing the line).  Before it
+// is accepted, the dirty ways of that set are pushed; the request is still
+// held, and C_IDLE looks at it again with the set clean.
+wire  [5:0] c_set2   = c_addr[9:4] + 6'd1;
+wire  [3:0] c_d1     = db[c_addr[9:4]];
+wire  [3:0] c_d2     = db[c_set2];
+wire        bp_acc   = c_write ? !st_upd_ok : (bypass && !c_instr);
+wire        need_push = (COPYBACK != 0) && (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
+                        c_req && !ack_r && !err_hold && !dr_active && bp_acc &&
+                        ((c_d1 != 4'd0) || (write_cross_line && (c_d2 != 4'd0)));
+wire  [5:0] np_set   = (c_d1 != 4'd0) ? c_addr[9:4] : c_set2;
+wire  [3:0] np_mask  = (c_d1 != 4'd0) ? c_d1 : c_d2;
+// CINV/CPUSH of the data cache: a row with dirty ways is pushed before the
+// sweep clears it (findings/copyback/plan.md revision 3: CINV as well)
+wire        sweep_push = (COPYBACK != 0) && (cst == C_SWEEP) && !sweep_all &&
+                         !sweep_cnt[6] && cinv_dc &&
+                         (db[sweep_cnt[5:0]] != 4'd0);
 
 assign rd_accept = (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
                    c_req && !ack_r && !c_write && !bypass && !ci_inv_pend;
@@ -545,7 +617,8 @@ assign wr_accept_upd = (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
                        c_req && !ack_r && !err_hold && !store_inv_lost &&
                        !dr_active && st_upd_ok;
 
-assign tag_ridx  = a_row;
+// a push reads its set's tags (the way's address) through port A
+assign tag_ridx  = (cst == C_PUSH) ? {1'b0, p_set} : a_row;
 wire [87:0] tags_next = (r_way == 2'd0) ? {tag_q[87:22], r_tag} :
                         (r_way == 2'd1) ? {tag_q[87:44], r_tag, tag_q[21:0]} :
                         (r_way == 2'd2) ? {tag_q[87:66], r_tag, tag_q[43:0]} :
@@ -553,7 +626,7 @@ wire [87:0] tags_next = (r_way == 2'd0) ? {tag_q[87:22], r_tag} :
 wire  [3:0] val_next  = vq | (4'd1 << r_way);
 wire        sweep_hit = sweep_all || (sweep_cnt[6] ? cinv_ic : cinv_dc);
 assign tag_we    = ((cst == C_TAGW) && !fill_snooped && !snoop_fill_row) ||
-                   ((cst == C_SWEEP) && sweep_hit);
+                   ((cst == C_SWEEP) && sweep_hit && !sweep_push);
 assign tag_widx  = (cst == C_SWEEP) ? sweep_cnt : r_row;
 assign tag_wdat  = (cst == C_SWEEP) ? {ROWW{1'b0}}
                                     : {rq + 2'd1, val_next, tags_next};
@@ -568,7 +641,7 @@ assign tag_wdat  = (cst == C_SWEEP) ? {ROWW{1'b0}}
 // An update-path store (st_upd_ok) owes no row invalidate at all: it
 // merges into the line on a hit and allocates nothing on a miss.
 wire store_inv = ((cst == C_IDLE) && c_req && c_write && !ack_r &&
-                  !store_inv_lost && !st_upd_ok && !dr_active) ||
+                  !store_inv_lost && !st_upd_ok && !dr_active && !need_push) ||
                  ((cst == C_PASS) && winv_pend) ||
                  (cst == C_WINV);
 // Snoop invalidates are FREE-RUNNING (5.1): a chipset write must land
@@ -613,13 +686,41 @@ wire [31:0] data_hit = (hit_way == 2'd0) ? data_q0 :
 // or a bus error already reported in this cycle suppresses it; the
 // memory write itself is untouched either way.  A store that misses
 // allocates nothing.
-wire st_merge = (cst == C_PASS) && st_chk && look_hit && !st_snooped && !m_err;
+// (COPYBACK) A snoop spares a dirty way and no longer changes a tag, so a
+// hit on a dirty way is trusted even in a snooped window: the store must
+// merge there, or the dirty line would later overwrite it in memory.
+wire hit_dirty = (COPYBACK != 0) && !r_row[6] && db[r_row[5:0]][hit_way];
+wire st_merge = (cst == C_PASS) && st_chk && look_hit && (!st_snooped || hit_dirty) && !m_err;
 
 // the data-array read runs with the acceptance of a cacheable read AND of
 // an update-path store (a store carries c_instr = 0, so its row is the
 // data bank's)
-assign cd_rd_en  = rd_accept | wr_accept_upd;
-assign cd_ridx   = {c_instr, a_set, c_addr[3:2]};
+wire   push_rd   = (cst == C_PUSH) && !p_ph;
+assign cd_rd_en  = rd_accept | wr_accept_upd | push_rd;
+assign cd_ridx   = push_rd ? {1'b0, p_set, p_rb[1:0]} : {c_instr, a_set, c_addr[3:2]};
+// the pushed way's longword, one clock after its address
+wire [31:0] p_dsel = (p_way == 2'd0) ? data_q0 : (p_way == 2'd1) ? data_q1 :
+                     (p_way == 2'd2) ? data_q2 : data_q3;
+wire [21:0] p_tsel = (p_way == 2'd0) ? t_w0 : (p_way == 2'd1) ? t_w1 :
+                     (p_way == 2'd2) ? t_w2 : t_w3;
+// C_LOOK trusts a hit on a dirty way in a snooped window, as st_merge does
+wire look_dirty = (COPYBACK != 0) && !r_row[6] && db[r_row[5:0]][hit_way];
+
+// dirty bits: set by a copyback store's merge, cleared when the way is
+// pushed (or its push fails) and when a fill replaces the line
+integer dbk;
+always @(posedge clk) begin
+	if (!nreset) begin
+		for (dbk = 0; dbk < 64; dbk = dbk + 1) db[dbk] <= 4'd0;
+	end else if (ce && (COPYBACK != 0)) begin
+		if (st_merge && r_cb) db[r_row[5:0]][hit_way] <= 1'b1;
+		if ((cst == C_PUSH) && push_out && m_err)
+			db[p_set] <= db[p_set] & ~p_mask;
+		else if ((cst == C_PUSH) && push_out && m_ack && (p_wb == 2'd3))
+			db[p_set][p_way] <= 1'b0;
+		if ((cst == C_TAGW) && !r_row[6]) db[r_row[5:0]][r_way] <= 1'b0;
+	end
+end
 assign cd_we     = ((cst == C_FILL) && r_issued && m_ack) ? (4'd1 << r_way) :
                    (cst == C_FILLW)                        ? (4'd1 << r_way) :
                    st_merge                                ? (4'd1 << hit_way) :
@@ -648,6 +749,10 @@ always @(posedge clk) begin
 		st_chk <= 0;
 		st_flow <= 0;
 		st_posted <= 0;
+		r_cb <= 0;
+		p_set <= 0; p_mask <= 0; p_way <= 0; p_ph <= 0; p_rb <= 0; p_wb <= 0;
+		p_req <= 0; p_tag <= 0; p_ret <= P_IDLE;
+		pbuf0 <= 0; pbuf1 <= 0; pbuf2 <= 0; pbuf3 <= 0;
 		post_err <= 0;
 		r_wdata <= 0;
 		r_fc <= 0;
@@ -684,7 +789,7 @@ always @(posedge clk) begin
 		// (store_inv's !store_inv_lost term), so the single slot cannot
 		// be overwritten.
 		if (snoop_wr && (cst == C_IDLE) && c_req && c_write && !ack_r &&
-		    !store_inv_lost && !st_upd_ok && !dr_active) begin
+		    !store_inv_lost && !st_upd_ok && !dr_active && !need_push) begin
 			store_inv_lost <= 1;
 			store_inv_set  <= c_addr[9:4];
 		end
@@ -698,6 +803,18 @@ always @(posedge clk) begin
 					sweep_cnt <= 0;
 					sweep_all <= 0;   // honour the cinv_ic/cinv_dc selects
 					cst <= C_SWEEP;
+				end
+				// (COPYBACK) a bypassing access over a dirty set: push the
+				// set's dirty ways first, then look at the request again
+				else if (need_push) begin
+					p_set  <= np_set;
+					p_mask <= np_mask;
+					p_way  <= low_way(np_mask);
+					p_ph   <= 1'b0;
+					p_rb   <= 3'd0;
+					p_req  <= 1'b0;
+					p_ret  <= P_IDLE;
+					cst    <= C_PUSH;
 				end
 				// A cache-inhibited hit owes a row invalidate.  Accept
 				// NOTHING until it lands.  rd_accept alone gated only the
@@ -751,6 +868,7 @@ always @(posedge clk) begin
 							r_off <= c_addr[1:0];
 							r_wdata <= c_wdata;
 							r_fc <= c_fc;
+							r_cb <= (COPYBACK != 0) && c_cb && st_post_ok;
 							st_chk <= 1;
 							st_flow <= 1;
 							winv_pend <= 0;
@@ -837,7 +955,16 @@ always @(posedge clk) begin
 						store_inv_set  <= r_row[5:0];
 					end
 				end
-				if (st_posted) begin
+				if (st_posted && r_cb && st_merge) begin
+					// (COPYBACK) the store hit a line of a copyback page:
+					// it merged and the line is dirty; memory is not written
+					st_posted <= 0;
+					st_flow   <= 0;
+					r_cb      <= 0;
+					cst <= C_IDLE;
+				end
+				else if (st_posted) begin
+					r_cb <= 0;
 					// A1-3a: the posted store is handed to the drain in
 					// this, its first C_PASS cycle -- the merge above has
 					// just landed -- and the FSM is free again.  A
@@ -900,6 +1027,21 @@ always @(posedge clk) begin
 			end
 
 			C_SWEEP: begin
+				if (sweep_push) begin
+					// (COPYBACK) the row has dirty ways: push them (once the
+					// drain is idle), then clear the row on the way back
+					if (!dr_active) begin
+						p_set  <= sweep_cnt[5:0];
+						p_mask <= db[sweep_cnt[5:0]];
+						p_way  <= low_way(db[sweep_cnt[5:0]]);
+						p_ph   <= 1'b0;
+						p_rb   <= 3'd0;
+						p_req  <= 1'b0;
+						p_ret  <= P_SWEEP;
+						cst    <= C_PUSH;
+					end
+				end
+				else begin
 				// one row per cycle; port A writes it (see sweep_hit)
 				sweep_cnt <= sweep_cnt + 7'd1;
 				if (sweep_cnt == 7'd127) begin
@@ -907,10 +1049,58 @@ always @(posedge clk) begin
 					sweep_all <= 0;
 					cst <= C_IDLE;
 				end
+				end
+			end
+
+			C_PUSH: begin
+				if (!p_ph) begin
+					// read the way's four longwords: the address of
+					// longword p_rb goes out, the one before arrives
+					p_rb <= p_rb + 3'd1;
+					case (p_rb)
+						3'd1: pbuf0 <= p_dsel;
+						3'd2: pbuf1 <= p_dsel;
+						3'd3: pbuf2 <= p_dsel;
+						3'd4: pbuf3 <= p_dsel;
+						default: ;
+					endcase
+					if (p_rb == 3'd4) begin
+						p_tag <= p_tsel;
+						p_ph  <= 1'b1;
+						p_wb  <= 2'd0;
+						p_req <= 1'b1;
+					end
+				end
+				else if (p_req && m_err) begin
+					// a write-back cannot be restarted: the late error
+					// the core halts on (post_err), and the push is over
+					p_req    <= 1'b0;
+					post_err <= 1'b1;
+					p_mask   <= 4'd0;
+					cst <= (p_ret == P_LOOK) ? C_LOOK : (p_ret == P_SWEEP) ? C_SWEEP : C_IDLE;
+				end
+				else if (p_req && m_ack) begin
+					p_req <= 1'b0;
+					if (p_wb == 2'd3) begin
+						// the way is clean (db): the next dirty way, or back
+						if ((p_mask & ~(4'd1 << p_way)) == 4'd0) begin
+							p_mask <= 4'd0;
+							cst <= (p_ret == P_LOOK) ? C_LOOK : (p_ret == P_SWEEP) ? C_SWEEP : C_IDLE;
+						end
+						else begin
+							p_mask <= p_mask & ~(4'd1 << p_way);
+							p_way  <= low_way(p_mask & ~(4'd1 << p_way));
+							p_ph   <= 1'b0;
+							p_rb   <= 3'd0;
+						end
+					end
+					else p_wb <= p_wb + 2'd1;
+				end
+				else if (!p_req) p_req <= 1'b1;   // after the gap clock
 			end
 
 			C_LOOK: begin
-				if (look_hit && !look_snooped && !snoop_look_row) begin
+				if (look_hit && ((!look_snooped && !snoop_look_row) || look_dirty)) begin
 					// all four ways were read alongside the tags, so the
 					// hit completes here: two cycles request-to-ack
 					rdata_r <= lw_extract(data_hit, r_size, r_off);
@@ -928,6 +1118,18 @@ always @(posedge clk) begin
 						// forced anyway, and memory order is preserved
 						// (the fill cannot overtake the store it may be
 						// reading)
+					end
+					else if ((COPYBACK != 0) && !r_row[6] && db[r_row[5:0]][rq]) begin
+						// (COPYBACK) the victim is dirty: push it, then
+						// come back here (still a miss, now a clean victim)
+						p_set  <= r_row[5:0];
+						p_mask <= 4'd1 << rq;
+						p_way  <= rq;
+						p_ph   <= 1'b0;
+						p_rb   <= 3'd0;
+						p_req  <= 1'b0;
+						p_ret  <= P_LOOK;
+						cst    <= C_PUSH;
 					end
 					else if (FILL_CHANNEL != 0 && fill_ok) begin
 						// A1: the whole line over the fill channel

@@ -72,11 +72,13 @@ start:	move.l	#CACR_ON,d0
 	moveq	#15,d1
 .pt:	move.l	d0,d2
 	or.b	(a1)+,d2
-	or.l	#1,d2
+	or.l	#$19,d2			; resident, U and M set: the walker never
+					; writes a descriptor (its snoop would clear
+					; set 0, where $2000 lives)
 	move.l	d2,(a0)+
 	add.l	#$1000,d0
 	dbra	d1,.pt
-	move.l	#$2000|CM_CI|1,PAGE+4*4	; page 4 = physical page 2, inhibited
+	move.l	#$2000|CM_CI|$19,PAGE+4*4	; page 4 = physical page 2, inhibited
 	move.l	#ROOT,d0
 	movec	d0,srp
 	movec	d0,urp
@@ -156,8 +158,10 @@ start:	move.l	#CACR_ON,d0
 	chkpk	$3050,$77777777,16
 
 ; 7: a DMA write to another line of the set leaves the dirty line alone
+	move.l	$2460,d0			; set $06, way 0 (the victim a
+						; row clear resets the pointer to)
 	move.l	$2060,d0
-	move.l	#$88888888,$2060		; dirty, set $06
+	move.l	#$88888888,$2060		; dirty, set $06, way 1
 	move.w	#$1C60,$F1E4			; the DMA agent: $1C60 (set $06)
 	move.w	#$5A5A,$F1E6
 	move.w	#0,$F1EA			; with its snoop

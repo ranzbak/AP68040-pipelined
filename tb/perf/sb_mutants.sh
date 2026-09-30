@@ -21,6 +21,7 @@ asm t_sbuf_pipe "$T/cache_asm" || exit 1
 asm t_fwd_pipe "$T/cache_asm" || exit 1
 asm t_sbmmu_pipe "$T/cache_asm" || exit 1
 asm t_dcache_pipe "$T/cache_asm" || exit 1
+asm t_cb_pipe "$T/cache_asm" || exit 1
 python3 "$T/mk_tmmu.py" "$AP040_REF/tb/asm/t_mmu.s" m9s > "$OUT/t_mmu_m9s.s" &&
 ( cd "$OUT" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o t_mmu_m9s.bin t_mmu_m9s.s ) &&
 python3 "$T/bin2hex.py" "$OUT/t_mmu_m9s.bin" "$OUT/t_mmu_m9s.hex" || exit 1
@@ -167,5 +168,36 @@ run_one pg_noflush ap040_pipe_core.v \
 run_one pg_nofc ap040_pipe_core.v \
 	"((pg_v[0] && pg_a[0] == fw_st_addr[31:12] && pg_f[0] == fw_st_fc) ||" \
 	"((pg_v[0] && pg_a[0] == fw_st_addr[31:12]) ||" compat t_sbmmu_pipe "-DSB_MMU=1" &
+
+echo "== copyback mutants (findings/copyback/plan.md S2, COPYBACK = 1)"
+CB="-DCOPYBACK=1 -DSB_MMU=1"
+# a copyback store hit still writes memory in its first C_PASS clock
+run_one cb_issue ap040_cache.v \
+	"(pass_active ? ((c_req & ~st_posted) | (st_posted & ~(st_chk & r_cb))) : 1'b0);" \
+	"(pass_active ? (c_req | st_posted) : 1'b0);" compat t_cb_pipe "$CB" &
+# a merged copyback store does not mark its line dirty
+run_one cb_nodirty ap040_cache.v \
+	"if (st_merge && r_cb) db[r_row[5:0]][hit_way] <= 1'b1;" \
+	"if (1'b0) db[r_row[5:0]][hit_way] <= 1'b1;" compat t_cb_pipe "$CB" &
+# a dirty victim is filled over without being pushed
+run_one cb_noevict ap040_cache.v \
+	"else if ((COPYBACK != 0) && !r_row[6] && db[r_row[5:0]][rq]) begin" \
+	"else if (1'b0) begin" compat t_cb_pipe "$CB" &
+# CINV/CPUSH clear dirty rows without pushing them
+run_one cb_nosweep ap040_cache.v \
+	"wire        sweep_push = (COPYBACK != 0) && (cst == C_SWEEP) && !sweep_all &&" \
+	"wire        sweep_push = 1'b0 && (cst == C_SWEEP) && !sweep_all &&" compat t_cb_pipe "$CB" &
+# a bypassing access goes to memory under a dirty line
+run_one cb_nobypass ap040_cache.v \
+	"wire        need_push = (COPYBACK != 0) && (cst == C_IDLE) && !(cinv_req && !cinv_done) &&" \
+	"wire        need_push = 1'b0 && (cst == C_IDLE) && !(cinv_req && !cinv_done) &&" compat t_cb_pipe "$CB" &
+# a row clear (the snoop) drops dirty ways
+run_one cb_nokeep ap040_cache.v \
+	"wire [3:0] vb_keep = ((COPYBACK != 0) && !inv_idx[6]) ? db[inv_idx[5:0]] : 4'd0;" \
+	"wire [3:0] vb_keep = 4'd0;" compat t_cb_pipe "$CB" &
+# a push writes the wrong longword (the data RAM's word before)
+run_one cb_pbuf ap040_cache.v \
+	"						3'd1: pbuf0 <= p_dsel;" \
+	"						3'd2: pbuf0 <= p_dsel;" compat t_cb_pipe "$CB" &
 wait
 

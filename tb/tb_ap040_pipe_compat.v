@@ -268,6 +268,9 @@ end
 `ifndef SB_MMU
 `define SB_MMU 0
 `endif
+`ifndef COPYBACK
+`define COPYBACK 0
+`endif
 ap040_pipe_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
                      .AP040_POST_STORES(POST),
                      .AP040_FILL_CHANNEL(FILLCH),
@@ -276,7 +279,8 @@ ap040_pipe_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
                      .AP040_RAS(`RAS),
                      .AP040_PRECISE(`PRECISE),
                      .AP040_MISPLIT(`MISPLIT),
-                     .AP040_SB_MMU(`SB_MMU)) dut
+                     .AP040_SB_MMU(`SB_MMU),
+                     .AP040_COPYBACK(`COPYBACK)) dut
 (
 	.clk(clk),
 	.nreset(nreset),
@@ -1185,9 +1189,7 @@ task run_phase;
 		// interrupt-injection capability word: t_fpu's IRQ soak runs
 		// only where the bench can deliver IPL
 		mem[16'hF160 >> 1] = 16'h0007;	// coarse + fine IPL + berr injection
-`ifdef COPYBACK
-		mem[16'hF196 >> 1] = 16'h0001;	// copyback cache compiled in
-`endif
+		mem[16'hF196 >> 1] = (`COPYBACK != 0) ? 16'h0001 : 16'h0000;	// copyback compiled in
 
 		nreset = 0;
 		repeat (10) @(posedge clk);

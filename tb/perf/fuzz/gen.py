@@ -15,6 +15,10 @@ R = random.Random(seed)
 # handler stores to and checks up to six more pages ($8000-$DFFF), so with
 # translation on the core's postable-page table (SB_MMU) replaces entries
 irq = os.environ.get("GEN_IRQ", "0") == "1"
+# GEN_CB=1 (findings/copyback/plan.md): with translation on, the work page
+# ($2000) is copyback (CM = 01); the results are copied out through the
+# cache to a write-through page, and CPUSHA runs before the end
+cb = os.environ.get("GEN_CB", "0") == "1"
 IR = random.Random(seed ^ 0x5eed)   # (its own stream: the program stays the same)
 L = []
 def e(s): L.append("\t" + s)
@@ -109,6 +113,7 @@ if seed & 1:
     e("lea\t$5200,a0"); e("move.l\t#$5400|3,(a0)")
     e("lea\t$5400,a0"); e("moveq\t#0,d0"); e("moveq\t#15,d1")
     L.append("pt:\tmove.l\td0,d2"); e("or.l\t#1,d2"); e("move.l\td2,(a0)+"); e("add.l\t#$1000,d0"); e("dbra\td1,pt")
+    if cb: e("move.l\t#$2000|$20|1,$5400+2*4")   # page 2 copyback
     e("move.l\t#$5000,d0"); e("movec\td0,srp"); e("movec\td0,urp"); e("pflusha")
     e("move.l\t#$8000,d0"); e("movec\td0,tc")
 e("lea\t$2000,a0"); e("move.w\t#$3ff,d7"); e(f"move.l\t#${R.getrandbits(32):08x},d0")
@@ -129,6 +134,7 @@ if irq:
 e("lea\t$2000,a4"); e("lea\t$3000,a5"); e("move.w\t#$2ff,d7")
 L.append("cpy:\tmove.l\t(a4)+,(a5)+"); e("dbra\td7,cpy")
 e("movem.l\td0-d6/a0-a3,$3c00")
+if cb: e("cpusha\tdc")
 e("moveq\t#0,d0"); e("movec\td0,tc"); e("move.l\t#$00008000,d0"); e("movec\td0,cacr")
 e("move.w\t$f1f6,$3c40")                   # I/O writes counted (DE off: from memory)
 e("move.w\t#$600d,$f102")

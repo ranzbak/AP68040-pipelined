@@ -63,7 +63,12 @@ module ap040_pipe_tg68k_compat
 	// findings/storebuf/plan.md stage 4: with translation on, a store to a
 	// page a synchronous store has proved postable is posted as well (the
 	// core's page table, the MMU's m_postok).  Needs AP040_STORE_BUF = 1.
-	parameter AP040_SB_MMU       = 0
+	parameter AP040_SB_MMU       = 0,
+	// findings/copyback/plan.md: the data cache keeps a store hit to a
+	// copyback page (CM = 01) in the DDR3 board's window, and writes it
+	// back when the line is evicted or pushed.  0: write-through as before.
+	// Needs AP040_POST_STORES = 1 and the internal caches.
+	parameter AP040_COPYBACK     = 0
 )
 (
 	input         clk,
@@ -240,7 +245,7 @@ wire        mm_req, mm_write, mm_instr;
 wire  [1:0] mm_size;
 wire [31:0] mm_addr, mm_wdata;
 wire  [2:0] mm_fc;
-wire        mm_ack, mm_nocache, mm_postok;
+wire        mm_ack, mm_nocache, mm_postok, mm_cb;
 wire [31:0] mm_rdata;
 
 // cache to bus adapter
@@ -487,7 +492,7 @@ ap040_mmu #(.IFP(IFP_ON ? 1 : 0)) mmu (
 	.walker_req(walker_req), .walker_we(walker_we), .walker_addr(walker_addr),
 	.walker_wdat(walker_wdat), .walker_ack(walker_ack), .walker_data(walker_data),
 	.walker_berr(walker_berr),
-	.phys_addr(mmu_addr_phys), .cache_inhibit(mmu_cache_inhibit), .m_nocache(mm_nocache), .m_postok(mm_postok),
+	.phys_addr(mmu_addr_phys), .cache_inhibit(mmu_cache_inhibit), .m_nocache(mm_nocache), .m_postok(mm_postok), .m_cb(mm_cb),
 	.ifp_en(ifp_req), .ifp_addr(ifp_addr), .ifp_s(ifp_s),
 	.ifp_ok(ifp_tok), .ifp_pa(ifp_pa), .ifp_ci(ifp_tci),
 	.dfp_en(dfp_req), .dfp_addr(dfp_addr), .dfp_fc(dfp_fc),
@@ -518,6 +523,7 @@ assign mm_wdata  = mem_wdata;
 assign mm_fc     = mem_fc;
 assign mm_nocache = 1'b0;
 assign mm_postok  = 1'b0;
+assign mm_cb      = 1'b0;
 assign mem_ack   = mm_ack;
 assign mem_rdata = mm_rdata;
 assign mem_flt_mmu = 1'b0;
@@ -604,6 +610,12 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		(!mm_addr[31:24] && (mm_addr[23] ^ |mm_addr[22:21]) && cache_z2_ena) ||
 		cache_chip;
 	wire cache_allow = cache_allow_all | cache_win;
+	// (findings/copyback/plan.md) copyback only in the DDR3 board's window:
+	// posting into the SDRAM corrupted data on the board (stage 4), and
+	// nothing but the CPU writes the DDR3 board.  A flat bench: all of it
+	// but the bench's registers.
+	wire cb_win = cache_allow_all ? (mm_addr[15:8] != 8'hF1) :
+	              ((mm_addr[31:28] == cache_z3_base1) && cache_z3_ena1);
 
 	// The instruction read path (plan M14).  The core launches a lookup
 	// with every fetch it issues (ifp_req includes the clock enable): the
@@ -697,7 +709,8 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 	ap040_cache #(
 		.POST_STORES(AP040_POST_STORES),
 		.FILL_CHANNEL(AP040_FILL_CHANNEL),
-		.IFP(IFP_ON ? 1 : 0)
+		.IFP(IFP_ON ? 1 : 0),
+		.COPYBACK(AP040_COPYBACK)
 	) cache (
 		.clk(clk),
 		.nreset(nreset),
@@ -729,6 +742,7 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.c_fc(mm_fc),
 		.c_nocache(mm_nocache | ~cache_allow |
 		           (mm_instr & cache_chip & ~cache_allow_all)),
+		.c_cb((AP040_COPYBACK != 0) && mm_cb && cb_win),
 		.s_stb(snp_stb),
 		.s_addr(snp_addr),
 		.c_ack(mm_ack),

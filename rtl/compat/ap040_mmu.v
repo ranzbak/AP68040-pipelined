@@ -105,6 +105,7 @@ module ap040_mmu
 	output     [31:0] phys_addr,
 	output            cache_inhibit,
 	output            m_nocache,
+	output            m_cb,          // (S2) the page is copyback (CM = 01)
 	// (store buffer stage 4, findings/storebuf/plan.md) the write forwarded
 	// now could have been posted: a TTR hit that neither write-protects nor
 	// inhibits, or an ATC hit that passed -- so writable, M already set, S
@@ -441,6 +442,11 @@ assign phys_addr     = pa_out;
 assign cache_inhibit = ttr_hit ? ttr_cm[1]
                      : (tc_e && atc_hit) ? h_cm[1] : 1'b0;
 assign m_nocache     = cache_inhibit;
+// (findings/copyback/plan.md S2) the page is copyback, CM = 01: from a
+// matching TTR, or the ATC entry with translation on; like cache_inhibit it
+// is combinational and valid while the request is held
+assign m_cb          = ttr_hit ? (ttr_cm == 2'b01)
+                     : (tc_e && atc_hit) ? (h_cm == 2'b01) : 1'b0;
 
 //---------------------------------------------------------------------------
 // walker FSM (single always block: owns atc arrays and w_* state)
