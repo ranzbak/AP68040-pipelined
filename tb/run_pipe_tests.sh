@@ -21,7 +21,7 @@ SRC="$RTL/ap040_pipe_pkg.sv $(ls $RTL/ap040_*.v | tr '\n' ' ')"
 # PIPE_STORE_BUF=<n>: build the program and wrapper benches with that store
 # buffer mode (findings/storebuf/plan.md: 0 off, 1 posting, 2 the A/B
 # reference); the bus-mode benches check the store order with tb_sb_check.v
-SBDEF="${PIPE_STORE_BUF:+-DSTORE_BUF=$PIPE_STORE_BUF} ${PIPE_FWD:+-DFWD=$PIPE_FWD} ${PIPE_RAS:+-DRAS=$PIPE_RAS} ${PIPE_PRECISE:+-DPRECISE=$PIPE_PRECISE} ${PIPE_MISPLIT:+-DMISPLIT=$PIPE_MISPLIT} ${PIPE_SB_MMU:+-DSB_MMU=$PIPE_SB_MMU}"
+SBDEF="${PIPE_STORE_BUF:+-DSTORE_BUF=$PIPE_STORE_BUF} ${PIPE_FWD:+-DFWD=$PIPE_FWD} ${PIPE_RAS:+-DRAS=$PIPE_RAS} ${PIPE_PRECISE:+-DPRECISE=$PIPE_PRECISE} ${PIPE_MISPLIT:+-DMISPLIT=$PIPE_MISPLIT} ${PIPE_SB_MMU:+-DSB_MMU=$PIPE_SB_MMU} ${PIPE_COPYBACK:+-DCOPYBACK=$PIPE_COPYBACK}"
 # PIPE_SB_MMU=1: stores posted with translation on too (store buffer stage 4)
 # PIPE_PRECISE=1 / PIPE_MISPLIT=1: address-precise fast reads, misaligned transfers split (catchup)
 # PIPE_RAS=1: ID's return-address stack (findings/catchup/plan.md step 2), every bench
@@ -265,12 +265,12 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 	# landing on an instruction past P_START with no read in flight.  The
 	# failure is a WEDGE, so it gets a short phase timeout (it passes in
 	# 180k clocks) instead of the bench's 20M default.
-	for t in t_integer t_cache t_bitfield_mmu t_mmu_m9s t_mmu_pipe t_rmw_wp texc_m9t t_irq_pipe t_mbit_pipe t_trirq_pipe t_ipend_pipe t_irqwedge_pipe t_icache_pipe t_earlydrop_pipe t_specread_pipe t_dcache_pipe t_sbuf_pipe t_fwd_pipe t_sbmmu_pipe $TMR; do
+	for t in t_integer t_cache t_bitfield_mmu t_mmu_m9s t_mmu_pipe t_rmw_wp texc_m9t t_irq_pipe t_mbit_pipe t_trirq_pipe t_ipend_pipe t_irqwedge_pipe t_icache_pipe t_earlydrop_pipe t_specread_pipe t_dcache_pipe t_sbuf_pipe t_fwd_pipe t_sbmmu_pipe t_cb_pipe $TMR; do
 		if [ "$t" = t_mmu_m9s ] || [ "$t" = t_movem_restart_m9s ] || [ "$t" = texc_m9t ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "$WORK/$t.s"
 		elif [ "$t" = t_mmu_pipe ] || [ "$t" = t_rmw_wp ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "mmu_asm/$t.s"
-		elif [ "$t" = t_icache_pipe ] || [ "$t" = t_earlydrop_pipe ] || [ "$t" = t_specread_pipe ] || [ "$t" = t_dcache_pipe ] || [ "$t" = t_sbuf_pipe ] || [ "$t" = t_fwd_pipe ] || [ "$t" = t_sbmmu_pipe ]; then
+		elif [ "$t" = t_icache_pipe ] || [ "$t" = t_earlydrop_pipe ] || [ "$t" = t_specread_pipe ] || [ "$t" = t_dcache_pipe ] || [ "$t" = t_sbuf_pipe ] || [ "$t" = t_fwd_pipe ] || [ "$t" = t_sbmmu_pipe ] || [ "$t" = t_cb_pipe ]; then
 			# plan M14: the pipelined instruction read path's coherency rules
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "cache_asm/$t.s"
 		elif [ "$t" = t_irq_pipe ] || [ "$t" = t_mbit_pipe ] || [ "$t" = t_trirq_pipe ] || [ "$t" = t_ipend_pipe ] || [ "$t" = t_irqwedge_pipe ]; then

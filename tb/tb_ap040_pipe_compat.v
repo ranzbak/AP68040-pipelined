@@ -753,6 +753,21 @@ always @(posedge clk) begin
 	end
 end
 
+// $F190 (word write): a memory PEEK address (low 16 bits); $F192/$F194
+// (read): the longword the bench's memory array holds there, straight from
+// mem[] -- what memory has behind the caches (findings/copyback/plan.md: a
+// dirty copyback line is not in memory until it is pushed).  Read them
+// through a cache-inhibited mapping, or the data cache keeps an old copy.
+// $F196 (read): 1 when the core under test has the copyback cache compiled
+// in (COPYBACK), set with each phase's program load.
+reg [15:0] peek_a = 0;
+always @(posedge clk) begin
+	if (nreset && dut.mem_ack && dut.mem_write && dut.mem_addr[15:0] == 16'hF190)
+		peek_a <= dut.mem_wdata[15:0];
+	mem[16'hF192 >> 1] = mem[peek_a[15:1]];
+	mem[16'hF194 >> 1] = mem[peek_a[15:1] + 15'd1];
+end
+
 // $F1F4 (write): a counting register for stores -- every store to it that
 // the core completes adds one to the word at $F1F6 (a strobe register, like
 // COPJMP: a store issued twice fires twice).  Pipelined bench only.
@@ -1170,6 +1185,9 @@ task run_phase;
 		// interrupt-injection capability word: t_fpu's IRQ soak runs
 		// only where the bench can deliver IPL
 		mem[16'hF160 >> 1] = 16'h0007;	// coarse + fine IPL + berr injection
+`ifdef COPYBACK
+		mem[16'hF196 >> 1] = 16'h0001;	// copyback cache compiled in
+`endif
 
 		nreset = 0;
 		repeat (10) @(posedge clk);
