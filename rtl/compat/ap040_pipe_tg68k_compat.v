@@ -68,7 +68,9 @@ module ap040_pipe_tg68k_compat
 	// copyback page (CM = 01) in the DDR3 board's window, and writes it
 	// back when the line is evicted or pushed.  0: write-through as before.
 	// Needs AP040_POST_STORES = 1 and the internal caches.
-	parameter AP040_COPYBACK     = 0
+	parameter AP040_COPYBACK     = 0,
+	// findings/btb/plan.md: IF's branch target buffer.  0: none.
+	parameter AP040_BTB          = 0
 )
 (
 	input         clk,
@@ -366,6 +368,7 @@ ap040_pipe_core #(
 	.STORE_BUF(AP040_STORE_BUF),
 	.FWD(AP040_FWD),
 	.RAS(AP040_RAS),
+	.BTB(AP040_BTB),
 	.PRECISE(AP040_PRECISE),
 	.MISPLIT(AP040_MISPLIT),
 	.SB_MMU(AP040_SB_MMU)

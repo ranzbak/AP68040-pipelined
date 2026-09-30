@@ -16,7 +16,7 @@ asm() {   # name dir -> $OUT/name.hex
 	( cd "$2" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$OUT/$1.bin" "$1.s" ) &&
 	python3 "$T/bin2hex.py" "$OUT/$1.bin" "$OUT/$1.hex"
 }
-for p in sb_raw sb_order sb_serialize sb_lateberr nop_sync smc ras misplit; do asm $p "$T/pipe_asm" || exit 1; done
+for p in sb_raw sb_order sb_serialize sb_lateberr nop_sync smc ras misplit btb; do asm $p "$T/pipe_asm" || exit 1; done
 asm t_sbuf_pipe "$T/cache_asm" || exit 1
 asm t_fwd_pipe "$T/cache_asm" || exit 1
 asm t_sbmmu_pipe "$T/cache_asm" || exit 1
@@ -26,7 +26,7 @@ python3 "$T/mk_tmmu.py" "$AP040_REF/tb/asm/t_mmu.s" m9s > "$OUT/t_mmu_m9s.s" &&
 ( cd "$OUT" && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o t_mmu_m9s.bin t_mmu_m9s.s ) &&
 python3 "$T/bin2hex.py" "$OUT/t_mmu_m9s.bin" "$OUT/t_mmu_m9s.hex" || exit 1
 
-run_one() {   # name file old new bench(prog|compat) program [extra define]
+run_one() {   # name file old new bench(prog|l1|compat) program [extra define]
 	n=$1; f=$2; old=$3; new=$4; b=$5; prog=$6; xd=${7:-}
 	d=$OUT/$n; rm -rf "$d"; mkdir -p "$d"
 	cp -r "$T/../rtl" "$d/rtl"
@@ -39,7 +39,14 @@ open(p,'w').write(s.replace(old,new))
 PY
 	R=$d/rtl
 	SRC="$R/ap040_pipe_pkg.sv $(ls $R/ap040_*.v | tr '\n' ' ')"
-	if [ "$b" = prog ]; then
+	if [ "$b" = l1 ]; then
+		# the program bench on the L1 substrate: a fetch answers in one
+		# clock, so IF runs ahead of the pipeline as it cannot on the bus
+		iverilog -g2012 -DSTORE_BUF=1 $xd -I "$R" -o "$d/tb.vvp" "$T/tb_ap040_pipe_prog.v" $SRC > "$d/clog" 2>&1 ||
+			{ echo "  $n: MUTANT DOES NOT COMPILE"; return; }
+		cyc=$(sed -n 's/^; diff:.*--cycles \([0-9]*\).*/\1/p' "$T/pipe_asm/$prog.s" | head -1)
+		timeout 900 vvp "$d/tb.vvp" +prog="$OUT/$prog.hex" +expect="$T/pipe_asm/$prog.exp" +cycles=${cyc:-20000} > "$d/log" 2>&1
+	elif [ "$b" = prog ]; then
 		iverilog -g2012 -DSTORE_BUF=1 $xd -DBUS_MODE -I "$R" -o "$d/tb.vvp" "$T/tb_ap040_pipe_prog.v" "$T/tb_sb_check.v" $SRC > "$d/clog" 2>&1 ||
 			{ echo "  $n: MUTANT DOES NOT COMPILE"; return; }
 		cyc=$(sed -n 's/^; diff:.*--cycles \([0-9]*\).*/\1/p' "$T/pipe_asm/$prog.s" | head -1)
@@ -199,5 +206,32 @@ run_one cb_nokeep ap040_cache.v \
 run_one cb_pbuf ap040_cache.v \
 	"						3'd1: pbuf0 <= p_dsel;" \
 	"						3'd2: pbuf0 <= p_dsel;" compat t_cb_pipe "$CB" &
+
+echo "== branch target buffer mutants (findings/btb/plan.md, BTB = 1)"
+BT="-DBTB=1 -DRAS=1"
+# a prediction is confirmed without comparing its target
+run_one btb_nocmp ap040_decode.v \
+	"wire   pred_ok = mk_end && is_br && (d.btarget[31:1] == m_tgt);" \
+	"wire   pred_ok = mk_end && is_br;" prog btb "$BT" &
+# a marked word inside an instruction is not restarted
+run_one btb_nobad ap040_decode.v \
+	"wire bad_mk  = mk_in && !mk_end;" \
+	"wire bad_mk  = 1'b0;" prog btb "$BT" &
+# a marked word ending a non-branch does not redirect to the next instruction
+run_one btb_noendfix ap040_decode.v \
+	"assign id_redirect_valid = bad_mk || (std_rd && !pred_ok) || (emit && mk_end && !std_rd);" \
+	"assign id_redirect_valid = bad_mk || (std_rd && !pred_ok);" prog btb "$BT" &
+# a predicted fetch keeps the word after the branch
+run_one btb_keepword ap040_inst_fetch.v \
+	"			ncnt = ncnt + ((infl_p && !infl_slot) ? 3'd1 : {1'b0, infl_n});" \
+	"			ncnt = ncnt + {1'b0, infl_n};" prog btb "$BT" &
+# the queue's PC does not jump to the target after the marked word
+run_one btb_qpc ap040_inst_fetch.v \
+	"			qpc <= {m_tg, 1'b0} + ((consume_nf == 2'd2) ? 32'd2 : 32'd0);" \
+	"			qpc <= qpc + {29'd0, consume_nf, 1'b0};" prog btb "$BT" &
+# the self-modifying-code check misses the code after the predicted jump
+run_one btb_range2 ap040_pipe_core.v \
+	"ovl(exe_o.st_addr, exe_o.st_size, BTB != 0, if_q_lo2, if_q_hi2));" \
+	"ovl(exe_o.st_addr, exe_o.st_size, 1'b0, if_q_lo2, if_q_hi2));" l1 btb "$BT" &
 wait
 

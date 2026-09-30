@@ -139,6 +139,9 @@ ap040_pipe_core #(
 `ifdef STORE_BUF
 	, .STORE_BUF(`STORE_BUF)
 `endif
+`ifdef BTB
+	, .BTB(`BTB)
+`endif
 `ifdef RAS
 	, .RAS(`RAS)
 `endif

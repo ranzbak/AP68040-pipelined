@@ -1,0 +1,11 @@
+# findings/btb/plan.md: every branch lands right, predicted by IF or not.
+# Hand-computed: bits 1-10 of $7000 = the ten cases.
+halt 000005b6
+m32 00007000 000007fe
+d1 00000004
+d2 00006002
+d3 00000007
+d4 00000004
+d5 00000028
+d6 00000046
+a3 00000001

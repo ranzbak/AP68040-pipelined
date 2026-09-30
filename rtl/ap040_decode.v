@@ -41,7 +41,12 @@ module ap040_decode
 	// pop; an RTS popping an entry redirects IF to it, as a guessed-taken
 	// Bcc does, and carries it (btarget, rpred) for EA-fetch to check.  A
 	// push or pop on a path later flushed only costs a misprediction.
-	parameter RAS = 0
+	parameter RAS = 0,
+	// findings/btb/plan.md: IF's branch target buffer.  ID confirms a
+	// prediction (the marked word ends a branch it redirects on, to the same
+	// target), repairs one that is wrong, restarts an instruction a marked
+	// word lands inside, and teaches the buffer its taken-branch redirects.
+	parameter BTB = 0
 )
 (
 	input             clk,
@@ -58,6 +63,17 @@ module ap040_decode
 	input      [15:0] q_w1,
 	input             q_e0,         // poisoned words (their fetch faulted, M6)
 	input             q_e1,
+	input             q_m0,         // (BTB) a predicted branch's last word (IF's mark)
+	input             q_m1,
+	input             q_s0,         // (BTB) the second word of its fetch
+	input             q_s1,
+	input      [31:1] m_tgt,        // (BTB) the prediction's target
+	input      [31:1] m_fa,         // (BTB) the fetch it was learned for
+	output            btb_wr,       // (BTB) write (btb_val) or invalidate an entry
+	output            btb_val,
+	output     [31:1] btb_fa,
+	output            btb_slot,
+	output     [31:1] btb_tgt,
 	input      [31:0] pf_addr,      // the faulted fetch
 	input             pf_long,
 	input             pf_atc,
@@ -1628,7 +1644,7 @@ assign g_v  = (wcnt != 4'd0);
 //--------------------------------------------------------------- emit
 
 wire done_i = complete || fbad;
-wire emit = done_i && !flush && !stall_in;
+wire emit_i = done_i && !flush && !stall_in;
 
 // words taken: on emit, only this instruction's (the next one's first word
 // may be the second word offered); while gathering, all of them; nothing
@@ -1643,6 +1659,20 @@ assign consume = (flush || stall_in) ? 2'd0 :
 // WB hold -> EA-fetch stall chain) need not reach IF's request through ID.
 assign consume_nf = stall_in ? 2'd0 :
                     fbad ? avail : complete ? need[1:0] : avail;
+
+// (BTB) The marked word taken this clock.  It must be the LAST word ID takes
+// for an instruction it completes; anywhere else -- taken while gathering,
+// or followed by another word -- the words after it are the target's, not
+// this instruction's: the instruction is dropped and fetched again from its
+// first word (bad_mk), and the entry is invalidated.
+wire mk_in   = (BTB != 0) && !flush && !stall_in &&
+               ((q_m0 && (consume_nf != 2'd0)) || (q_m1 && (consume_nf == 2'd2)));
+wire mk_end  = mk_in && complete && !fbad &&
+               ((q_m0 && (consume_nf == 2'd1)) || (q_m1 && (consume_nf == 2'd2)));
+wire bad_mk  = mk_in && !mk_end;
+wire emit    = emit_i && !bad_mk;
+// the last word's position in its fetch (the entry's slot)
+wire s_last  = (consume_nf == 2'd2) ? q_s1 : q_s0;
 
 // the return-address stack (RAS)
 reg  [31:0] ras [0:7];
@@ -1669,8 +1699,23 @@ always @(posedge clk)
 
 // guess taken: Bcc/BRA/BSR redirect IF the clock they are emitted; so does
 // an RTS the return-address stack predicts
-assign id_redirect_valid = emit && (d.cls == CL_BCC || d.cls == CL_BSR || d.cls == CL_DBCC || ras_hit);
-assign id_redirect_pc    = d_ras.btarget;
+wire   is_br  = (d.cls == CL_BCC || d.cls == CL_BSR || d.cls == CL_DBCC);
+wire   std_rd = emit && (is_br || ras_hit);
+// (BTB) IF already fetched the target: nothing to redirect.  A marked word
+// that ends another instruction, or a branch to another target, redirects
+// where ID would have gone (the target, or the next instruction).
+wire   pred_ok = mk_end && is_br && (d.btarget[31:1] == m_tgt);
+assign id_redirect_valid = bad_mk || (std_rd && !pred_ok) || (emit && mk_end && !std_rd);
+assign id_redirect_pc    = bad_mk ? vpc : std_rd ? d_ras.btarget : d.next_pc;
+// (BTB) learning: a taken branch IF did not predict is written for the fetch
+// that brought its last word; a wrong or misplaced mark fixes its entry
+wire   learn  = (BTB != 0) && emit && is_br && !mk_end && !d.btarget[0];
+wire   fix    = (BTB != 0) && ((emit && mk_end && !pred_ok) || bad_mk);
+assign btb_wr   = learn || fix;
+assign btb_val  = learn || (fix && !bad_mk && is_br && !d.btarget[0]);
+assign btb_fa   = learn ? ((d.next_pc[31:1] - 31'd1) - {30'd0, s_last}) : m_fa;
+assign btb_slot = learn ? s_last : ((consume_nf == 2'd2) ? q_s1 : q_s0);
+assign btb_tgt  = d.btarget[31:1];
 
 always @(posedge clk) begin
 	if (!nreset) begin
@@ -1681,7 +1726,8 @@ always @(posedge clk) begin
 		werr     <= 11'd0;
 		g_pc     <= 32'd0;
 	end else if (ce) begin
-		if (flush) begin
+		if (flush || bad_mk) begin
+			// (bad_mk: the instruction is fetched again from its first word)
 			id_valid <= 1'b0;
 			wcnt     <= 4'd0;
 			werr     <= 11'd0;

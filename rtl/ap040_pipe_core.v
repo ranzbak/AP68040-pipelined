@@ -84,7 +84,10 @@ module ap040_pipe_core
 	// post a store to a page a synchronous store has proved postable
 	// (mem_postok with its acknowledge): the core keeps 4 such pages,
 	// flushed by PFLUSH and by a MOVEC to TC, URP, SRP or a TTR.
-	parameter         SB_MMU             = 0
+	parameter         SB_MMU             = 0,
+	// findings/btb/plan.md: IF's 16-entry branch target buffer, taught by
+	// ID's taken-branch redirects; ID confirms or recovers.  0: none.
+	parameter         BTB                = 0
 )
 (
 	input  clk,
@@ -264,6 +267,12 @@ wire  [1:0] fw_st_size;
 wire        q_v0, q_v1;  wire [31:0] q_pc0;  wire [15:0] q_w0, q_w1;  wire [1:0] id_consume, id_consume_nf;
 // self-modifying code: the code the stages younger than EX hold
 wire [31:0] if_q_lo, if_q_hi, id_g_lo, id_g_hi;
+// (BTB) IF's second code range (after a predicted jump), its marks, and the
+// buffer's port from ID
+wire [31:0] if_q_lo2, if_q_hi2;
+wire        q_m0, q_m1, q_s0, q_s1;
+wire [31:1] bt_mtgt, bt_mfa, bt_fa, bt_tgt;
+wire        bt_wr, bt_val, bt_slot;
 wire        id_g_v, smc_hit, wb_smc;
 wire        id_valid;  id_t id_o;
 wire        eac_valid; eac_t eac_o;
@@ -757,13 +766,19 @@ end endgenerate
 //--------------------------------------------------------------- stages
 ap040_inst_fetch #(
 	.PC_RESET(PC_RESET), .PROG_WORDS(PROG_WORDS), .L1_AW(L1_AW),
-	.FETCH_AT_RESET(RESET_FROM_VECTORS ? 0 : 1), .LONG_ANY(BUS ? 0 : 1)
+	.FETCH_AT_RESET(RESET_FROM_VECTORS ? 0 : 1), .LONG_ANY(BUS ? 0 : 1), .BTB(BTB)
 ) u_if
 (
 	.clk(clk), .nreset(nreset), .ce(ce),
 	.redirect_valid(redirect_valid), .redirect_pc(redirect_pc), .redirect_hold(wb_smc && BUS == 0),
 	.redirect_s((ex_redirect && !wb_smc) ? ex_redirect_s : sr_now[13]), .f_s(f_s),
-	.q_lo(if_q_lo), .q_hi(if_q_hi),
+	.q_lo(if_q_lo), .q_hi(if_q_hi), .q_lo2(if_q_lo2), .q_hi2(if_q_hi2),
+	.q_m0(q_m0), .q_m1(q_m1), .q_s0(q_s0), .q_s1(q_s1), .m_tgt(bt_mtgt), .m_fa(bt_mfa),
+	.btb_wr(bt_wr), .btb_val(bt_val), .btb_fa(bt_fa), .btb_slot(bt_slot), .btb_tgt(bt_tgt),
+	// every change of what an instruction address holds forgets the buffer:
+	// CINV/CPUSH of the instruction cache, the self-modifying-code refetch,
+	// PFLUSH and a MOVEC to the MMU's registers (pg_clear)
+	.btb_clear(pg_clear || wb_smc || (cinv_req && cinv_ic)),
 	.consume(id_consume), .consume_nf(id_consume_nf), .fetch_hold(pmmu_busy || eaf_redir_soon),
 	.f_req(f_req), .f_addr(f_addr), .f_long(f_long), .f_gnt(f_gnt), .f_ack(f_ack), .f_data(f_data),
 	.f_err(f_err), .f_atc(f_atc),
@@ -771,14 +786,16 @@ ap040_inst_fetch #(
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1)
 );
 
-ap040_decode #(.HAS_FPU(HAS_FPU), .RAS(RAS)) u_id
+ap040_decode #(.HAS_FPU(HAS_FPU), .RAS(RAS), .BTB(BTB)) u_id
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ea_stall), .flush(flush_id),
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1),
 	.q_e0(q_e0), .q_e1(q_e1), .pf_addr(iff_addr), .pf_long(iff_long), .pf_atc(iff_atc),
 	.consume(id_consume), .consume_nf(id_consume_nf),
 	.id_redirect_valid(id_redirect_valid), .id_redirect_pc(id_redirect_pc),
-	.id_valid(id_valid), .id_o(id_o), .g_lo(id_g_lo), .g_hi(id_g_hi), .g_v(id_g_v)
+	.id_valid(id_valid), .id_o(id_o), .g_lo(id_g_lo), .g_hi(id_g_hi), .g_v(id_g_v),
+	.q_m0(q_m0), .q_m1(q_m1), .q_s0(q_s0), .q_s1(q_s1), .m_tgt(bt_mtgt), .m_fa(bt_mfa),
+	.btb_wr(bt_wr), .btb_val(bt_val), .btb_fa(bt_fa), .btb_slot(bt_slot), .btb_tgt(bt_tgt)
 );
 
 wire older_busy  = eaf_valid || exe_valid || sb_busy;   // (serialising waits for posted stores too)
@@ -900,7 +917,8 @@ assign smc_hit = exe_valid && exe_o.st_v && !exe_o.stf.exc &&
                   ovl(exe_o.st_addr, exe_o.st_size, eac_valid, eac_o.i.pc, eac_o.i.next_pc) ||
                   ovl(exe_o.st_addr, exe_o.st_size, id_valid, id_o.pc, id_o.next_pc) ||
                   ovl(exe_o.st_addr, exe_o.st_size, id_g_v, id_g_lo, id_g_hi) ||
-                  ovl(exe_o.st_addr, exe_o.st_size, 1'b1, if_q_lo, if_q_hi));
+                  ovl(exe_o.st_addr, exe_o.st_size, 1'b1, if_q_lo, if_q_hi) ||
+                  ovl(exe_o.st_addr, exe_o.st_size, BTB != 0, if_q_lo2, if_q_hi2));
 // The refetch goes out in the store's first clock in WB, not when memory
 // acknowledges it (timing: the acknowledge must not reach IF's fetch address,
 // the gate build's clk_114 -> clk_38 path), once (smc_fired while WB holds
