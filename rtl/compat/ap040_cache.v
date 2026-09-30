@@ -161,6 +161,10 @@ module ap040_cache
 // bare array does NOT map to M10K and costs ~3000 ALMs instead.
 //
 //   row = { rr[1:0], valid[3:0], tag3, tag2, tag1, tag0 }   (94 bits)
+//
+// (findings/copyback/plan.md S1) The lookups no longer read the row's valid
+// field: the valid bits are in flip-flops (vb, below), so that a row clear
+// can spare the ways that must survive it.
 localparam TAGW = 22;
 localparam ROWW = 2 + 4 + 4*TAGW;
 
@@ -299,14 +303,36 @@ reg  [31:0] fill_hold;           // requested longword captured during fill
 reg         ack_r;
 reg  [31:0] rdata_r;
 
+// Valid bits (findings/copyback/plan.md S1).  The row's valid field is
+// still written, but nothing reads it: the lookup takes the valid bits
+// from these flip-flops, which take exactly the row's writes -- port A's
+// tag write, and port B's row clear, which wins in the same edge as it does
+// in the RAM -- and are read like the row, registered on port A's address
+// and old data on a collision (dpram's rdw_mixed OLD_DATA).  In flops, a
+// clear can spare ways: vb_keep names the ways a row clear leaves valid (none
+// yet; the copyback cache's dirty lines).
+reg  [3:0] vb [0:127];
+reg  [3:0] vq;
+wire [3:0] vb_keep = 4'd0;
+integer vbk;
+always @(posedge clk) begin
+	if (!nreset) begin
+		for (vbk = 0; vbk < 128; vbk = vbk + 1) vb[vbk] <= 4'd0;
+	end else begin
+		if (ce & tag_we) vb[tag_widx] <= tag_wdat[91:88];
+		if (inv_wren)    vb[inv_idx]  <= vb[inv_idx] & vb_keep;
+	end
+	vq <= vb[tag_we ? tag_widx : tag_ridx];
+end
+
 wire [21:0] t_w0 = tag_q[21:0];
 wire [21:0] t_w1 = tag_q[43:22];
 wire [21:0] t_w2 = tag_q[65:44];
 wire [21:0] t_w3 = tag_q[87:66];
-wire v_w0 = tag_q[88];
-wire v_w1 = tag_q[89];
-wire v_w2 = tag_q[90];
-wire v_w3 = tag_q[91];
+wire v_w0 = vq[0];
+wire v_w1 = vq[1];
+wire v_w2 = vq[2];
+wire v_w3 = vq[3];
 wire h0 = v_w0 && (t_w0 == r_tag);
 wire h1 = v_w1 && (t_w1 == r_tag);
 wire h2 = v_w2 && (t_w2 == r_tag);
@@ -507,7 +533,7 @@ wire [87:0] tags_next = (r_way == 2'd0) ? {tag_q[87:22], r_tag} :
                         (r_way == 2'd1) ? {tag_q[87:44], r_tag, tag_q[21:0]} :
                         (r_way == 2'd2) ? {tag_q[87:66], r_tag, tag_q[43:0]} :
                                           {r_tag, tag_q[65:0]};
-wire  [3:0] val_next  = tag_q[91:88] | (4'd1 << r_way);
+wire  [3:0] val_next  = vq | (4'd1 << r_way);
 wire        sweep_hit = sweep_all || (sweep_cnt[6] ? cinv_ic : cinv_dc);
 assign tag_we    = ((cst == C_TAGW) && !fill_snooped && !snoop_fill_row) ||
                    ((cst == C_SWEEP) && sweep_hit);
@@ -996,9 +1022,7 @@ if (IFP != 0) begin : g_ifp
 	(* ramstyle = "no_rw_check" *) reg [31:0] idat3 [0:255];
 	reg  [87:0] itag_q;
 	reg  [31:0] idat_q0, idat_q1, idat_q2, idat_q3;
-	reg   [3:0] iv [0:63];
 	reg   [5:0] f_set;
-	integer k;
 	always @(posedge clk) begin
 		if (ce & tag_we & tag_widx[6]) itag[tag_widx[5:0]] <= tag_wdat[87:0];
 		if (ce & cd_we[0] & cd_widx[8]) idat0[cd_widx[7:0]] <= cd_wdat;
@@ -1014,14 +1038,7 @@ if (IFP != 0) begin : g_ifp
 			f_set   <= ifp_addr[9:4];
 		end
 	end
-	always @(posedge clk) begin
-		if (!nreset) begin
-			for (k = 0; k < 64; k = k + 1) iv[k] <= 4'd0;
-		end else begin
-			if (ce & tag_we & tag_widx[6]) iv[tag_widx[5:0]] <= tag_wdat[91:88];
-			if (inv_wren & inv_idx[6])     iv[inv_idx[5:0]]  <= 4'd0;
-		end
-	end
+	// the valid bits are the main lookup's (vb): the same writes
 	// the way a fill is overwriting, and the clock after the fill ends
 	wire fill_st = (cst == C_FILL) || (cst == C_FILLC) || (cst == C_FILLW) ||
 	               (cst == C_TAGW) || (cst == C_FERR);
@@ -1038,7 +1055,7 @@ if (IFP != 0) begin : g_ifp
 	end
 	wire [3:0] mask_now  = (fill_st && r_row[6] && r_row[5:0] == f_set) ? (4'd1 << r_way) : 4'd0;
 	wire [3:0] mask_prev = (fm_v && fm_set == f_set) ? (4'd1 << fm_way) : 4'd0;
-	wire [3:0] vv = iv[f_set] & ~mask_now & ~mask_prev;
+	wire [3:0] vv = vb[{1'b1, f_set}] & ~mask_now & ~mask_prev;
 	wire g0 = vv[0] && (itag_q[21:0]  == ifp_ptag);
 	wire g1 = vv[1] && (itag_q[43:22] == ifp_ptag);
 	wire g2 = vv[2] && (itag_q[65:44] == ifp_ptag);
@@ -1072,11 +1089,9 @@ if (IFP != 0) begin : g_dfp
 	(* ramstyle = "no_rw_check" *) reg [31:0] ddat3 [0:255];
 	reg  [87:0] dtag_q;
 	reg  [31:0] ddat_q0, ddat_q1, ddat_q2, ddat_q3;
-	reg   [3:0] dv [0:63];
 	reg   [5:0] g_set;
 	reg   [1:0] g_size, g_off;
 	reg         g_col;
-	integer k;
 	wire  [5:0] l_set = dfp_addr[9:4];
 	// a write of the data bank's set l_set in this edge
 	wire w_tag = ce & tag_we & !tag_widx[6];
@@ -1102,14 +1117,7 @@ if (IFP != 0) begin : g_dfp
 			           (w_dat && cd_widx[7:2] == l_set);
 		end
 	end
-	always @(posedge clk) begin
-		if (!nreset) begin
-			for (k = 0; k < 64; k = k + 1) dv[k] <= 4'd0;
-		end else begin
-			if (w_tag) dv[tag_widx[5:0]] <= tag_wdat[91:88];
-			if (w_inv) dv[inv_idx[5:0]]  <= 4'd0;
-		end
-	end
+	// the valid bits are the main lookup's (vb): the same writes
 	wire fill_d = ((cst == C_FILL) || (cst == C_FILLC) || (cst == C_FILLW) ||
 	               (cst == C_TAGW) || (cst == C_FERR)) && !r_row[6];
 	reg        dm_v;
@@ -1128,7 +1136,7 @@ if (IFP != 0) begin : g_dfp
 	wire       d_busy_now = (w_inv && inv_idx[5:0] == g_set) ||
 	                        (w_tag && tag_widx[5:0] == g_set) ||
 	                        (w_dat && cd_widx[7:2] == g_set);
-	wire [3:0] dvv = dv[g_set] & ~dmask_now & ~dmask_prev;
+	wire [3:0] dvv = vb[{1'b0, g_set}] & ~dmask_now & ~dmask_prev;
 	wire e0 = dvv[0] && (dtag_q[21:0]  == dfp_ptag);
 	wire e1 = dvv[1] && (dtag_q[43:22] == dfp_ptag);
 	wire e2 = dvv[2] && (dtag_q[65:44] == dfp_ptag);
