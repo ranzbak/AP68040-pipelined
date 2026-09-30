@@ -36,6 +36,44 @@ the pipelined branch completed, verified and brought up on hardware.
 The milestone log, open questions and every deviation from the manual are in
 `AP040_IMPLEMENTATION_PLAN.md` and `TIMING-LOG.md`.
 
+## Performance
+
+Measured on the board (QMTech XC7A100T in MinimigAGA_TC64), with the core
+clocked at **37.8125 MHz** (`clk_114/3`), the MMU on under MMULib's
+`68040.library`, the FPU on, and the Minimig's fast RAM (Zorro II/III SDRAM
+and the DDR3 board). The benchmark is
+[xSysInfo](https://github.com/reinauer/xSysInfo)'s Dhrystone 2.1, which rates
+against an A4000/040 at 25 MHz.
+
+| Core | Dhrystones/s | vs 68040 @ 25 MHz |
+| --- | ---: | ---: |
+| before the store buffer and branch work | 21,721 | 0.66 |
+| + store buffer, store-to-load forwarding, return-address stack | 22,185 | 0.67 |
+| + address-precise fast reads | 28,938 | 0.88 |
+| **+ stores posted with the MMU on (current)** | **33,287** | **1.01** |
+
+That is about 880 Dhrystones/s per MHz (0.50 DMIPS/MHz), against about 1,320
+for a real 68040: the core matches a 25 MHz 68040 by running at 38 MHz.
+The real chip is ahead per clock mainly because it runs fast RAM in copyback
+mode, while this data cache is write-through.
+
+The features behind the table are parameters of `ap040_pipe_tg68k_compat`,
+all 0 (off) by default:
+
+| Parameter | What it does | MinimigAGA_TC64 |
+| --- | --- | --- |
+| `AP040_STORE_BUF` | posts stores that cannot fault into a 4-entry FIFO (1) | 1 |
+| `AP040_FWD` | a load an older store covers is answered from that store | 1 |
+| `AP040_RAS` | an 8-entry return-address stack predicts RTS in ID | 1 |
+| `AP040_PRECISE` | fast reads compare addresses with the stores in flight, instead of waiting for all of them | 1 |
+| `AP040_SB_MMU` | with translation on, stores to a page a synchronous store proved writable are posted too | 1 |
+| `AP040_MISPLIT` | splits misaligned transfers into aligned pieces | 0 |
+
+With the MMU on, `AP040_SB_MMU` posts only into the DDR3 board's window
+(`mem_postok` in `ap040_pipe_tg68k_compat.v`): posting into the SDRAM as well
+corrupted data on the board while every simulation passed, and that cause is
+still open. `AP040_MISPLIT` gains nothing on the board and is not used.
+
 ## What is here
 
 ```
