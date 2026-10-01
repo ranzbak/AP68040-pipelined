@@ -1,0 +1,16 @@
+halt 0000450
+# fpureal_fscc_ea.s: FScc steps its register ONCE, by the byte rule.
+# 1: $FF, $00 at $6000/$6001, guard $AA after them, A1 = $6002
+m32 00006000 ff00aaaa
+a1 00006002
+# 2: $FF at $600F, A2 = $600F, the guards either side intact
+m32 0000600c aaaaaaff
+m32 00006010 aaaaaaaa
+a2 0000600f
+# 3: (A7)+ steps a byte by two: $FF at $6020, SP was $6022
+m32 00006020 ffaaaaaa
+d6 00006022
+# 4: untouched guards
+m32 00006004 aaaaaaaa
+m32 00006008 aaaaaaaa
+m32 00006024 aaaaaaaa

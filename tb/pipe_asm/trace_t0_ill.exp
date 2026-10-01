@@ -1,0 +1,20 @@
+halt 0000528
+# trace_t0_ill.s: each T0 trace is taken BEFORE the ILLEGAL that follows it.
+#
+# three traces (BRA at $4A0, NOP at $4A6, ANDI #0,SR at $4AA), none for the
+# MOVEQ at $4B0, and four ILLEGALs ($4A4, $4A8, $4AE, $4B2)
+m32 00007000 00000003
+m32 00007004 00000004
+# order: trace then illegal three times, then a lone illegal:
+# ((((((0+1)*4)+1)*4)+1)*4)*4 = $150.  A yielded trace gives 0.
+m32 00007008 00000150
+# stacked PCs of the traces = the ILLEGALs: $4A4+$4A8+$4AE
+m32 0000700c 00000dfa
+# address fields = the traced instructions: $4A0+$4A6+$4AA
+m32 00007010 00000df0
+# the ILLEGALs' stacked PCs: $4A4+$4A8+$4AE+$4B2
+m32 00007014 000012ac
+# case 3: ANDI #0,SR cleared S and T0, so the ILLEGAL stacks SR $0000
+m32 00007018 ffff0000
+# every trace frame was format $2, vector offset $24
+m32 0000701c 00000000

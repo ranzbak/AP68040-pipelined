@@ -1509,8 +1509,15 @@ assign fp_dst_r    = i.ext[9:7];
 // opclass 100/101 arrives it must NOT write FPIAR -- a move to or from a
 // control register leaves it alone -- so that decode has to break this
 // equality rather than extend it.
-assign fp_ia_we    = fp_req;
-assign fp_ia_wdata = (HAS_FPU != 0) ? i.pc : 32'd0;
+// ... and an exception that loads FPIAR (i.fpiar_x: an opclass 010 F-line
+// or unimplemented instruction whose EA the 68040 rejects) writes it once,
+// when its entry COMMITS -- step 5, everything older done -- so an entry a
+// late store fault takes over leaves FPIAR alone
+reg        x_fia;          // the exception in progress loads FPIAR ...
+reg [31:0] x_fia_pc;       // ... with this, its instruction's own PC
+reg        fia_we;         // the one-clock write
+assign fp_ia_we    = fp_req || fia_we;
+assign fp_ia_wdata = (HAS_FPU == 0) ? 32'd0 : fia_we ? x_fia_pc : i.pc;
 // where the operand comes from, always LEFT aligned in the 96-bit window:
 // memory (assembled in fp_buf), the instruction stream (the decoder's
 // fpimm -- never a bus access, lib/AP68040 S_FPU_IMM), or a data register.
@@ -2101,11 +2108,12 @@ function automatic stp_t tr_st(input stp_t s, input logic [3:0] ph, input logic 
 endfunction
 reg         tr_take;      // a trace is due in front of the next instruction
 reg  [31:0] tr_pc;        // the traced instruction's PC (the $2 address field)
-// A T0 change-of-flow trace is resolved only once the TARGET has entered the
-// pipeline, so an illegal instruction at the target wins and cancels it
-// (reference go_pc: `flow_t0_pend`).  A T1 trace is not: it is taken at the
-// boundary before the target is looked at.
-reg         tr_yield;
+// A T0 trace, like a T1 trace, is taken at the boundary BEFORE the next
+// instruction is looked at, so an exception that belongs to the next
+// instruction (an ILLEGAL at a branch target, say) comes after it.  The
+// reference core (go_pc: `flow_t0_pend`) let a T0-only trace yield to it and
+// this core copied that; cputest on the board (tests/cputest/board, 40
+// instructions, every test ends in an ILLEGAL) shows the 68040 does not.
 // `!older_busy` is the interrupt's rule for the same reason: the traced
 // instruction's writeback must have committed before the frame's SR is
 // latched.  An interrupt at the same boundary WINS (irq_st sits outside this
@@ -2155,7 +2163,7 @@ wire stp_t st_i = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, 
 // the trace.  The reference's own comment calls its behaviour OPEN.  PLAN D23
 // has the three readings side by side; the manual is authority rule 1.
 wire tr_go = tr_take && eac_v_use && !rst_pending && !older_busy &&
-             (ph == P_START) && !(tr_yield && st_i.exc_go && !irq_go);
+             (ph == P_START);
 
 // the trace is applied OUTSIDE the interrupt override, so it wins a boundary
 // they both want (M68040UM 8.3: trace is priority group 6, interrupt 8).  The
@@ -2376,7 +2384,8 @@ always @(posedge clk) begin
 		fr_flags <= 3'd0; fr_grs <= 3'd0; fr_wbte15 <= 1'b0; fr_fpt <= 96'd0; fr_et <= 96'd0;
 		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
 		irq_take <= 1'b0; irq_take_lvl <= 3'd0;
-		tr_take <= 1'b0; tr_pc <= 32'd0; tr_yield <= 1'b0;
+		tr_take <= 1'b0; tr_pc <= 32'd0;
+		x_fia <= 1'b0; x_fia_pc <= 32'd0; fia_we <= 1'b0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
 		cm_v <= 1'b0; cm_ea <= 32'd0; cm_pc <= 32'd0; r_ea <= 32'd0; r_ssw <= 16'd0;
 		mm_mask <= 16'd0; mm_k_q <= 4'd0; mm_addr <= 32'd0; mm_empty <= 1'b0; mm_rreg <= 5'd0; mm_rlast <= 1'b0; mm_tail <= 1'b0;
@@ -2386,6 +2395,7 @@ always @(posedge clk) begin
 		rst_pending <= reset_seq;
 		eaf_valid <= 1'b0; eaf_o <= '0;
 	end else if (ce) begin
+		fia_we <= 1'b0;
 		// the EX-side output register
 		if ((flush && !keep_out) || wf_go) eaf_valid <= 1'b0;
 		else if (!stall_in) begin
@@ -2401,6 +2411,7 @@ always @(posedge clk) begin
 			// behind it (EX's micro-op, this stage) is abandoned
 			eaf_valid <= 1'b0;
 			ph <= P_EXC; x_step <= 3'd5; x_vec <= 8'd2; x_fmt <= 4'd7; x_irq <= 1'b0;
+			x_fia <= 1'b0;   // an entry it takes over does not load FPIAR
 			x_pc <= wf_last ? wb_stf.npc : wb_stf.ipc;
 			x_addr <= wb_st_a;
 			x7[2] <= wb_stf.cm ? mm_ea[wb_stf.cmt] :                              // EA (MOVEM: calculated)
@@ -2608,6 +2619,8 @@ always @(posedge clk) begin
 					if (x_step == 3'd4 && st.disp && !x_target[0]) x_pass2 <= 1'b0;
 					if (x_step == 3'd5 && !older_busy) begin
 						x_pass2 <= 1'b0;
+						fia_we <= x_fia && (HAS_FPU != 0);
+						x_fia  <= 1'b0;
 						// (audit 2026-09-27, finding 5) an RTE's odd-PC address
 						// error stacks the restored SR WITH S set -- $A700 for a
 						// restored $8700 (M68040UM 8.4, 1998 addendum p. 2)
@@ -2872,7 +2885,6 @@ always @(posedge clk) begin
 			if (st.fin && ph != P_EXC && ph != P_RESET) begin
 				tr_take  <= tr_arm || rte_ct;
 				tr_pc    <= rte_ct ? r_pc : i.pc;
-				tr_yield <= rte_ct ? 1'b0 : !sr_in[15];   // a T0-only trace yields to the target's exception
 			end
 			// no trace survives the exception its own instruction took: the
 			// TRAP takes the TRAP and nothing else (the reference clears the
@@ -2905,6 +2917,11 @@ always @(posedge clk) begin
 			if (st.exc_go) begin
 				ph     <= P_EXC;
 				x_vec  <= st.ev; x_fmt <= st.ef; x_pc <= st.epc; x_addr <= st.eaddr;
+				// the instruction's OWN exception (not an interrupt or a trace
+				// taken in front of it), and not one a store fault replaces
+				x_fia    <= (HAS_FPU != 0) && ph != P_EXC && i.cls == CL_EXC && i.fpiar_x &&
+				            !st.irq && st.ev == i.exc_vec && !wf_go;
+				x_fia_pc <= i.pc;
 				x_step <= 3'd5;
 				x_irq  <= st.irq; x_lvl <= irq_lvl;
 			end

@@ -1272,10 +1272,15 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						end else if (d.src.kind == EK_DREG ||
 						             (d.src.kind == EK_MEM &&
 						              !(sh.sm == 3'd7 && sh.sr[1]))) begin
-							// FScc <ea>: a data-alterable byte destination
+							// FScc <ea>: a data-alterable byte destination,
+							// and ONLY a destination: left in src as well, the
+							// EA was computed twice and an (An)+ / -(An) stepped
+							// the register twice, with the byte one step off
+							// (cputest fint/FScc on the board, fpureal_fscc_ea.s)
 							d.cls  = CL_FPU;
 							d.size = SZ_B;
 							d.dst  = d.src;
+							d.src  = '0; d.src.reg_n = R_NONE; d.src.idx_reg = R_NONE;
 						end else begin
 							// an immediate or PC-relative FScc destination is
 							// the ordinary F-line (lib/AP68040 S_FSCC0)
@@ -1374,7 +1379,10 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 					//   PC-relative: a source only, as for every store.
 					// An empty list is FPIAR, not a no-op.
 					else if (x1[15:14] == 2'b10) begin
-						d.t0sync   = x1[13];   // (M9.T) control registers TO memory
+						// (M9.T) control registers TO MEMORY: WinUAE traces the
+						// FMOVE(M) CR,<ea> arm and not the Dn / An forms (cputest
+						// fint/FMOVEM.X on the board; fpureal_t0_fcr.s)
+						d.t0sync   = x1[13] && d.src.kind == EK_MEM;
 						fp_crsel   = (x1[12:10] == 3'd0) ? 3'b001 : x1[12:10];
 						fp_crn     = fp_cr_n(x1[12:10]);
 						fp_crmulti = (fp_crn != 3'd1);
@@ -1421,6 +1429,12 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						// alone: in opclass 011 bits 6:0 are the k-factor, and
 						// every rejected store is the plain F-line (WinUAE
 						// put_fp_value2; lib/AP68040 go_fp_fline)
+						// Opclass 010 has loaded FPIAR by then, F-line or
+						// unimplemented alike: the 68040 sets it as soon as the
+						// opmode is known to exist (WinUAE fpuop_arithmetic),
+						// and a rejected 011 store has not (it sets FPIAR after
+						// the store).  cputest on the board, 392 instructions.
+						d.fpiar_x = (x1[15:13] == 3'b010);
 						if (x1[15:13] != 3'b010 || fp_op_hw(x1[6:0])) begin
 							d.exc_fmt = 4'd0; d.exc_next = 1'b0;
 						end else begin

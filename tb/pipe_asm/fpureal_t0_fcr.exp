@@ -1,0 +1,8 @@
+halt 000045a
+# fpureal_t0_fcr.s: three traces -- fmove.l fpcr,(a1) at $436, fmovem.x
+# fp0,(a2) at $43A and the MOVE to SR at $43E; the two register forms at
+# $42E and $432 are not traced
+m32 00007000 00000003
+# $436+$43A+$43E
+m32 00007004 00000cae
+d0 00001234

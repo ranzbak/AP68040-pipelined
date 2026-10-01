@@ -164,6 +164,11 @@ typedef struct packed {
 	// this bit carries the rest -- the `t0_special` list, copied verbatim from
 	// the reference core, plus the FP forms that set its `t0_force`.
 	logic        t0sync;
+	// (cputest board run) a CL_EXC that LOADS FPIAR with its own PC when it
+	// is taken: an opclass 010 instruction whose opmode exists but whose
+	// effective address the 68040 rejects (WinUAE fpuop_arithmetic sets FPIAR
+	// before it looks at the EA; tb/pipe_asm/fpureal_fpiar.s)
+	logic        fpiar_x;
 } id_t;
 
 typedef struct packed {

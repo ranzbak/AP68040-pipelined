@@ -1,0 +1,20 @@
+halt 000049e
+# fpureal_fpiar.s: FPIAR after each case, in slot order
+# 1 fadd.l a0,fp1 at $41E: F-line, FPIAR = its PC
+m32 00007000 0000041e
+# 2 fabs.x d0,fp1 at $42A: F-line, FPIAR = its PC
+m32 00007004 0000042a
+# 3 fadd.l d0,fp1 at $436: legal, FPIAR = its PC
+m32 00007008 00000436
+# 4 fmove.l fp1,a0: rejected opclass 011 store, sentinel kept
+m32 0000700c 5a5a0004
+# 5 opmode $2B does not exist: sentinel kept
+m32 00007010 5a5a0005
+# 6 fmove.l #0,fpcr: sentinel kept
+m32 00007014 5a5a0006
+# 7 fbeq: sentinel kept
+m32 00007018 5a5a0007
+# 8 fseq d1: sentinel kept
+m32 0000701c 5a5a0008
+# four F-lines: cases 1, 2, 4, 5
+m32 00007020 00000004

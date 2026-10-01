@@ -19,10 +19,11 @@
 ;      is the reference's changed-bits rule: the STOP that rewrites the
 ;      same upper bits does NOT trace and WOULD hang if it stopped, since
 ;      nothing in this program raises an interrupt.
-;   7  a T0 change-of-flow trace is resolved only once the TARGET is in
-;      the pipeline, so an ILLEGAL there wins and CANCELS the trace (the
-;      reference's flow_t0_pend).  A T1 trace is not: it is taken at the
-;      boundary, before the target is looked at.
+;   7  a T0 change-of-flow trace is taken at the boundary, BEFORE the
+;      ILLEGAL at the target: trace first, then vector 4.  (This case used
+;      to pin the opposite, the reference's flow_t0_pend, where the ILLEGAL
+;      cancelled the trace; cputest on the board showed the 68040 traces --
+;      see trace_t0_ill.s.)
 ;   6  MOVEC TO a control register ($4E7B) traces; reading one back
 ;      ($4E7A) does not -- hardware narrowed this to the write direction
 ;      and cputest Basic/MOVEC2 depends on it.
@@ -89,10 +90,10 @@ b2:
 	movec	vbr,d3			; $4E7A: reads: no trace
 	movec	d3,vbr			; $4E7B: writes: +1
 
-;------------------------------------- 7: an exception at the TARGET wins
-	bra.w	ill1			; a change of flow under T0, whose trace
-ill1:	dc.w	$4AFC			; ... yields to this ILLEGAL: vector 4 is
-cont:					; taken and the trace is CANCELLED
+;------------------------------------- 7: the trace comes before the TARGET's exception
+	bra.w	ill1			; a change of flow under T0: +1, and only
+ill1:	dc.w	$4AFC			; ... then does this ILLEGAL take vector 4
+cont:
 	move.w	#$2700,sr		; +1  (the last trace)
 	nop				; not traced: the boundary it lands on
 	bra	halt
