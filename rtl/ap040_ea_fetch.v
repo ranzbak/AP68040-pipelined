@@ -1618,6 +1618,13 @@ wire  [3:0] fp_mvn   = {3'd0, fp_mvmk[7]} + {3'd0, fp_mvmk[6]} + {3'd0, fp_mvmk[
                        {3'd0, fp_mvmk[4]} + {3'd0, fp_mvmk[3]} + {3'd0, fp_mvmk[2]} +
                        {3'd0, fp_mvmk[1]} + {3'd0, fp_mvmk[0]};
 wire  [6:0] fp_mvb12 = {fp_mvn, 3'd0} + {1'b0, fp_mvn, 2'd0};       // 12 x n
+// an EMPTY list, static or dynamic, moves no register at all and leaves An
+// where it was (cputest fint/FMOVEM.X on the board: D1 = 0 loaded FP7).
+// Decode gave it a one-register step like a dynamic list, so the same an_ov
+// override (fp_anv with n = 0) puts the register back.
+wire        fp_mvemp = fp_mvm && (fp_mvmk == 8'd0);
+reg         fp_mvemp_q;   // ... latched in the P_FPU entry clock, for the An update
+                          // (the same timing reason as fp_mvb12_q)
 reg   [6:0] fp_mvb12_q;   // fp_mvb12 as it was in the P_FPU entry clock (fp_anv)
 wire        fp_mvpd  = fp_mvst && (i.dst.upd == UPD_PRE);
 wire        fp_lsb   = fp_mvpd;
@@ -1766,7 +1773,7 @@ wire [31:0] fp_addr0 = fp_mem_dst ? d_addr_c : s_addr_c;
 // file's value), and FMOVEM writes no data register.  So the count latched at
 // entry (fp_mvb12_q) is the same value op_c would give, and EX's forwarded
 // result no longer reaches the An update through the popcount.
-wire [31:0] fp_anv  = fp_mvdy ? ((i.dst.upd == UPD_PRE) || (i.src.upd == UPD_PRE)
+wire [31:0] fp_anv  = (fp_mvdy || fp_mvemp_q) ? ((i.dst.upd == UPD_PRE) || (i.src.upd == UPD_PRE)
                                 ? fp_addr0 - {25'd0, fp_mvb12_q} + 32'd12
                                 : fp_addr0 + {25'd0, fp_mvb12_q}) :
                       fp_sv   ? fp_addr : (fp_addr + (fp_bsy ? 32'd100 : 32'd52));
@@ -1920,8 +1927,8 @@ wire ex_t fp_w = (fp_stt == FS_WR) ? an_ov(fp_st_uop(x_ord,
                                               (fp_mvm || fp_sv || fp_scc) ? !(fp_crd && fp_k == 2'd3)
                                                                             : (fp_k != fp_beats),
                                               fp_baddr, fp_bdata, fp_bsz),
-                                          fp_frm || fp_mvdy, fp_anv)
-                                   : an_ov(fp_x, fp_frm || fp_mvdy, fp_anv);
+                                          fp_frm || fp_mvdy || fp_mvemp_q, fp_anv)
+                                   : an_ov(fp_x, fp_frm || fp_mvdy || fp_mvemp_q, fp_anv);
 // The unimplemented-instruction and unsupported-data-type faults, with the
 // frames lib/AP68040's go_fp_unimp / go_fp_unsupp use -- both validated on
 // the v24 cputest corpus (PLAN.md D19):
@@ -2375,7 +2382,7 @@ always @(posedge clk) begin
 		fp_stt <= FS_RD; fp_k <= 2'd0; fp_addr <= 32'd0;
 		fp_cw <= 1'b0; fp_csel <= 2'd0; fp_cwd <= 32'd0; fp_crd <= 1'b0;
 		fp_ae <= 1'b0; fp_avec <= 8'd0; fp_pend <= 1'b0; fp_pvec <= 8'd0;
-		fp_list <= 8'd0; fp_mvb12_q <= 7'd0; fp_fsel <= 3'd0; fp_mw <= 1'b0; fp_mwd <= 96'd0; fp_mwsel <= 3'd0;
+		fp_list <= 8'd0; fp_mvb12_q <= 7'd0; fp_mvemp_q <= 1'b0; fp_fsel <= 3'd0; fp_mw <= 1'b0; fp_mwd <= 96'd0; fp_mwsel <= 3'd0;
 		fp_rstp <= 1'b0; fp_idlp <= 1'b0; fp_fmte <= 1'b0;
 		fp_fn <= 5'd0; fp_frm <= 1'b0; fp_svack <= 1'b0; fp_frup <= 1'b0; fp_bsy <= 1'b0; fp_rarm <= 1'b0; fp_pcap <= 1'b0;
 		fr_busy <= 1'b0; fr_et15 <= 1'b0; fr_fpt15 <= 1'b0; fr_wbt <= 96'd0;
@@ -2511,6 +2518,7 @@ always @(posedge clk) begin
 								// register is picked here.
 								fp_list <= fp_mvmk & ~(8'd1 << mv_bit(fp_mvmk, fp_lsb));
 								fp_mvb12_q <= fp_mvb12;
+								fp_mvemp_q <= fp_mvemp;
 								fp_fsel <= (!fp_mvst || i.ext[12]) ? (3'd7 - mv_bit(fp_mvmk, fp_lsb))
 								                                   : mv_bit(fp_mvmk, fp_lsb);
 								// (M10.3) a PENDING exception is taken in front of this
@@ -2555,6 +2563,8 @@ always @(posedge clk) begin
 								else if (fp_rs) fp_stt <= FS_RD;
 								else if (fp_mvm) begin
 									fp_stt <= fp_mvst ? FS_WR : FS_RD;
+									// nothing to move: done before the first beat
+									if (fp_mvemp) begin fp_crd <= 1'b1; fp_k <= 2'd3; end
 									// (M10.9) a dynamic list's step was not known to
 									// EA-calc, so the base and the register update
 									// are computed here

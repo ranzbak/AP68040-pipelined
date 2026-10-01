@@ -1488,7 +1488,10 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						// zero: `nb == 0` means "use the size rule" in eacomp,
 						// not "do not step", so zero would silently step by four.
 						// EA-fetch adds the remaining 12 x (n-1) through an_ov.
-						d.imm[6:0] = x1[11] ? 7'd12
+						// An EMPTY static list gets the same one register: EA-
+						// fetch moves nothing for it and puts An back through
+						// an_ov (fpureal_fmovem_empty.s)
+						d.imm[6:0] = (x1[11] || fp_mvn == 4'd0) ? 7'd12
 						                    : {fp_mvn, 3'd0} + {1'b0, fp_mvn, 2'd0};   // 8n + 4n
 						d.size = SZ_L;
 					end else if (d.cls == CL_FPU && x1[15:14] == 2'b10) begin

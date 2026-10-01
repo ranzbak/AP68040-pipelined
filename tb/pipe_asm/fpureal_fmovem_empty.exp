@@ -1,0 +1,17 @@
+halt 0000458
+# fpureal_fmovem_empty.s: an empty list moves nothing
+# FP7 and FP6 keep 7 and 6
+d6 00000007
+d7 00000006
+# no register moves: (A0), (A1)+ twice, -(A2) twice
+a0 00006000
+a1 00006010
+a2 00006030
+# and no byte of the guard changes
+m32 00006000 aaaaaaaa
+m32 00006010 aaaaaaaa
+m32 00006020 aaaaaaaa
+m32 00006024 aaaaaaaa
+m32 00006028 aaaaaaaa
+m32 0000602c aaaaaaaa
+m32 00006030 aaaaaaaa
