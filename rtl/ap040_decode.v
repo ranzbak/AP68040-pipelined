@@ -1435,7 +1435,13 @@ function automatic id_t decf(input logic [10:0][15:0] vbuf, input logic [31:0] v
 						// and a rejected 011 store has not (it sets FPIAR after
 						// the store).  cputest on the board, 392 instructions.
 						d.fpiar_x = (x1[15:13] == 3'b010);
-						if (x1[15:13] != 3'b010 || fp_op_hw(x1[6:0])) begin
+						// ... except a PACKED source in a data register, which
+						// WinUAE's get_fp_value rejects WITHOUT asking about the
+						// opmode on the 040 (`case 3: // P ... return 0`): the
+						// plain F-line whatever the opmode (cputest board run
+						// 2, fint.p d0,fp1 and 27 more; fpureal_dnpacked.s)
+						if (x1[15:13] != 3'b010 || fp_op_hw(x1[6:0]) ||
+						    (d.src.kind == EK_DREG && x1[12:10] == 3'b011)) begin
 							d.exc_fmt = 4'd0; d.exc_next = 1'b0;
 						end else begin
 							// an FPSP-emulated opmode reports as UNIMPLEMENTED

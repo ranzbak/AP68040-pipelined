@@ -1,0 +1,14 @@
+halt 000043e
+# fpureal_dnpacked.s: {format/vector, 0} and the stacked PC per case
+# 1 fint.p d0,fp1 at $408: the plain F-line, own PC
+m32 00007000 002c0000
+m32 00007004 00000408
+# 2 facos.p d0,fp1 at $40E: the plain F-line, own PC
+m32 00007008 002c0000
+m32 0000700c 0000040e
+# 3 fabs.p d0,fp1 at $414: the plain F-line, own PC
+m32 00007010 002c0000
+m32 00007014 00000414
+# 4 fint.x d0,fp1 at $41A: unimplemented, format $2, the NEXT PC
+m32 00007018 202c0000
+m32 0000701c 0000041e
