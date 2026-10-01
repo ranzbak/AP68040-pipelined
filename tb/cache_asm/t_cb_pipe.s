@@ -25,6 +25,9 @@
 ;      writes every one back
 ;  12  three ways of one set dirty ($2090/$2490/$2890), then a
 ;      cache-inhibited read in that set: every dirty way written back first
+;  13  MOVE16 of a whole line, four different longwords: from a dirty
+;      copyback line ($20A0 -> $30A0) and from a write-through line
+;      ($90A0 -> $90C0), every longword in its place
 
 FAILREG	equ	$F100
 DONEREG	equ	$F102
@@ -231,6 +234,40 @@ start:	move.l	#CACR_ON,d0
 	beq.s	.c12b
 	failt	124
 .c12b:
+; 13: MOVE16, four different longwords
+	lea	$20A0,a0
+	move.l	(a0),d0				; resident
+	move.l	#$D0D0D000,(a0)+		; dirty
+	move.l	#$D0D0D001,(a0)+
+	move.l	#$D0D0D002,(a0)+
+	move.l	#$D0D0D003,(a0)+
+	lea	$20A0,a0
+	lea	$30A0,a1
+	move16	(a0)+,(a1)+
+	lea	$30A0,a1
+	move.l	#$D0D0D000,d1
+	moveq	#3,d3
+.m13:	cmp.l	(a1)+,d1
+	beq.s	.n13
+	failt	13
+.n13:	addq.l	#1,d1
+	dbra	d3,.m13
+	lea	$90A0,a0
+	move.l	#$E0E0E000,(a0)+		; write-through page
+	move.l	#$E0E0E001,(a0)+
+	move.l	#$E0E0E002,(a0)+
+	move.l	#$E0E0E003,(a0)+
+	lea	$90A0,a0
+	lea	$90C0,a1
+	move16	(a0)+,(a1)+
+	lea	$90C0,a1
+	move.l	#$E0E0E000,d1
+	moveq	#3,d3
+.w13:	cmp.l	(a1)+,d1
+	beq.s	.v13
+	failt	133
+.v13:	addq.l	#1,d1
+	dbra	d3,.w13
 	move.w	#$600d,DONEREG
 .h:	bra.s	.h
 
