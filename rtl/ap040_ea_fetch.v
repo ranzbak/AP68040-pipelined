@@ -1331,13 +1331,29 @@ wire        mm_post = (i.src.kind == EK_MEM) && (i.src.mode == 3'd3);
 wire  [4:0] mm_base = mm_ld ? eac_i.src_r : eac_i.dst_r;
 wire [31:0] mm_sz   = (mm_p || i.size == SZ_W) ? 32'd2 : 32'd4;
 
+// the lowest set bit.  A casez, not a loop: the loop this replaced (15 down
+// to 0, overwriting k) gave the HIGHEST bit in xsim, so MOVE16 (whose stores
+// take their own explicit order) moved a line reversed in the SoC bench.
 function automatic logic [3:0] lsb16(input logic [15:0] m);
-	logic [3:0] k;
-	int j;
-	k = 4'd0;
-	for (j = 15; j >= 0; j = j - 1)
-		if (m[j]) k = j[3:0];
-	return k;
+	casez (m)
+		16'b???????????????1: return 4'd0;
+		16'b??????????????10: return 4'd1;
+		16'b?????????????100: return 4'd2;
+		16'b????????????1000: return 4'd3;
+		16'b???????????10000: return 4'd4;
+		16'b??????????100000: return 4'd5;
+		16'b?????????1000000: return 4'd6;
+		16'b????????10000000: return 4'd7;
+		16'b???????100000000: return 4'd8;
+		16'b??????1000000000: return 4'd9;
+		16'b?????10000000000: return 4'd10;
+		16'b????100000000000: return 4'd11;
+		16'b???1000000000000: return 4'd12;
+		16'b??10000000000000: return 4'd13;
+		16'b?100000000000000: return 4'd14;
+		16'b1000000000000000: return 4'd15;
+		default: return 4'd0;
+	endcase
 endfunction
 function automatic logic [4:0] mm_reg(input logic [3:0] k, input logic pre, input logic s, input logic m);
 	logic [3:0] j;
@@ -1602,17 +1618,33 @@ wire        fp_rev   = fp_mvst && (i.ext[12] == fp_mvpd);
 // the next register the list selects: the highest bit set, or the lowest for
 // a predecrement store (lib/AP68040 S_FPU_MVM's scan), mapped to a register
 // by the mask convention
+// (casez priority encoders, not a loop over a part-selected index: see lsb16)
 function automatic logic [2:0] mv_bit(input logic [7:0] m, input logic lsb);
-	logic [2:0] b;
-	logic       found;
-	integer     j;
-	b = 3'd0; found = 1'b0;
-	for (j = 7; j >= 0; j = j - 1)
-		if (!found && m[lsb ? (3'd7 - j[2:0]) : j[2:0]]) begin
-			b = lsb ? (3'd7 - j[2:0]) : j[2:0];
-			found = 1'b1;
-		end
-	return b;
+	if (lsb) begin
+		casez (m)
+			8'b???????1: return 3'd0;
+			8'b??????10: return 3'd1;
+			8'b?????100: return 3'd2;
+			8'b????1000: return 3'd3;
+			8'b???10000: return 3'd4;
+			8'b??100000: return 3'd5;
+			8'b?1000000: return 3'd6;
+			8'b10000000: return 3'd7;
+			default: return 3'd0;
+		endcase
+	end else begin
+		casez (m)
+			8'b1???????: return 3'd7;
+			8'b01??????: return 3'd6;
+			8'b001?????: return 3'd5;
+			8'b0001????: return 3'd4;
+			8'b00001???: return 3'd3;
+			8'b000001??: return 3'd2;
+			8'b0000001?: return 3'd1;
+			8'b00000001: return 3'd0;
+			default: return 3'd0;
+		endcase
+	end
 endfunction
 wire  [2:0] fp_mvb  = mv_bit(fp_list, fp_lsb);
 wire  [2:0] fp_mvr  = (!fp_mvst || i.ext[12]) ? (3'd7 - fp_mvb) : fp_mvb;
