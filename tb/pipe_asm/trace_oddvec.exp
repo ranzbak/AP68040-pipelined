@@ -1,0 +1,13 @@
+halt 00004ae
+# trace_oddvec.s: ONE address error, the trace's own
+m32 00007000 00000001
+# format $2, vector offset $00C (address error)
+m32 00007004 0000200c
+# PC field = the trace vector's offset, $24 (not vector 4's $10)
+m32 00007008 00000024
+# address = the odd handler address $123 with bit 0 clear
+m32 0000700c 00000122
+# stacked SR = the new SR: S set, T1 clear ($2700 from $A700)
+m32 00007010 00002700
+# the ILLEGAL after the traced MOVEQ never ran
+m32 00007014 00000000
