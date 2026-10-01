@@ -75,6 +75,15 @@ module ap040_cache
 	input       [2:0] c_fc,
 	input             c_nocache,
 	input             c_cb,        // (COPYBACK) a copyback page in the copyback window
+	// (COPYBACK) the MMU's table walk is in progress.  The walker and this
+	// cache share the master port (rtl/soc/TG68K.vhd's mux: wk_go takes it
+	// over and takes the next acknowledge as its descriptor), and a walk
+	// can run while the cache sweeps for CINV/CPUSH (the instruction fetch
+	// misses the ATC meanwhile).  A write-back starts only with no walk in
+	// progress; a sweep's pending write-back holds new walks off (post_busy,
+	// the MMU's walk_hold).  Found on the board: copyback hung AmigaOS
+	// at program load and exit (CacheClearU), 2026-10-01.
+	input             walk_busy,
 	output            c_ack,
 	output     [31:0] c_rdata,
 
@@ -473,7 +482,8 @@ reg [31:0] r_wdata;
 reg  [2:0] r_fc;
 wire       st_post_ok = (POST_STORES != 0) && c_write && !c_nocache &&
                         !c_instr;
-assign post_busy = st_posted | dr_active | (cst == C_PUSH);
+wire       sweep_push;   // (COPYBACK) declared here, assigned with need_push below
+assign post_busy = st_posted | dr_active | (cst == C_PUSH) | sweep_push;
 
 // Snoop-vs-fill and snoop-vs-lookup collisions (5.2).  A snoop hitting
 // the row of an in-flight fill poisons it: the fill's data may predate
@@ -599,13 +609,13 @@ wire  [3:0] c_d1     = db[c_addr[9:4]];
 wire  [3:0] c_d2     = db[c_set2];
 wire        bp_acc   = c_write ? !st_upd_ok : (bypass && !c_instr);
 wire        need_push = (COPYBACK != 0) && (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
-                        c_req && !ack_r && !err_hold && !dr_active && bp_acc &&
+                        c_req && !ack_r && !err_hold && !dr_active && !walk_busy && bp_acc &&
                         ((c_d1 != 4'd0) || (write_cross_line && (c_d2 != 4'd0)));
 wire  [5:0] np_set   = (c_d1 != 4'd0) ? c_addr[9:4] : c_set2;
 wire  [3:0] np_mask  = (c_d1 != 4'd0) ? c_d1 : c_d2;
 // CINV/CPUSH of the data cache: a row with dirty ways is pushed before the
 // sweep clears it (findings/copyback/plan.md revision 3: CINV as well)
-wire        sweep_push = (COPYBACK != 0) && (cst == C_SWEEP) && !sweep_all &&
+assign      sweep_push = (COPYBACK != 0) && (cst == C_SWEEP) && !sweep_all &&
                          !sweep_cnt[6] && cinv_dc &&
                          (db[sweep_cnt[5:0]] != 4'd0);
 
@@ -1030,7 +1040,7 @@ always @(posedge clk) begin
 				if (sweep_push) begin
 					// (COPYBACK) the row has dirty ways: push them (once the
 					// drain is idle), then clear the row on the way back
-					if (!dr_active) begin
+					if (!dr_active && !walk_busy) begin
 						p_set  <= sweep_cnt[5:0];
 						p_mask <= db[sweep_cnt[5:0]];
 						p_way  <= low_way(db[sweep_cnt[5:0]]);
@@ -1121,7 +1131,9 @@ always @(posedge clk) begin
 					end
 					else if ((COPYBACK != 0) && !r_row[6] && db[r_row[5:0]][rq]) begin
 						// (COPYBACK) the victim is dirty: push it, then
-						// come back here (still a miss, now a clean victim)
+						// come back here (still a miss, now a clean victim);
+						// not while a table walk owns the master port
+						if (!walk_busy) begin
 						p_set  <= r_row[5:0];
 						p_mask <= 4'd1 << rq;
 						p_way  <= rq;
@@ -1130,6 +1142,7 @@ always @(posedge clk) begin
 						p_req  <= 1'b0;
 						p_ret  <= P_LOOK;
 						cst    <= C_PUSH;
+						end
 					end
 					else if (FILL_CHANNEL != 0 && fill_ok) begin
 						// A1: the whole line over the fill channel

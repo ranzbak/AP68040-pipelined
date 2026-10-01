@@ -247,7 +247,7 @@ wire        mm_req, mm_write, mm_instr;
 wire  [1:0] mm_size;
 wire [31:0] mm_addr, mm_wdata;
 wire  [2:0] mm_fc;
-wire        mm_ack, mm_nocache, mm_postok, mm_cb;
+wire        mm_ack, mm_nocache, mm_postok, mm_cb, mm_walk;
 wire [31:0] mm_rdata;
 
 // cache to bus adapter
@@ -495,7 +495,7 @@ ap040_mmu #(.IFP(IFP_ON ? 1 : 0)) mmu (
 	.walker_req(walker_req), .walker_we(walker_we), .walker_addr(walker_addr),
 	.walker_wdat(walker_wdat), .walker_ack(walker_ack), .walker_data(walker_data),
 	.walker_berr(walker_berr),
-	.phys_addr(mmu_addr_phys), .cache_inhibit(mmu_cache_inhibit), .m_nocache(mm_nocache), .m_postok(mm_postok), .m_cb(mm_cb),
+	.phys_addr(mmu_addr_phys), .cache_inhibit(mmu_cache_inhibit), .m_nocache(mm_nocache), .m_postok(mm_postok), .m_cb(mm_cb), .walk_busy(mm_walk),
 	.ifp_en(ifp_req), .ifp_addr(ifp_addr), .ifp_s(ifp_s),
 	.ifp_ok(ifp_tok), .ifp_pa(ifp_pa), .ifp_ci(ifp_tci),
 	.dfp_en(dfp_req), .dfp_addr(dfp_addr), .dfp_fc(dfp_fc),
@@ -527,6 +527,7 @@ assign mm_fc     = mem_fc;
 assign mm_nocache = 1'b0;
 assign mm_postok  = 1'b0;
 assign mm_cb      = 1'b0;
+assign mm_walk    = 1'b0;
 assign mem_ack   = mm_ack;
 assign mem_rdata = mm_rdata;
 assign mem_flt_mmu = 1'b0;
@@ -746,6 +747,7 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.c_nocache(mm_nocache | ~cache_allow |
 		           (mm_instr & cache_chip & ~cache_allow_all)),
 		.c_cb((AP040_COPYBACK != 0) && mm_cb && cb_win),
+		.walk_busy(mm_walk),
 		.s_stb(snp_stb),
 		.s_addr(snp_addr),
 		.c_ack(mm_ack),

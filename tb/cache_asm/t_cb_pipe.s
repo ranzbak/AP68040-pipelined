@@ -21,6 +21,10 @@
 ;   8  code stored through copyback runs after CPUSHA
 ;   9  a write-through page writes through
 ;  10  a store miss writes through (no write-allocate)
+;  11  all four ways of one set dirty ($2080/$2480/$2880/$2C80), CPUSHA
+;      writes every one back
+;  12  three ways of one set dirty ($2090/$2490/$2890), then a
+;      cache-inhibited read in that set: every dirty way written back first
 
 FAILREG	equ	$F100
 DONEREG	equ	$F102
@@ -193,6 +197,40 @@ start:	move.l	#CACR_ON,d0
 	move.l	#$ABABABAB,$2070		; never read: not resident
 	chkpk	$2070,$ABABABAB,10
 
+; 11: four dirty ways in one set
+	move.l	$2080,d0
+	move.l	$2480,d0
+	move.l	$2880,d0
+	move.l	$2C80,d0
+	move.l	#$B0B0B001,$2080
+	move.l	#$B0B0B002,$2480
+	move.l	#$B0B0B003,$2880
+	move.l	#$B0B0B004,$2C80
+	cpusha	dc
+	chkpk	$2080,$B0B0B001,111
+	chkpk	$2480,$B0B0B002,112
+	chkpk	$2880,$B0B0B003,113
+	chkpk	$2C80,$B0B0B004,114
+	cmp.l	#$B0B0B003,$2880
+	beq.s	.c11
+	failt	115
+.c11:
+; 12: three dirty ways, then an inhibited read in the set
+	move.l	$2090,d0
+	move.l	$2490,d0
+	move.l	$2890,d0
+	move.l	#$C0C0C001,$2090
+	move.l	#$C0C0C002,$2490
+	move.l	#$C0C0C003,$2890
+	cmp.l	#$C0C0C001,$4090		; the inhibited alias of $2090
+	beq.s	.c12a
+	failt	12
+.c12a:	chkpk	$2490,$C0C0C002,122
+	chkpk	$2890,$C0C0C003,123
+	cmp.l	#$C0C0C002,$2490
+	beq.s	.c12b
+	failt	124
+.c12b:
 	move.w	#$600d,DONEREG
 .h:	bra.s	.h
 
