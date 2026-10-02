@@ -145,6 +145,7 @@ typedef struct packed {
 	logic [31:0] exc_addr;     // CL_EXC format $2: the address field
 	logic [31:0] btarget;      // CL_BCC/BSR/DBCC: branch target; CL_RTS with rpred: the predicted return address
 	logic        rpred;        // CL_RTS: ID redirected IF to btarget (the return-address stack's top)
+	logic        bnt;          // CL_BCC: ID guessed it NOT taken (BTFN: a forward conditional branch)
 	logic [1:0]  size2;        // the destination EA's operand size (PACK/UNPK, RTR)
 	logic [4:0]  reg_c;        // a third register operand (CAS Du, DIV.L Dr, MUL.L Dh, BF offset)
 	logic [4:0]  reg_d;        // a fourth (bitfield width)

@@ -145,6 +145,9 @@ ap040_pipe_core #(
 `ifdef LDX
 	, .LDX(`LDX)
 `endif
+`ifdef BTFN
+	, .BTFN(`BTFN)
+`endif
 `ifdef RAS
 	, .RAS(`RAS)
 `endif

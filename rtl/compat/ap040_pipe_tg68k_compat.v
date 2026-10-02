@@ -72,7 +72,10 @@ module ap040_pipe_tg68k_compat
 	// findings/btb/plan.md: IF's branch target buffer.  0: none.
 	parameter AP040_BTB          = 0,
 	// findings/loadstore/plan.md step 1: late-operand load dispatch.  0: none.
-	parameter AP040_LDX          = 0
+	parameter AP040_LDX          = 0,
+	// findings/loadstore/plan.md section 11: forward conditional branches
+	// guessed not taken.  0: every Bcc guessed taken.
+	parameter AP040_BTFN         = 0
 )
 (
 	input         clk,
@@ -374,6 +377,7 @@ ap040_pipe_core #(
 	.RAS(AP040_RAS),
 	.BTB(AP040_BTB),
 	.LDX(AP040_LDX),
+	.BTFN(AP040_BTFN),
 	.PRECISE(AP040_PRECISE),
 	.MISPLIT(AP040_MISPLIT),
 	.SB_MMU(AP040_SB_MMU)

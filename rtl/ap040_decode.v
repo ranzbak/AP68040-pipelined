@@ -46,7 +46,12 @@ module ap040_decode
 	// prediction (the marked word ends a branch it redirects on, to the same
 	// target), repairs one that is wrong, restarts an instruction a marked
 	// word lands inside, and teaches the buffer its taken-branch redirects.
-	parameter BTB = 0
+	parameter BTB = 0,
+	// findings/loadstore/plan.md section 11: 1 guesses a forward conditional
+	// Bcc NOT taken (no redirect; EA-fetch redirects to the target if it is
+	// taken) and every other branch taken -- backward taken, forward not
+	// taken.  0: every Bcc guessed taken, as before.  Only without the BTB.
+	parameter BTFN = 0
 )
 (
 	input             clk,
@@ -1707,6 +1712,7 @@ id_t d_ras;
 always @* begin
 	d_ras = d;
 	d_ras.rpred = ras_hit;
+	d_ras.bnt   = bnt;
 	if (ras_hit) d_ras.btarget = ras_top;
 end
 always @(posedge clk)
@@ -1722,7 +1728,10 @@ always @(posedge clk)
 
 // guess taken: Bcc/BRA/BSR redirect IF the clock they are emitted; so does
 // an RTS the return-address stack predicts
-wire   is_br  = (d.cls == CL_BCC || d.cls == CL_BSR || d.cls == CL_DBCC);
+// (BTFN) a forward conditional Bcc is guessed not taken: ID does not redirect
+wire   bnt    = (BTFN != 0) && (BTB == 0) && (d.cls == CL_BCC) && (d.cond != 4'h0) &&
+                (d.btarget > d.pc);
+wire   is_br  = ((d.cls == CL_BCC) && !bnt) || d.cls == CL_BSR || d.cls == CL_DBCC;
 wire   std_rd = emit && (is_br || ras_hit);
 // (BTB) IF already fetched the target: nothing to redirect.  A marked word
 // that ends another instruction, or a branch to another target, redirects

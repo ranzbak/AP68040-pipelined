@@ -277,6 +277,9 @@ end
 `ifndef LDX
 `define LDX 0
 `endif
+`ifndef BTFN
+`define BTFN 0
+`endif
 ap040_pipe_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
                      .AP040_POST_STORES(POST),
                      .AP040_FILL_CHANNEL(FILLCH),
@@ -288,7 +291,8 @@ ap040_pipe_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
                      .AP040_SB_MMU(`SB_MMU),
                      .AP040_COPYBACK(`COPYBACK),
                      .AP040_BTB(`BTB),
-                     .AP040_LDX(`LDX)) dut
+                     .AP040_LDX(`LDX),
+                     .AP040_BTFN(`BTFN)) dut
 (
 	.clk(clk),
 	.nreset(nreset),

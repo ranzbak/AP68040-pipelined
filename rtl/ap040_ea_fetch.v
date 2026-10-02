@@ -2390,7 +2390,8 @@ assign eaf_stall = eac_valid && !st.fin;
 assign eaf_blk   = eac_v_use && (i.serialize || (ph != P_START && ph != P_OPS) || i.cls == CL_MOVEM);
 assign halted    = (ph == P_HALT);
 
-// Bcc/DBcc were guessed taken by ID; a not-taken one is corrected here,
+// Bcc/DBcc were guessed taken by ID (but a forward Bcc under BTFN, i.bnt,
+// guessed not taken: corrected to its target when taken); a not-taken one is corrected here,
 // with the CCR the instruction ahead of it (in EX, or committing in WB)
 // leaves -- a two-clock correction instead of the four a redirect from EX
 // costs (M68040UM 10.5 p. 10-11: Bcc not taken 3, DBcc 3/4).
@@ -2403,9 +2404,12 @@ wire        rts_ok     = (i.cls == CL_RTS) && i.rpred && (s_val_c == i.btarget);
 wire        redir_now  = st.disp && st.dsel == 3'd0 && !flush &&
                         ((i.cls == CL_RTS && !rts_ok) || i.cls == CL_RTD || i.cls == CL_RTR ||
                          ((i.cls == CL_JMP || i.cls == CL_JSR) && !eac_i.redirected) ||
-                         ((i.cls == CL_BCC || i.cls == CL_DBCC) && !br_taken));
+                         (i.cls == CL_DBCC && !br_taken) ||
+                         (i.cls == CL_BCC && (i.bnt ? br_taken : !br_taken)));
+// (BTFN) a Bcc ID guessed NOT taken (i.bnt) is corrected to its target
 wire [31:0] redir_pc_now = (i.cls == CL_RTS || i.cls == CL_RTD) ? s_val_c :
                            (i.cls == CL_RTR) ? d_val_c :
+                           (i.cls == CL_BCC && i.bnt) ? i.btarget :
                            (i.cls == CL_BCC || i.cls == CL_DBCC) ? i.next_pc : s_addr_c;
 
 // REDIR_REG (plan M11.1): hold the redirect one clock.  `rdz_v` is the GAP

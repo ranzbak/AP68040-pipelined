@@ -91,7 +91,10 @@ module ap040_pipe_core
 	// findings/loadstore/plan.md step 1: a load is dispatched in its lookup
 	// clock with the answer the read path gives there (late operand); EX
 	// waits only when it was not answered then.  0: as before.
-	parameter         LDX                = 0
+	parameter         LDX                = 0,
+	// findings/loadstore/plan.md section 11: ID guesses a forward conditional
+	// Bcc not taken (backward taken, forward not taken).  0: all taken.
+	parameter         BTFN               = 0
 )
 (
 	input  clk,
@@ -799,7 +802,7 @@ ap040_inst_fetch #(
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1)
 );
 
-ap040_decode #(.HAS_FPU(HAS_FPU), .RAS(RAS), .BTB(BTB)) u_id
+ap040_decode #(.HAS_FPU(HAS_FPU), .RAS(RAS), .BTB(BTB), .BTFN(BTFN)) u_id
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ea_stall), .flush(flush_id),
 	.q_v0(q_v0), .q_v1(q_v1), .q_pc0(q_pc0), .q_w0(q_w0), .q_w1(q_w1),
