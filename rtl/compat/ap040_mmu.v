@@ -110,6 +110,14 @@ module ap040_mmu
 	// its last: the walker owns the master port then, and the cache must not
 	// start a write-back on it (see the cache's walk_busy)
 	output            walk_busy,
+	// (copyback) M68040UM 3.2.5: a table search reads a descriptor through
+	// the data cache (cachable, no allocate), and its read-modify-write
+	// pushes the matching line first.  This walker reads and writes memory,
+	// so before each descriptor transaction (walk_pend: its address is on
+	// walker_addr, the request not yet out) the cache pushes any dirty way
+	// of that set and holds the walker (walk_wait) until memory has it.
+	output            walk_pend,
+	input             walk_wait,
 	// (store buffer stage 4, findings/storebuf/plan.md) the write forwarded
 	// now could have been posted: a TTR hit that neither write-protects nor
 	// inhibits, or an ATC hit that passed -- so writable, M already set, S
@@ -430,6 +438,7 @@ assign m_fc    = c_fc;
 // Besides making the interface unambiguous for a level-handshake backend,
 // this prevents a held ack from completing the following descriptor.
 assign walker_req  = w_active && w_issued;
+assign walk_pend   = w_active && !w_issued;
 assign walker_we   = w_req_wr;
 assign walker_addr = w_req_addr;
 assign walker_wdat = w_req_wdat;
@@ -503,7 +512,7 @@ always @(posedge clk) begin
 		c_flt <= 0;
 		pt_done <= 0;
 		pf_done <= 0;
-		if (w_active && !w_issued) w_issued <= 1;
+		if (w_active && !w_issued && !walk_wait) w_issued <= 1;
 
 		if (walk_err) begin
 			// A physical bus error while fetching or updating a descriptor is

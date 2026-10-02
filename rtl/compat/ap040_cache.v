@@ -77,13 +77,26 @@ module ap040_cache
 	input             c_cb,        // (COPYBACK) a copyback page in the copyback window
 	// (COPYBACK) the MMU's table walk is in progress.  The walker and this
 	// cache share the master port (rtl/soc/TG68K.vhd's mux: wk_go takes it
-	// over and takes the next acknowledge as its descriptor), and a walk
-	// can run while the cache sweeps for CINV/CPUSH (the instruction fetch
-	// misses the ATC meanwhile).  A write-back starts only with no walk in
-	// progress; a sweep's pending write-back holds new walks off (post_busy,
-	// the MMU's walk_hold).  Found on the board: copyback hung AmigaOS
-	// at program load and exit (CacheClearU), 2026-10-01.
+	// over and takes the next acknowledge as its descriptor).  A write-back
+	// starts only with no walk in progress; a pending write-back holds new
+	// walks off (post_busy, the MMU's walk_hold).  Found on the board:
+	// copyback hung AmigaOS at program load and exit (CacheClearU),
+	// 2026-10-01.  A CINV/CPUSH sweep and a walk never overlap at all: the
+	// sweep starts with no walk running, and sweep_busy holds walks off
+	// while it runs (the instruction fetch past a CPUSH can miss the ATC).
 	input             walk_busy,
+	// (COPYBACK) the walker's next descriptor transaction is waiting
+	// (wk_pend, physical address wk_addr) and may not go out while its set
+	// holds a dirty way (wk_wait): M68040UM 3.2.5, a table search sees the
+	// data cache's copy and its read-modify-write pushes the line first.
+	// From C_IDLE (before a pending CINV/CPUSH, whose sweep waits for the
+	// walk) the cache looks the line up (C_WLOOK) and pushes it if it is
+	// dirty here -- only that line -- then lets the walker go.
+	// The walker has no transaction on the master port while it waits.
+	input             wk_pend,
+	input      [31:0] wk_addr,
+	output            wk_wait,
+	output            sweep_busy,   // (COPYBACK) a CINV/CPUSH sweep: no walk may start
 	output            c_ack,
 	output     [31:0] c_rdata,
 
@@ -292,6 +305,7 @@ localparam C_SWEEP = 4'd7;   // reset / CINV: walk the rows clearing them
 localparam C_FILLC = 4'd8;   // A1: line requested over the fill channel
 localparam C_FILLW = 4'd9;   // A1: the delivered line goes into the way
 localparam C_PUSH  = 4'd10;  // (COPYBACK) write dirty ways of a data-bank set back
+localparam C_WLOOK = 4'd11;  // (COPYBACK) the walker's set: is its line dirty here?
 
 // (COPYBACK) Dirty bits, one per data-bank line.  A row clear spares the
 // dirty ways (vb_keep): a dirty line is only ever dropped after it has been
@@ -605,6 +619,22 @@ assign c_rdata = pass_active ? m_rdata : rdata_r;
 // is accepted, the dirty ways of that set are pushed; the request is still
 // held, and C_IDLE looks at it again with the set clean.
 wire  [5:0] c_set2   = c_addr[9:4] + 6'd1;
+// (COPYBACK) the walker's descriptor in a set with dirty ways: C_WLOOK
+// reads the set's tags, and only a dirty way holding the descriptor's own
+// line is pushed (the 68040 looks the line up; a dirty neighbour stays).
+// wk_chk: this transaction's set has been looked at; it clears when the
+// walker's request goes out (wk_pend falls).
+reg         wk_chk;
+reg         wl_ph;
+wire  [5:0] wk_set   = wk_addr[9:4];
+wire        wk_push  = (COPYBACK != 0) && wk_pend && (db[wk_set] != 4'd0) && !wk_chk;
+assign      wk_wait  = (COPYBACK != 0) && wk_pend &&
+                       (((db[wk_set] != 4'd0) && !wk_chk) || (cst == C_WLOOK) || (cst == C_PUSH));
+wire  [3:0] wl_match = {db[p_set][3] && (t_w3 == wk_addr[31:10]),
+                        db[p_set][2] && (t_w2 == wk_addr[31:10]),
+                        db[p_set][1] && (t_w1 == wk_addr[31:10]),
+                        db[p_set][0] && (t_w0 == wk_addr[31:10])};
+assign      sweep_busy = (COPYBACK != 0) && (cst == C_SWEEP);
 wire  [3:0] c_d1     = db[c_addr[9:4]];
 wire  [3:0] c_d2     = db[c_set2];
 wire        bp_acc   = c_write ? !st_upd_ok : (bypass && !c_instr);
@@ -628,7 +658,7 @@ assign wr_accept_upd = (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
                        !dr_active && st_upd_ok;
 
 // a push reads its set's tags (the way's address) through port A
-assign tag_ridx  = (cst == C_PUSH) ? {1'b0, p_set} : a_row;
+assign tag_ridx  = ((cst == C_PUSH) || (cst == C_WLOOK)) ? {1'b0, p_set} : a_row;
 wire [87:0] tags_next = (r_way == 2'd0) ? {tag_q[87:22], r_tag} :
                         (r_way == 2'd1) ? {tag_q[87:44], r_tag, tag_q[21:0]} :
                         (r_way == 2'd2) ? {tag_q[87:66], r_tag, tag_q[43:0]} :
@@ -762,6 +792,7 @@ always @(posedge clk) begin
 		r_cb <= 0;
 		p_set <= 0; p_mask <= 0; p_way <= 0; p_ph <= 0; p_rb <= 0; p_wb <= 0;
 		p_req <= 0; p_tag <= 0; p_ret <= P_IDLE;
+		wk_chk <= 0; wl_ph <= 0;
 		pbuf0 <= 0; pbuf1 <= 0; pbuf2 <= 0; pbuf3 <= 0;
 		post_err <= 0;
 		r_wdata <= 0;
@@ -781,6 +812,7 @@ always @(posedge clk) begin
 		ack_r <= 0;
 		cinv_done <= 0;
 		post_err <= 0;
+		if (!wk_pend) wk_chk <= 1'b0;
 		if (ci_inv) ci_inv_pend <= 0;
 
 		// the decoupled drain completes, or fails, whatever the FSM is
@@ -809,7 +841,17 @@ always @(posedge clk) begin
 		case (cst)
 			C_IDLE: begin
 				if (!c_req) err_hold <= 0;
-				if (cinv_req && !cinv_done) begin
+				if (wk_push && !dr_active) begin
+					// (COPYBACK) the walker waits on a set with dirty ways
+					p_set <= wk_set;
+					wl_ph <= 1'b0;
+					cst   <= C_WLOOK;
+				end
+				// (COPYBACK) a sweep and a table walk never overlap: the
+				// sweep starts with no walk running (the walker may be
+				// waiting for the push above), and no walk starts while
+				// it runs (sweep_busy holds walks off)
+				else if (cinv_req && !cinv_done && !((COPYBACK != 0) && walk_busy)) begin
 					sweep_cnt <= 0;
 					sweep_all <= 0;   // honour the cinv_ic/cinv_dc selects
 					cst <= C_SWEEP;
@@ -1059,6 +1101,26 @@ always @(posedge clk) begin
 					sweep_all <= 0;
 					cst <= C_IDLE;
 				end
+				end
+			end
+
+			C_WLOOK: begin
+				// the set's tags arrive the clock after p_set (wl_ph)
+				if (!wl_ph)
+					wl_ph <= 1'b1;
+				else begin
+					wk_chk <= 1'b1;
+					if (wl_match != 4'd0) begin
+						p_mask <= wl_match;
+						p_way  <= low_way(wl_match);
+						p_ph   <= 1'b0;
+						p_rb   <= 3'd0;
+						p_req  <= 1'b0;
+						p_ret  <= P_IDLE;
+						cst    <= C_PUSH;
+					end
+					else
+						cst <= C_IDLE;
 				end
 			end
 

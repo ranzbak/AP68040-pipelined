@@ -250,6 +250,8 @@ wire  [1:0] mm_size;
 wire [31:0] mm_addr, mm_wdata;
 wire  [2:0] mm_fc;
 wire        mm_ack, mm_nocache, mm_postok, mm_cb, mm_walk;
+wire        wk_pend, wk_wait;   // (copyback) the walker waits for a push of its set
+wire        sweep_busy;         // (copyback) a CINV/CPUSH sweep holds new walks off
 wire [31:0] mm_rdata;
 
 // cache to bus adapter
@@ -488,7 +490,7 @@ ap040_mmu #(.IFP(IFP_ON ? 1 : 0)) mmu (
 	.itt0(w_itt0), .itt1(w_itt1), .dtt0(w_dtt0), .dtt1(w_dtt1),
 	.c_req(mem_req), .c_write(mem_write), .c_instr(mem_instr), .c_size(mem_size),
 	.c_addr(mem_addr), .c_wdata(mem_wdata), .c_fc(mem_fc), .c_lock(mem_lock),
-	.walk_hold(post_busy),
+	.walk_hold(post_busy | sweep_busy),
 	.c_ack(mem_ack), .c_rdata(mem_rdata), .c_flt(mem_flt_mmu),
 	.pt_req(pt_req), .pt_write(pt_write), .pt_addr(pt_addr), .pt_fc(pt_fcw),
 	.pt_done(pt_done), .pt_mmusr(pt_mmusr),
@@ -499,6 +501,7 @@ ap040_mmu #(.IFP(IFP_ON ? 1 : 0)) mmu (
 	.walker_wdat(walker_wdat), .walker_ack(walker_ack), .walker_data(walker_data),
 	.walker_berr(walker_berr),
 	.phys_addr(mmu_addr_phys), .cache_inhibit(mmu_cache_inhibit), .m_nocache(mm_nocache), .m_postok(mm_postok), .m_cb(mm_cb), .walk_busy(mm_walk),
+	.walk_pend(wk_pend), .walk_wait(wk_wait),
 	.ifp_en(ifp_req), .ifp_addr(ifp_addr), .ifp_s(ifp_s),
 	.ifp_ok(ifp_tok), .ifp_pa(ifp_pa), .ifp_ci(ifp_tci),
 	.dfp_en(dfp_req), .dfp_addr(dfp_addr), .dfp_fc(dfp_fc),
@@ -531,6 +534,7 @@ assign mm_nocache = 1'b0;
 assign mm_postok  = 1'b0;
 assign mm_cb      = 1'b0;
 assign mm_walk    = 1'b0;
+assign wk_pend    = 1'b0;
 assign mem_ack   = mm_ack;
 assign mem_rdata = mm_rdata;
 assign mem_flt_mmu = 1'b0;
@@ -751,6 +755,10 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		           (mm_instr & cache_chip & ~cache_allow_all)),
 		.c_cb((AP040_COPYBACK != 0) && mm_cb && cb_win),
 		.walk_busy(mm_walk),
+		.wk_pend(wk_pend),
+		.wk_addr(walker_addr),
+		.wk_wait(wk_wait),
+		.sweep_busy(sweep_busy),
 		.s_stb(snp_stb),
 		.s_addr(snp_addr),
 		.c_ack(mm_ack),
@@ -805,6 +813,8 @@ else begin : g_nocache
 	assign ifp_data  = 32'd0;
 	wire unused_ifp = ifp_req | ifp_s | (|ifp_addr);
 	assign post_busy = 1'b0;    // no cache, no buffer: stores are synchronous
+	assign wk_wait   = 1'b0;    // no cache, nothing dirty
+	assign sweep_busy = 1'b0;
 	assign post_err  = 1'b0;
 	assign fill_req  = 1'b0;    // no cache, no line fills
 	assign fill_addr = 28'd0;
