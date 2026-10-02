@@ -568,6 +568,29 @@ assign debug_status2 = {32'd0, c_dbg_usp, c_dbg_isp, 16'd0, 8'd0, 5'd0, 1'b0, de
 // so it wins the port; the walker's own invalidate waits at most a cycle.
 // A second walker write cannot arrive that fast (each is a full memory
 // transaction), so one pending slot is enough.
+// The chipset snoop, registered on this clock first.  TG68K's holder
+// (snp_stb_held) is set on any clk_114 edge and is high at exactly one
+// clk_cpu edge, so used directly its crossing had one clk_114 period
+// (8.8 ns) for the cache's whole invalidate cone (nine LUT levels into
+// the valid bits): +0.03 to +0.14 ns in the copyback builds, -0.06 ns in
+// stage_cb4 -- a late snoop would clear some valid bits of its set and
+// not others.  Registered, the crossing is flop to flop and the cone has
+// the full clk_cpu period.  The pulse shape is unchanged (one clock),
+// one clock later; the cache already takes a snoop at any point against
+// a fill (poisoned in flight, no tag write in C_TAGW, a set clear after).
+reg         csnp_stb;
+reg  [31:0] csnp_addr;
+always @(posedge clk) begin
+	if (!nreset) begin
+		csnp_stb  <= 1'b0;
+		csnp_addr <= 32'd0;
+	end
+	else begin
+		csnp_stb <= cache_snoop_stb;
+		if (cache_snoop_stb) csnp_addr <= cache_snoop_addr;
+	end
+end
+
 reg         wsnp_pend;
 reg  [31:0] wsnp_addr;
 reg         walker_wr_d;
@@ -585,13 +608,13 @@ always @(posedge clk) begin
 			wsnp_pend <= 1'b1;
 			wsnp_addr <= walker_addr;
 		end
-		else if (wsnp_pend && !cache_snoop_stb)
+		else if (wsnp_pend && !csnp_stb)
 			wsnp_pend <= 1'b0;      // issued on the port this cycle
 	end
 end
 
-wire        snp_stb  = cache_snoop_stb | wsnp_pend;
-wire [31:0] snp_addr = cache_snoop_stb ? cache_snoop_addr : wsnp_addr;
+wire        snp_stb  = csnp_stb | wsnp_pend;
+wire [31:0] snp_addr = csnp_stb ? csnp_addr : wsnp_addr;
 
 generate
 if (AP040_ENABLE_CACHE != 0) begin : g_cache
