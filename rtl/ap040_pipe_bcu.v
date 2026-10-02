@@ -144,6 +144,12 @@ module ap040_pipe_bcu
 	// and never goes on the port.  Tie low without the path.
 	input             rd_fast,
 	input      [31:0] rd_fast_data,
+	// (findings/loadstore/plan.md step 1, LDX) the answer the slot read gets
+	// THIS clock if it is answered without the port -- the value rd_data
+	// takes at this edge -- and whether it is (combinational, for EA-fetch's
+	// late-operand dispatch: data path only, never a stall condition)
+	output            rd_fast_now,
+	output     [31:0] rd_data_c,
 
 	// instruction fetch (IF)
 	input             f_req,
@@ -229,6 +235,8 @@ wire go_st   = go_fifo || go_sync;
 // may be sending the older instruction's store to EX in that same clock
 // (an early read), and older_st sees it only once it is there.
 wire go_rd   = idle && !sp_on && (sb_cnt == 0) && !st_v && !older_st && dq_v && !rd_fast && !rd_fwd;
+assign rd_fast_now = (rd_fast || rd_fwd) && dq_v;
+assign rd_data_c   = rd_fwd ? fw_data : rd_fast_data;
 // (MIX) nor while WB holds a store it posts: it is older than any fetch,
 // and a refetch after self-modifying code (WB's wb_smc, in that very
 // clock) must not read the code before the store lands (smc.s)

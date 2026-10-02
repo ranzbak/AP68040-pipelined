@@ -70,7 +70,9 @@ module ap040_pipe_tg68k_compat
 	// Needs AP040_POST_STORES = 1 and the internal caches.
 	parameter AP040_COPYBACK     = 0,
 	// findings/btb/plan.md: IF's branch target buffer.  0: none.
-	parameter AP040_BTB          = 0
+	parameter AP040_BTB          = 0,
+	// findings/loadstore/plan.md step 1: late-operand load dispatch.  0: none.
+	parameter AP040_LDX          = 0
 )
 (
 	input         clk,
@@ -369,6 +371,7 @@ ap040_pipe_core #(
 	.FWD(AP040_FWD),
 	.RAS(AP040_RAS),
 	.BTB(AP040_BTB),
+	.LDX(AP040_LDX),
 	.PRECISE(AP040_PRECISE),
 	.MISPLIT(AP040_MISPLIT),
 	.SB_MMU(AP040_SB_MMU)

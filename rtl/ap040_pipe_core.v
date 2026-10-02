@@ -87,7 +87,11 @@ module ap040_pipe_core
 	parameter         SB_MMU             = 0,
 	// findings/btb/plan.md: IF's 16-entry branch target buffer, taught by
 	// ID's taken-branch redirects; ID confirms or recovers.  0: none.
-	parameter         BTB                = 0
+	parameter         BTB                = 0,
+	// findings/loadstore/plan.md step 1: a load is dispatched in its lookup
+	// clock with the answer the read path gives there (late operand); EX
+	// waits only when it was not answered then.  0: as before.
+	parameter         LDX                = 0
 )
 (
 	input  clk,
@@ -526,6 +530,10 @@ wire             l1_en_a;
 wire      [31:0] l1_rdata_a;
 wire             d_rd_req, d_rd_ack;
 wire      [31:0] d_rd_addr, d_rd_data;
+wire             d_rd_fast_now;      // (LDX) the slot read is answered this clock ...
+wire      [31:0] d_rd_data_c;        // ... with this
+wire             ld_wait;            // EX's micro-op waits for its loaded operand
+wire             ldx_busy;           // ... and the outstanding read is that micro-op's own
 wire       [1:0] d_rd_size;
 wire             d_wr_ready;
 
@@ -580,6 +588,7 @@ generate if (BUS == 0) begin : g_l1
 	assign l1_en_a   = f_req;
 	assign d_rd_ack  = l1_rd_ack;
 	assign d_rd_data = l1_rd_data;
+	assign d_rd_fast_now = 1'b0; assign d_rd_data_c = 32'd0;
 	assign sb_full = 1'b0; assign sb_busy = 1'b0;
 	assign st_done = 1'b0; assign st_ferr = 1'b0; assign st_fatc = 1'b0; assign st_fma = 1'b0;
 	assign mem_req = 1'b0; assign mem_write = 1'b0; assign mem_instr = 1'b0; assign mem_size = 2'd0;
@@ -743,7 +752,10 @@ end else begin : g_bus
 		.st_addr(exe_o.st_addr), .st_size(exe_o.st_size),
 		.st_data(exe_o.st_data), .st_fc(exe_o.st_fc), .st_rb(exe_o.st_rb), .mem_rb(),
 		.sb_full(sb_full), .sb_busy(sb_busy), .st_done(st_done), .st_ferr(st_ferr), .st_fatc(st_fatc), .st_fma(st_fma),
-		.older_st(older_store || (exe_valid && exe_o.st_v)),   // (registered state only: timing)
+		// (LDX) while EX holds a load dispatched before its answer, EX's store
+		// is that load's own -- younger than the read in the slot, which would
+		// otherwise wait for it for ever (MOVE.L abs,-(SP) on a slow read)
+		.older_st((older_store && !(ldx_busy && !d_rd_ack)) || (exe_valid && exe_o.st_v)),   // (registered state only: timing)
 		.lk_v(ce && d_rd_req), .lk_addr(d_rd_addr), .lk_size(d_rd_size), .sb_ovl(sb_ovl), .k_fifo_o(sb_kfifo),
 		.lk_fc(d_rd_fc), .exs_v(ex_push), .exs_addr(eaf_o.daddr), .exs_data(eaf_o.next_pc), .exs_fc(eaf_o.st_fc),
 		.wbs_v(exe_valid && exe_o.st_v), .wbs_ok(!exe_o.stf.lk),
@@ -752,6 +764,7 @@ end else begin : g_bus
 		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc), .rd_lk(d_rd_lk),
 		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(d_rd_err),
 		.rd_fast(d_rd_fast), .rd_fast_data(dfp_data),
+		.rd_fast_now(d_rd_fast_now), .rd_data_c(d_rd_data_c),
 		.f_req(b_f_req), .f_addr(b_f_addr), .f_long(b_f_long), .f_fc(b_f_s ? 3'd6 : 3'd2),
 		.f_gnt(b_f_gnt), .f_ack(b_f_ack), .f_data(b_f_data), .f_err(b_f_err),
 		.st_err(bus_st_err),
@@ -835,7 +848,7 @@ ap040_ea_calc #(.HAS_FPU(HAS_FPU)) u_eac
 
 
 ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HAS_FPU(HAS_FPU), .REDIR_REG(REDIR_REG),
-                 .MM_TAIL(BUS ? 1 : 0)) u_eaf
+                 .MM_TAIL(BUS ? 1 : 0), .LDX(LDX)) u_eaf
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ex_stall), .flush(flush),
 	.keep_out(ex_redir_q && ex_stall),
@@ -853,6 +866,7 @@ ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HA
 	.ex_ccr_v(fw_ccr_v), .ex_ccr(fw_ccr),
 	.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc), .rd_lk(d_rd_lk),
 	.rd_ack(d_rd_ack), .rd_data_raw(d_rd_data),
+	.rd_fast_now(d_rd_fast_now), .rd_data_c(d_rd_data_c), .ld_wait(ld_wait), .ldx_busy(ldx_busy),
 	.rd_err(d_rd_err), .rd_atc(d_rd_atc), .rd_ma(d_rd_ma), .bus_wdata(mem_wdata),
 	.pt_req(pt_req), .pt_write(pt_write), .pt_addr(pt_addr), .pt_done(pt_done), .pt_mmusr(pt_mmusr),
 	.pf_req(pf_req), .pf_mode(pf_mode), .pf_addr(pf_addr), .pf_done(pf_done),
@@ -937,7 +951,7 @@ always @(posedge clk)
 
 ap040_execute #(.HAS_FPU(HAS_FPU)) u_ex
 (
-	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(wb_hold), .wb_drop(wb_fault), .in_drop(wb_smc),
+	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(wb_hold), .ld_wait(ld_wait), .wb_drop(wb_fault), .in_drop(wb_smc),
 	.eaf_valid(eaf_valid), .x(eaf_o),
 	.ccr_in(sr_now[4:0]), .sr_in(sr_now),
 	.sfc_in({29'd0, sfc}), .dfc_in({29'd0, dfc}), .cacr_in(cacr), .vbr_in(vbr),

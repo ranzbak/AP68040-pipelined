@@ -30,6 +30,9 @@ module ap040_execute
 	input             nreset,
 	input             ce,
 	input             stall_in,   // WB cannot accept
+	// (findings/loadstore/plan.md step 1, LDX) this micro-op's loaded
+	// operand is not in x yet: hold it, as for a MUL/DIV still running
+	input             ld_wait,
 	input             wb_drop,    // WB's store faulted (M6): its micro-op is gone
 	input             in_drop,    // WB's self-modifying-code refetch: this micro-op does not go to WB
 
@@ -81,7 +84,9 @@ reg         md_busy;
 wire        md_done;
 wire [31:0] md_rhi, md_rlo;
 wire        md_ovf;
-wire        md_start = md_uop && !md_busy;
+// (LDX) not on a provisional operand: a MUL from memory dispatched before
+// its load's answer starts when the answer is in (ldx.s case 9)
+wire        md_start = md_uop && !md_busy && !ld_wait;
 wire [31:0] md_a  = md_long ? x.a : (md_sgn ? sext16(x.a[15:0]) : {16'd0, x.a[15:0]});
 wire [31:0] md_hi = !md_div ? 32'd0 :
                     (md_long && md_64) ? x.c :
@@ -106,7 +111,7 @@ end
 
 // EX holds while a MUL/DIV runs: from its start until the clock its result is there
 wire md_wait = md_uop && !(md_busy && md_done);
-assign ex_stall = stall_in || md_wait;
+assign ex_stall = stall_in || md_wait || ld_wait;
 
 wire [31:0] alu_result;
 wire  [4:0] alu_flags;
@@ -425,10 +430,10 @@ assign fw_w0_val = w.w0_val;
 // redirect's flush (keep_out, core).  An older store that faults squashes
 // this micro-op anyway, and its exception redirects IF again.
 reg  ex_rdone;
-assign ex_redirect    = eaf_valid && redir && !ex_rdone;
+assign ex_redirect    = eaf_valid && redir && !ex_rdone && !ld_wait;
 always @(posedge clk)
 	if (!nreset) ex_rdone <= 1'b0;
-	else if (ce) ex_rdone <= eaf_valid && stall_in && !wb_drop && (ex_rdone || (redir && !ex_rdone));
+	else if (ce) ex_rdone <= eaf_valid && stall_in && !wb_drop && (ex_rdone || (redir && !ex_rdone && !ld_wait));
 assign ex_redirect_pc = redir_pc;
 assign ex_redirect_s  = w.sr_v ? w.sr_val[13] : sr_in[13];
 
@@ -440,9 +445,9 @@ always @(posedge clk) begin
 	end else if (ce && wb_drop) begin
 		exe_valid <= 1'b0;
 	end else if (ce && !stall_in) begin
-		// a MUL/DIV still running sends a bubble to WB
-		exe_valid <= eaf_valid && !md_wait && !in_drop;
-		if (eaf_valid && !md_wait) begin
+		// a MUL/DIV still running, or a load still answering, sends a bubble to WB
+		exe_valid <= eaf_valid && !md_wait && !ld_wait && !in_drop;
+		if (eaf_valid && !md_wait && !ld_wait) begin
 			exe_o <= w;
 			// (findings/storebuf/plan.md) a store WB may post: it goes to
 			// RAM, is not a locked read-modify-write's, and is not MOVES

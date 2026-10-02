@@ -67,7 +67,11 @@ module ap040_ea_fetch
 	parameter MM_TAIL = 0,
 	// RESET: how long RSTO is asserted, in (enabled) clocks -- M68040UM
 	// 7.x "the processor drives the reset out (RSTO) signal for 512 BCLK"
-	parameter RSTO_CLKS = 512
+	parameter RSTO_CLKS = 512,
+	// findings/loadstore/plan.md step 1: a load whose answer has not been
+	// seen yet is dispatched in its lookup clock (late operand); EX waits
+	// for the answer (ld_wait).  0 = as before.
+	parameter LDX = 0
 )
 (
 	input             clk,
@@ -110,6 +114,13 @@ module ap040_ea_fetch
 	input             rd_ack,
 	input      [31:0] rd_data_raw,
 	input             rd_err,     // the read ended in an access error (M6)
+	// (LDX) the read's answer as it would be registered at this edge, and
+	// whether it is being answered this clock (ap040_pipe_bcu rd_data_c /
+	// rd_fast_now); EX's micro-op still waiting for its loaded operand
+	input             rd_fast_now,
+	input      [31:0] rd_data_c,
+	output            ld_wait,
+	output            ldx_busy,   // ... and the outstanding read is that load's (EX's store is younger than it)
 	// WB's store ended in an access error (M6, synchronous stores): EX's
 	// micro-op and this stage are flushed and vector 2 is taken
 	// PTEST / PFLUSH (M7): level requests to the MMU until done
@@ -292,6 +303,13 @@ wire        redir_gap = (REDIR_REG != 0) && rdz_v;
 wire        eac_v_use = eac_valid && !redir_gap;
 reg        rd_pend;        // a read is outstanding
 reg        rd_drop;        // ... and belongs to a flushed instruction
+// (LDX, findings/loadstore/plan.md step 1) the outstanding read belongs to a
+// load already dispatched to EX (late operand); its answer completes EX's
+// micro-op instead of being this stage's capture
+reg        ldx_pend;
+reg        ldx_fast_q;     // ... and it was answered in its dispatch clock
+reg        ldx_b;          // its value went to the micro-op's b (a destination load), else a
+reg [31:0] ldx_pc;         // its instruction's PC: an access error restarts it
 reg  [2:0] rd_tag;         // which read it is
 reg        done_smi, done_dmi, done_sld, done_dld;
 reg [31:0] s_addr, d_addr; // after memory indirect
@@ -514,7 +532,10 @@ wire        cm_use  = cm_hit && mm_cmi && cm_mode;
 // no operand from memory (a branch, a register operation, the handler's own
 // code) always comes, and t_irq_pipe.s check 33 holds every request in a run
 // of 16 back-to-back loads to the same boundary rule.
-wire        i_rd    = (rd_pend && !rd_drop) || done_smi || done_dmi || done_sld || done_dld;
+// (LDX: a read still outstanding for a load already in EX is that older
+// instruction's, not this one's -- counting it deferred an interrupt past
+// this boundary, and past the next, whose own read then went out)
+wire        i_rd    = (rd_pend && !rd_drop && !ldx_pend) || done_smi || done_dmi || done_sld || done_dld;
 wire        irq_now = irq_req && !(cm_hit && mm_cmi) && !i_rd;
 wire [31:0] s_addr_now = done_smi ? s_addr : eac_i.src_ea;
 wire [31:0] d_addr_now = done_dmi ? d_addr :
@@ -559,20 +580,57 @@ reg   [2:0] rd_fc_q;
 wire [31:0] rd_data = (STFWD == 0) ? rd_data_raw : st_merge(st_merge(rd_data_raw, rd_a_q, rd_sz_q, wb_st_v, wb_st_addr, wb_st_size, wb_st_data),
                                rd_a_q, rd_sz_q, ex_st_v, ex_st_addr, ex_st_size, ex_st_data);
 
-// the capture in this cycle, as the dispatch sees it
-wire        cap      = rd_pend && rd_ack && !rd_drop && !rd_err;
+// the capture in this cycle, as the dispatch sees it (not while the read
+// belongs to a load already in EX: LDX)
+wire        cap      = rd_pend && rd_ack && !rd_drop && !rd_err && !ldx_pend;
 // an access error on the answer (M6): the instruction takes vector 2
 // (format $7) and restarts; during exception entry, RTE or reset it is a
 // double fault (M68040UM 7.6.3, p. 7-43: the processor halts)
-wire        cap_err  = rd_pend && rd_ack && !rd_drop && rd_err;
+wire        cap_err  = rd_pend && rd_ack && !rd_drop && rd_err && !ldx_pend;
+// (LDX) late-operand dispatch.  A plain instruction whose LAST missing
+// operand is a load issued at least a clock ago and not answered yet is
+// dispatched now, with the answer the read path is giving this clock
+// (rd_data_c) in place of the operand.  The decision is flops only -- the
+// cache's hit/miss is NOT on this stage's stall chain (findings/loadstore/
+// plan.md section 6, timing) -- and EX checks it a clock later: answered in
+// this clock (ldx_fast_q, then the registered rd_ack) the operand was right;
+// otherwise EX waits (ld_wait) and the answer, when it comes, is written
+// into the micro-op.  Only one read is ever outstanding: the next
+// instruction's read waits for the answer (use_early, below, sees the real
+// rd_ack), so answers cannot come back out of order.
+//   eligible: the read is the instruction's last, its value lands in the
+//   micro-op's a (a source load) or b (a destination load) and nowhere else
+//   in this stage (not vdep, not MOVES, not a memory-indirect pointer, not
+//   two micro-ops), and the class neither redirects nor serialises on it.
+wire ldx_cls = (i.cls == CL_ALU) || (i.cls == CL_SCC) || (i.cls == CL_SHIFT) || (i.cls == CL_BIT) ||
+               (i.cls == CL_CCROP) || (i.cls == CL_MOVE2CCR) || (i.cls == CL_PACK) || (i.cls == CL_UNPK) ||
+               (i.cls == CL_MULDIV && !i.imm[0]) || (i.cls == CL_UNLK);
+wire ldx_go  = (LDX != 0) && ldx_cls && eac_v_use && (ph == P_START || ph == P_OPS) &&
+               rd_pend && !rd_ack && !rd_drop && !ldx_pend && !vdep &&
+               !need_smi && !need_dmi && i.fcsel == 2'd0 && !two_uop && !is_bf &&
+               !aer_lk &&   // TAS (a CL_ALU): a locked read-modify-write stays as it was (t_rmw_wp)
+               ((rd_tag == T_SLD && i.src.kind == EK_MEM && needs_ld_src && !(needs_ld_dst && !done_dld)) ||
+                (rd_tag == T_DLD && i.dst.kind == EK_MEM && needs_ld_dst && !(needs_ld_src && !done_sld)));
+wire [31:0] ldx_data = (STFWD == 0) ? rd_data_c :
+                       st_merge(st_merge(rd_data_c, rd_a_q, rd_sz_q, wb_st_v, wb_st_addr, wb_st_size, wb_st_data),
+                                rd_a_q, rd_sz_q, ex_st_v, ex_st_addr, ex_st_size, ex_st_data);
+// the late answer, written into EX's micro-op: EX holds the load itself, so
+// only WB's store is older and still unwritten
+wire [31:0] ldx_rew  = (STFWD == 0) ? rd_data_raw :
+                       st_merge(rd_data_raw, rd_a_q, rd_sz_q, wb_st_v, wb_st_addr, wb_st_size, wb_st_data);
+wire        ldx_err_go = ldx_pend && rd_pend && rd_ack && !rd_drop && rd_err && ph != P_HALT && ph != P_RESET;
+assign      ld_wait  = ldx_pend && !(rd_ack && ldx_fast_q);
+assign      ldx_busy = ldx_pend;
+wire        capx     = cap || ldx_go;
+wire [31:0] rd_datax = ldx_go ? ldx_data : rd_data;
 wire [31:0] s_addr_c = (cap && rd_tag == T_SMI) ? rd_data + eac_i.src_add : s_addr_now;
 wire [31:0] d_addr_c = (cap && rd_tag == T_DMI) ? rd_data + eac_i.dst_add : d_addr_now;
 wire        dn_smi   = done_smi || (cap && rd_tag == T_SMI);
 wire        dn_dmi   = done_dmi || (cap && rd_tag == T_DMI);
-wire        dn_sld   = done_sld || (cap && rd_tag == T_SLD);
-wire        dn_dld   = done_dld || (cap && rd_tag == T_DLD);
-wire [31:0] s_val_c  = (cap && rd_tag == T_SLD) ? rd_data : s_val;
-wire [31:0] d_val_c  = (cap && rd_tag == T_DLD) ? rd_data : d_val;
+wire        dn_sld   = done_sld || (capx && rd_tag == T_SLD);
+wire        dn_dld   = done_dld || (capx && rd_tag == T_DLD);
+wire [31:0] s_val_c  = (capx && rd_tag == T_SLD) ? rd_datax : s_val;
+wire [31:0] d_val_c  = (capx && rd_tag == T_DLD) ? rd_datax : d_val;
 // Timing (plan M3 OOC, WNS -8.6 ns before this): instructions whose
 // EA-fetch decision -- trap or not, one micro-op or two, the field address
 // -- depends on operand VALUES do not take them straight from EX's result
@@ -1216,7 +1274,7 @@ wire tr_arm_stop = sr_in[15] || (sr_in[14] && tr_stop_t0);
 wire trapn_arm = ((ph == P_START) || (ph == P_OPS)) && eac_v_use && !rst_pending &&
                  !(i.serialize && older_busy && ph == P_START) && !(i.priv && !s_bit) &&
                  ops_done && !(rd_pend && !rd_ack);
-wire stp_t st0_nt = stepf(ph, eac_v_use, rst_pending, i, older_busy, !bf_rdblk, rd_pend, rd_ack, cap,
+wire stp_t st0_nt = stepf(ph, eac_v_use, rst_pending, i, older_busy, !bf_rdblk, rd_pend, rd_ack || ldx_go, capx,
                       s_bit, stall_in, nx, ops_done, jmp_odd, rts_odd, rtr_odd, trap_u, 1'b0, trap_vec,
                       indexed_mode, two_uop, bf_step, sync_busy, s_addr_c, s_val_c,
                       d_val_c, x_step, vbr_in, x_vec, x_target, r_step, rd_a, rte_fmt_ok, rte_goes,
@@ -1254,6 +1312,17 @@ wire        aer_m16  = (i.cls == CL_MOVEM) && i.imm[2];
 // whose compare fails, which never writes, still faults.  rd_lk is assigned
 // with the other read attributes, below.
 wire [15:0] aer_ssw  = ssw_f(ph == P_MOVEM && mm_cmi, rd_ma, rd_atc, aer_lk, 1'b0, rd_sz_q, aer_m16, i.fcsel != 2'd0, rd_fc_q);
+// (LDX) a departed load's access error: the frame is the load's own, an
+// ordinary read (eligible loads are never locked, MOVE16, MOVES or MOVEM),
+// and it is taken in front of whatever this stage holds now, which has
+// committed nothing (EX held the load, so nothing younger dispatched)
+wire [15:0] aer_ssw_x = ssw_f(1'b0, rd_ma, rd_atc, 1'b0, 1'b0, rd_sz_q, 1'b0, 1'b0, rd_fc_q);
+function automatic id_t with_pc(input id_t i0, input logic sw, input logic [31:0] pc);
+	id_t r;
+	r = i0;
+	if (sw) r.pc = pc;
+	return r;
+endfunction
 // A store's access error (synchronous stores: the micro-op is still in
 // WB).  On the instruction's last micro-op everything else it did has
 // committed: the write is reported pending in WB1 and the stacked PC is past
@@ -2151,7 +2220,8 @@ wire stp_t st_i = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, 
                                      (HAS_FPU != 0) && fp_fmte,
                                      (HAS_FPU != 0) && fp_bsun_go && (ph == P_FPU) && !fp_crd,
                                      (HAS_FPU != 0) && fp_trapcc && fp_ctk && !fp_bsun_go),
-                               irq_go, irq_take_lvl, irq_take_pc), aerr_go, i, rd_a_q);
+                               irq_go, irq_take_lvl, irq_take_pc), aerr_go || ldx_err_go,
+                     with_pc(i, ldx_err_go, ldx_pc), rd_a_q);
 // (M9.T step 4) A TRACE AND AN INTERRUPT PENDING AT THE SAME BOUNDARY: the
 // trace goes FIRST.  M68040UM 8.3, Table 8-4 puts Trace in priority group 6
 // and Interrupt in group 8, "with 0 as the highest priority", and 8.3 then
@@ -2369,6 +2439,7 @@ assign eaf_redir_pc = (REDIR_REG != 0) ? rdz_pc : redir_pc_now;
 always @(posedge clk) begin
 	if (!nreset) begin
 		ph <= P_START; rd_pend <= 1'b0; rd_tag <= 3'd0; rd_drop <= 1'b0;
+		ldx_pend <= 1'b0; ldx_fast_q <= 1'b0; ldx_b <= 1'b0; ldx_pc <= 32'd0;
 		done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
 		s_addr <= 32'd0; d_addr <= 32'd0; s_val <= 32'd0; d_val <= 32'd0;
 		x_vec <= 8'd0; x_fmt <= 4'd0; x_pc <= 32'd0; x_addr <= 32'd0; x_step <= 3'd0; x_k <= 4'd0;
@@ -2404,7 +2475,8 @@ always @(posedge clk) begin
 	end else if (ce) begin
 		fia_we <= 1'b0;
 		// the EX-side output register
-		if ((flush && !keep_out) || wf_go) eaf_valid <= 1'b0;
+		// (LDX: a departed load's access error takes its micro-op back out of EX)
+		if ((flush && !keep_out) || wf_go || ldx_err_go) eaf_valid <= 1'b0;
 		else if (!stall_in) begin
 			eaf_valid <= st.disp;
 			if (st.disp) eaf_o <= disp_x;
@@ -2413,6 +2485,25 @@ always @(posedge clk) begin
 		// is answered later; rd_drop throws that answer away.
 		if (rd_req) begin rd_pend <= 1'b1; rd_tag <= rd_t; rd_a_q <= rd_addr; rd_sz_q <= rd_size; rd_fc_q <= rd_fc; end
 		else if (rd_ack) begin rd_pend <= 1'b0; rd_drop <= 1'b0; end
+		// (LDX) a load dispatched before its answer.  The answer ends it: in its
+		// dispatch clock's edge the operand was already right (ldx_fast_q);
+		// later, it is written into EX's micro-op, which waits for it
+		// (ld_wait); an access error takes the micro-op out (ldx_err_go).  A
+		// flush or a store fault abandons EX's micro-op, and rd_drop (below)
+		// the read.
+		if ((flush && !keep_out) || wf_go) ldx_pend <= 1'b0;
+		else if (ldx_pend && rd_ack) begin
+			ldx_pend <= 1'b0;
+			if (!rd_err && !ldx_fast_q) begin
+				if (ldx_b) eaf_o.b <= ldx_rew;
+				else       eaf_o.a <= ldx_rew;
+			end
+		end else if (ldx_go && st.disp && !stall_in) begin
+			ldx_pend   <= 1'b1;
+			ldx_fast_q <= rd_fast_now;
+			ldx_b      <= (rd_tag == T_DLD);
+			ldx_pc     <= i.pc;
+		end
 		if (wf_go) begin
 			// the faulted store's instruction is done or restarts; everything
 			// behind it (EX's micro-op, this stage) is abandoned
@@ -2690,7 +2781,7 @@ always @(posedge clk) begin
 					end
 					// (an access error leaves a pending deferred exception for the
 					// restart to take)
-					if (fp_pend && st.exc_go && !aerr_go) fp_pend <= 1'b0;
+					if (fp_pend && st.exc_go && !aerr_go && !ldx_err_go) fp_pend <= 1'b0;
 					// the memory operand, LEFT aligned: one byte, one word, or
 					// one, two or three longwords
 					if (!fp_cr && !fp_mvm && !fp_sv && !fp_rs &&
@@ -2913,10 +3004,11 @@ always @(posedge clk) begin
 				x7[7]  <= bus_wdata;
 				for (xk = 8; xk <= 14; xk = xk + 1) x7[xk] <= 32'd0;
 			end
-			if (aerr_go) begin
-				x7[2]  <= (ph == P_MOVEM && mm_cmi) ? mm_ea[mm_tag] :    // EA (MOVEM: calculated)
+			if (aerr_go || ldx_err_go) begin
+				x7[2]  <= ldx_err_go ? rd_a_q :                          // (LDX: an ordinary read's)
+				          (ph == P_MOVEM && mm_cmi) ? mm_ea[mm_tag] :    // EA (MOVEM: calculated)
 				          aer_m16 ? {rd_a_q[31:4], 4'd0} : rd_a_q;
-				x7[3]  <= {aer_ssw, 16'h0000};                           // SSW, WB3S
+				x7[3]  <= {ldx_err_go ? aer_ssw_x : aer_ssw, 16'h0000};  // SSW, WB3S
 				x7[4]  <= 32'd0;                                         // WB2S, WB1S
 				x7[5]  <= rd_a_q;                                        // FA
 				x7[6]  <= rd_a_q;                                        // WB3A
@@ -2930,7 +3022,7 @@ always @(posedge clk) begin
 				// the instruction's OWN exception (not an interrupt or a trace
 				// taken in front of it), and not one a store fault replaces
 				x_fia    <= (HAS_FPU != 0) && ph != P_EXC && i.cls == CL_EXC && i.fpiar_x &&
-				            !st.irq && st.ev == i.exc_vec && !wf_go;
+				            !st.irq && st.ev == i.exc_vec && !wf_go && !ldx_err_go;
 				x_fia_pc <= i.pc;
 				x_step <= 3'd5;
 				x_irq  <= st.irq; x_lvl <= irq_lvl;

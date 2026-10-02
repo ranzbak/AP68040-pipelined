@@ -38,6 +38,15 @@ start:
 	addq.w	#1,2(a3)	; RMW at $7032: the store faults, WB1 pending, lands once
 	move.l	a6,($7200).l	; log end: 4 frames
 	move.l	d7,($7204).l
+	; (findings/loadstore/plan.md step 1) the halt is kept clear of the
+	; last instructions: an exception's micro-ops retire tagged with the PC
+	; of whatever EA-fetch holds, and with LDX the pipeline is one
+	; instruction further when the RMW's write faults -- tagged `halt`, the
+	; bench would stop in the middle of the handler's entry
+	nop
+	nop
+	nop
+	nop
 halt:
 	bra.s	halt
 
