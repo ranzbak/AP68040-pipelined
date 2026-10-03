@@ -161,14 +161,18 @@ always @(posedge clk) begin
 			else if (tb_must[ml] && insn_start) begin
 				// An instruction started with the claim still held.  The
 				// reference allowed ONE such start; this pipeline needs a
-				// wider bound and the number is CALIBRATED, not copied:
-				// `irq_take` does not arm while a data read is outstanding
-				// (the M9 operand-read rule, 0bbab45 -- an interrupt must not
-				// land between an instruction's operand read and its
-				// execution), so a run of back-to-back reads legitimately
-				// defers a qualified request.  Measured across the interrupt
-				// programs, the worst case is SIX, in t_irq_pipe's own
-				// read-to-clear test (case 32/33).  Sixteen is therefore well
+				// wider bound and the number is CALIBRATED, not copied.
+				// Since M9.I (2026-10-03) a request is pending whatever the
+				// read state and the instruction at the boundary is held until
+				// it can be taken in front of; only an instruction whose
+				// operand was already read completes first (the M9
+				// operand-read rule, 0bbab45: no double read), so the core
+				// defers by at most one instruction (t_irqlat_pipe).  Measured:
+				// t_irq_pipe 1, t_irqwedge_pipe 2, t_ipend_pipe 7 (exception
+				// entry, where the core's own request is already low; the same
+				// before M9.I).  Before M9.I a run of reads or of busy
+				// boundaries starved the request without bound -- the bound
+				// below is what caught that (fuzz seeds 5018/5081).  Sixteen is well
 				// above anything the design does and far below a LOST hold,
 				// which survives until the program changes the mask or the
 				// device lets go -- dozens of instructions in every one of
@@ -1219,9 +1223,9 @@ task run_phase;
 			         ph, dbg_pc, dbg_ir, debug_fault, debug_halted);
 			// where the pipeline stands: a wedge with no request pending
 			// is an internal hand-off, not a bus hang (2026-09-23)
-			$display("      EA-fetch ph=%0d pc=%08h valid=%b irq_req=%b irq_take=%b mem_req=%b older_busy=%b",
+			$display("      EA-fetch ph=%0d pc=%08h valid=%b irq_req=%b irq_pend=%b mem_req=%b older_busy=%b",
 			         dut.core.u_eaf.ph, dut.core.dbg_eac_pc, dut.core.eac_valid,
-			         dut.core.irq_req, dut.core.u_eaf.irq_take, dut.core.mem_req, dut.core.older_busy);
+			         dut.core.irq_req, dut.core.u_eaf.irq_pend, dut.core.mem_req, dut.core.older_busy);
 		end
 		else if (result == 1)
 			$display("phase %0d passed (%0d cycles)", ph, timeout);

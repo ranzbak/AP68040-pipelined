@@ -536,7 +536,18 @@ wire        cm_use  = cm_hit && mm_cmi && cm_mode;
 // instruction's, not this one's -- counting it deferred an interrupt past
 // this boundary, and past the next, whose own read then went out)
 wire        i_rd    = (rd_pend && !rd_drop && !ldx_pend) || done_smi || done_dmi || done_sld || done_dld;
-wire        irq_now = irq_req && !(cm_hit && mm_cmi) && !i_rd;
+// (M9.I) A request is PENDING whatever the read state: the 68040 makes it
+// pending the moment the synchronised level is above the mask (M68040UM
+// 7.5.1 p. 7-29, Figure 7-19) and "takes an interrupt exception for a
+// pending interrupt within one instruction boundary" (p. 7-31).  Whether the
+// instruction AT the boundary can be taken in front of (`i_rd`: it has read
+// nothing) is decided where it is taken, below -- it used to be a term of the
+// arm, and the arm then never came: with the fast read path an instruction's
+// operand read goes out in the clock the one ahead finishes and is answered
+// in the clock it finishes itself, so a run of memory operands kept
+// `rd_pend || rd_req` up at every clock and the request starved (fuzz seeds
+// 5018/5081 with the board switches: 16+ instruction starts).
+wire        irq_now = irq_req && !(cm_hit && mm_cmi);
 wire [31:0] s_addr_now = done_smi ? s_addr : eac_i.src_ea;
 wire [31:0] d_addr_now = done_dmi ? d_addr :
                          (i.cls == CL_CHK2) ? s_addr_now + ((i.size == SZ_B) ? 32'd1 : (i.size == SZ_W) ? 32'd2 : 32'd4) :
@@ -2201,10 +2212,27 @@ reg  [31:0] tr_pc;        // the traced instruction's PC (the $2 address field)
 // instruction it is taken in front of.  Everything it is made of is a
 // register or a cheap term, and it reaches the dispatch as a mux select, not
 // as a term inside stepf.
-reg        irq_take;
+// (M9.I) `irq_pend` is the registered "a qualified request is pending" --
+// the 68040's IPEND (M68040UM 7.5.1, Figure 7-20).  `irq_arm` adds the rule
+// of the boundary: the instruction there has read nothing (`i_rd`), so the
+// interrupt is taken in front of it; one that has (its early read went out,
+// or was answered) completes first -- the 68040's own rule for a serialized
+// page (7-43: "preventing the instruction from being interrupted after the
+// operand fetch stage"), applied to every page so a read-sensitive register
+// is never read twice.  Its successor's early read is held (`!irq_pend` in
+// rd_req), so the successor arrives with nothing read and is taken in front
+// of: the deferral is ONE instruction, the 68040's "within one instruction
+// boundary" (7-31).  While the older instructions commit (`older_busy`, the
+// frame needs their SR) the instruction at the boundary is HELD (`irq_hold`,
+// the trace's hold shape in tr_st) instead of being let through -- letting it
+// through, as before, deferred the request past every boundary at which EX,
+// WB or the store FIFO was busy, i.e. every one of a dense run of stores.
+reg        irq_pend;
 reg  [2:0] irq_take_lvl;
+wire       irq_arm  = irq_pend && !i_rd;
+wire       irq_hold = irq_arm && (ph == P_START);
 wire [31:0] irq_take_pc = (ph == P_STOP) ? i.next_pc : i.pc;
-wire irq_go = irq_take && eac_v_use && !rst_pending && !older_busy &&
+wire irq_go = irq_arm && eac_v_use && !rst_pending && !older_busy &&
               ((ph == P_START) || (ph == P_STOP));
 wire stp_t st_i = aerr_st(irq_st(fp_st(pm_st(st1, ph == P_PMMU || ph == P_CINV, pm_got, stall_in),
                                      (HAS_FPU != 0) && (ph == P_FPU), stall_in, fp_live, fp_unimp, fp_unsupp,
@@ -2247,7 +2275,11 @@ wire tr_go = tr_take && eac_v_use && !rst_pending && !older_busy &&
 // interrupt is not acknowledged here -- `tr_st` clears the `irq` flag -- so
 // the request simply stays pending and is taken in front of the trace
 // handler's first instruction.
-wire stp_t st = tr_st(st_i, ph, tr_take, tr_go, i.pc, tr_pc);
+// (M9.I) the interrupt's hold rides the trace's: an instruction with nothing
+// read waits at the boundary until the older ones have committed and the
+// request is taken in front of it (irq_go sets exc_go, which the hold does
+// not touch), or the request goes away.
+wire stp_t st = tr_st(st_i, ph, tr_take || irq_hold, tr_go, i.pc, tr_pc);
 
 //--------------------------------------------------------------- PFLUSH / PTEST
 // M68040UM 3.7 (MMU instructions): privileged; they wait for everything
@@ -2380,8 +2412,12 @@ wire   use_early = early_v && early.v && !st.issue && (!rd_pend || rd_ack) &&
 // its first clock when Enable()'s INTENA write let a pending Paula request
 // through; t_irqwedge_pipe.s).  `irq_blk` is registers only: the chain
 // still sees a flip-flop's worth of logic, not a term (the m9s rule).
-wire   irq_blk   = irq_take && (ph == P_START);
-assign rd_req    = ((st.issue && !irq_blk) || (use_early && !irq_take)) && !flush && !tr_take;   // (registered: out of stepf)
+// (M9.I) `irq_blk` holds the FIRST read of the instruction at P_START while
+// a request is pending (it is the one taken in front of); a read the
+// instruction already has (`i_rd`, inside irq_arm) lets its next ones go.
+// The early read is the NEXT instruction's: pending is enough to hold it.
+wire   irq_blk   = irq_hold;
+assign rd_req    = ((st.issue && !irq_blk) || (use_early && !irq_pend)) && !flush && !tr_take;   // (registered: out of stepf)
 assign rd_addr   = st.issue ? st.ia  : early.a;
 assign rd_size   = st.issue ? st.isz : early.sz;
 wire [2:0] rd_t  = st.issue ? st.it  : early.t;
@@ -2465,7 +2501,7 @@ always @(posedge clk) begin
 		fr_cmd1 <= 16'd0; fr_cmd3 <= 16'd0; fr_stag <= 3'd0; fr_dtag <= 3'd0;
 		fr_flags <= 3'd0; fr_grs <= 3'd0; fr_wbte15 <= 1'b0; fr_fpt <= 96'd0; fr_et <= 96'd0;
 		x_irq <= 1'b0; x_lvl <= 3'd0; rs_cnt <= 10'd0;
-		irq_take <= 1'b0; irq_take_lvl <= 3'd0;
+		irq_pend <= 1'b0; irq_take_lvl <= 3'd0;
 		tr_take <= 1'b0; tr_pc <= 32'd0;
 		x_fia <= 1'b0; x_fia_pc <= 32'd0; fia_we <= 1'b0;
 		mm_ea[0] <= 32'd0; mm_ea[1] <= 32'd0; mm_tag <= 1'b0;
@@ -2564,7 +2600,7 @@ always @(posedge clk) begin
 				P_START: begin
 					if (rst_pending) begin
 						ph <= P_RESET; r_step <= 3'd0;
-					end else if (eac_v_use && !(i.serialize && older_busy) && !irq_take && !tr_take) begin
+					end else if (eac_v_use && !(i.serialize && older_busy) && !irq_arm && !tr_take) begin
 						if (!st.exc_go && i.cls == CL_STOP) begin
 							// (M9.T) a TRACED stop loads the SR and carries on:
 							// it never enters the stopped state.  No guard is
@@ -2979,8 +3015,11 @@ always @(posedge clk) begin
 			endcase
 			// an exception starts: step 5 waits for everything older to
 			// commit, then latches SR and the supervisor SP
-			// the pending-interrupt hold, one clock behind the sampler
-			irq_take     <= irq_now && !rd_req && ph != P_EXC && ph != P_RTE &&
+			// (M9.I) the pending request, one clock behind the sampler: no
+			// read term here (see irq_now) -- `!rd_req` was a second one, and
+			// a read issued this clock is `rd_pend` in the next, where irq_arm
+			// sees it
+			irq_pend     <= irq_now && ph != P_EXC && ph != P_RTE &&
 			                ph != P_RESET && ph != P_HALT;
 			irq_take_lvl <= irq_lvl;
 			// (M9.T) arm a trace as the instruction leaves: `sr_in` is still
