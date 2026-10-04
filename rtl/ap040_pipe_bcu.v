@@ -144,6 +144,10 @@ module ap040_pipe_bcu
 	// and never goes on the port.  Tie low without the path.
 	input             rd_fast,
 	input      [31:0] rd_fast_data,
+	// (findings/loadstore/plan.md step 3, DFP_MIS) the data read path is
+	// still working on the read in the slot (a misaligned read's second
+	// lookup): hold it off the port this clock.  Tie low without the path.
+	input             rd_hold,
 	// (findings/loadstore/plan.md step 1, LDX) the answer the slot read gets
 	// THIS clock if it is answered without the port -- the value rd_data
 	// takes at this edge -- and whether it is (combinational, for EA-fetch's
@@ -234,7 +238,7 @@ wire go_st   = go_fifo || go_sync;
 // A read goes from the slot, never in the clock it is requested: EA-fetch
 // may be sending the older instruction's store to EX in that same clock
 // (an early read), and older_st sees it only once it is there.
-wire go_rd   = idle && !sp_on && (sb_cnt == 0) && !st_v && !older_st && dq_v && !rd_fast && !rd_fwd;
+wire go_rd   = idle && !sp_on && (sb_cnt == 0) && !st_v && !older_st && dq_v && !rd_fast && !rd_fwd && !rd_hold;
 assign rd_fast_now = (rd_fast || rd_fwd) && dq_v;
 assign rd_data_c   = rd_fwd ? fw_data : rd_fast_data;
 // (MIX) nor while WB holds a store it posts: it is older than any fetch,

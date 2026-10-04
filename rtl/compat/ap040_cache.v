@@ -50,7 +50,13 @@ module ap040_cache
 	// before any access that bypasses the cache touches its set, and by
 	// every CINV/CPUSH of the data cache.  Needs POST_STORES = 1.  0: the
 	// cache is write-through, exactly as before.
-	parameter COPYBACK = 0
+	parameter COPYBACK = 0,
+	// findings/loadstore/plan.md step 3 (IFP = 1): the data read path also
+	// serves a MISALIGNED word or longword that stays inside one 4K page,
+	// as two consecutive longword lookups of the D-bank copy (the second in
+	// the clock after the first, dfp_two) assembled into the operand in the
+	// clock after that.  0: a misaligned read is never a hit, as before.
+	parameter DFP_MIS = 0
 )
 (
 	input             clk,
@@ -141,6 +147,11 @@ module ap040_cache
 	input      [21:0] dfp_ptag,
 	output            dfp_thit,
 	output     [31:0] dfp_rdata,
+	// (DFP_MIS) in the answer clock: the read spans two longwords and the
+	// second is being looked up at this edge; dfp_thit is then the FIRST
+	// longword's verdict, and the whole read's answer (dfp_thit, dfp_rdata)
+	// comes in the clock after, unless a new lookup is launched meanwhile.
+	output            dfp_two,
 
 	// Posted store (A2b-1).  post_busy: a store already acknowledged to
 	// the core is still draining to memory; the core's serializing
@@ -459,6 +470,45 @@ function [31:0] lw_extract;
 			`AP040_SZ_W:
 				lw_extract = off[1] ? {16'd0, lw[15:0]} : {16'd0, lw[31:16]};
 			default: lw_extract = lw;
+		endcase
+	end
+endfunction
+
+// (DFP_MIS) the operand out of a 64-bit window: w0 is the longword the
+// address names, w1 the next one.  With two = 0 (one lookup) w1 is unused,
+// and the result is lw_extract's for every alignment it serves; a word at
+// offset 1 lies inside one longword and is served by one lookup too.
+function [31:0] lw_extract2;
+	input [31:0] w0;
+	input [31:0] w1;
+	input [1:0] size;
+	input [1:0] off;
+	input two;
+	reg [31:0] a;
+	begin
+		a = two ? w0 : w1;   // (two: the first longword was kept in w0; else the lookup's own data arrives in w1)
+		case (size)
+			`AP040_SZ_B:
+				case (off)
+					2'd0: lw_extract2 = {24'd0, a[31:24]};
+					2'd1: lw_extract2 = {24'd0, a[23:16]};
+					2'd2: lw_extract2 = {24'd0, a[15:8]};
+					default: lw_extract2 = {24'd0, a[7:0]};
+				endcase
+			`AP040_SZ_W:
+				case (off)
+					2'd0: lw_extract2 = {16'd0, a[31:16]};
+					2'd1: lw_extract2 = {16'd0, a[23:8]};
+					2'd2: lw_extract2 = {16'd0, a[15:0]};
+					default: lw_extract2 = {16'd0, a[7:0], w1[31:24]};
+				endcase
+			default:
+				case (off)
+					2'd0: lw_extract2 = a;
+					2'd1: lw_extract2 = {a[23:0], w1[31:24]};
+					2'd2: lw_extract2 = {a[15:0], w1[31:16]};
+					default: lw_extract2 = {a[7:0], w1[31:8]};
+				endcase
 		endcase
 	end
 endfunction
@@ -1386,29 +1436,78 @@ if (IFP != 0) begin : g_dfp
 	reg   [5:0] g_set;
 	reg   [1:0] g_size, g_off;
 	reg         g_col;
-	wire  [5:0] l_set = dfp_addr[9:4];
+	// (DFP_MIS) a misaligned read spanning two longwords (plan step 3).
+	// Clock A (dfp_en): the first longword is read as any lookup's.  Clock B
+	// (g_two): its verdict is taken as today (dfp_thit) and kept (g_h1, its
+	// data g_d1, its set and way g_set1/g_way1, the physical tag of the
+	// second longword g_ptag2), while the copy's one read port fetches the
+	// second longword (g_idx2: the next longword of the bank, +1 on the
+	// 8-bit index; the tag is incremented when the index wraps the 1K
+	// bank -- never past the 4K page, which two_in excludes).  Clock C
+	// (g_m2): the second longword's compare, the first's line re-checked
+	// (still valid, no write to its set now), the operand assembled from the
+	// 64-bit window.  The requester never launches a lookup in clock B (one
+	// read outstanding); if it did, the new lookup wins and the old one is
+	// dropped (dfp_two low, g_m2 never set).
+	reg         g_two;       // the lookup launched at the last edge needs a second (this clock)
+	reg   [7:0] g_idx2;      // ... the second longword's index in the bank
+	reg         g_m2;        // the second lookup was launched at the last edge: the answer is now
+	reg  [21:0] g_ptag2;     // the second longword's physical tag
+	reg   [5:0] g_set1;      // the first longword's set, way (one-hot), data and verdict
+	reg   [3:0] g_way1;
+	reg  [31:0] g_d1;
+	reg         g_h1;
+	wire        two_in = (DFP_MIS != 0) && (dfp_addr[11:2] != 10'h3FF) &&
+	                     ((dfp_size == `AP040_SZ_L && dfp_addr[1:0] != 2'b00) ||
+	                      (dfp_size == `AP040_SZ_W && dfp_addr[1:0] == 2'b11));
+	wire        rd2    = (DFP_MIS != 0) && g_two && !dfp_en;
+	wire  [7:0] r_idx  = rd2 ? g_idx2 : dfp_addr[9:2];
+	wire  [5:0] l_set  = r_idx[7:2];
 	// a write of the data bank's set l_set in this edge
 	wire w_tag = ce & tag_we & !tag_widx[6];
 	wire w_inv = inv_wren & !inv_idx[6];
 	wire w_dat = ce & (|cd_we) & !cd_widx[8];
+	// (declared ahead: the first longword's verdict and data, kept at the edge ending clock B)
+	wire        thit_now;
+	wire [31:0] dsel;
+	wire        e0, e1, e2, e3;
 	always @(posedge clk) begin
 		if (w_tag) dtag[tag_widx[5:0]] <= tag_wdat[87:0];
 		if (ce & cd_we[0] & !cd_widx[8]) ddat0[cd_widx[7:0]] <= cd_wdat;
 		if (ce & cd_we[1] & !cd_widx[8]) ddat1[cd_widx[7:0]] <= cd_wdat;
 		if (ce & cd_we[2] & !cd_widx[8]) ddat2[cd_widx[7:0]] <= cd_wdat;
 		if (ce & cd_we[3] & !cd_widx[8]) ddat3[cd_widx[7:0]] <= cd_wdat;
-		if (ce & dfp_en) begin
+		if (ce & (dfp_en | rd2)) begin
 			dtag_q  <= dtag[l_set];
-			ddat_q0 <= ddat0[dfp_addr[9:2]];
-			ddat_q1 <= ddat1[dfp_addr[9:2]];
-			ddat_q2 <= ddat2[dfp_addr[9:2]];
-			ddat_q3 <= ddat3[dfp_addr[9:2]];
+			ddat_q0 <= ddat0[r_idx];
+			ddat_q1 <= ddat1[r_idx];
+			ddat_q2 <= ddat2[r_idx];
+			ddat_q3 <= ddat3[r_idx];
 			g_set   <= l_set;
-			g_size  <= dfp_size;
-			g_off   <= dfp_addr[1:0];
 			g_col   <= (w_tag && tag_widx[5:0] == l_set) ||
 			           (w_inv && inv_idx[5:0] == l_set) ||
 			           (w_dat && cd_widx[7:2] == l_set);
+		end
+		if (ce & dfp_en) begin
+			g_size  <= dfp_size;
+			g_off   <= dfp_addr[1:0];
+			g_idx2  <= dfp_addr[9:2] + 8'd1;
+		end
+		if (!nreset) begin
+			g_two <= 1'b0; g_m2 <= 1'b0;
+		end else if (ce) begin
+			g_two <= dfp_en && two_in;
+			g_m2  <= rd2;
+			if (rd2) begin
+				g_h1    <= thit_now;
+				g_d1    <= dsel;
+				g_set1  <= g_set;
+				g_way1  <= {e3, e2, e1, e0};
+				// the tag plus one when the index wrapped the 1K bank: a
+				// full 22-bit increment (two_in keeps the carry inside
+				// pa[11:10] today, but the sum does not depend on it)
+				g_ptag2 <= dfp_ptag + {21'd0, (g_idx2 == 8'd0)};
+			end
 		end
 	end
 	// the valid bits are the main lookup's (vb): the same writes
@@ -1431,18 +1530,40 @@ if (IFP != 0) begin : g_dfp
 	                        (w_tag && tag_widx[5:0] == g_set) ||
 	                        (w_dat && cd_widx[7:2] == g_set);
 	wire [3:0] dvv = vb[{1'b0, g_set}] & ~dmask_now & ~dmask_prev;
-	wire e0 = dvv[0] && (dtag_q[21:0]  == dfp_ptag);
-	wire e1 = dvv[1] && (dtag_q[43:22] == dfp_ptag);
-	wire e2 = dvv[2] && (dtag_q[65:44] == dfp_ptag);
-	wire e3 = dvv[3] && (dtag_q[87:66] == dfp_ptag);
+	// (DFP_MIS) the compare runs against both candidate tags -- the
+	// requester's for a lookup answered now, the kept second-longword tag
+	// in the misaligned read's third clock -- and the choice is made after
+	// it, so the compare path is no deeper than before.
+	wire t0 = (dtag_q[21:0]  == dfp_ptag), t1 = (dtag_q[43:22] == dfp_ptag);
+	wire t2 = (dtag_q[65:44] == dfp_ptag), t3 = (dtag_q[87:66] == dfp_ptag);
+	wire m0 = (DFP_MIS != 0) && (dtag_q[21:0]  == g_ptag2), m1 = (DFP_MIS != 0) && (dtag_q[43:22] == g_ptag2);
+	wire m2 = (DFP_MIS != 0) && (dtag_q[65:44] == g_ptag2), m3 = (DFP_MIS != 0) && (dtag_q[87:66] == g_ptag2);
+	assign e0 = dvv[0] && (g_m2 ? m0 : t0);
+	assign e1 = dvv[1] && (g_m2 ? m1 : t1);
+	assign e2 = dvv[2] && (g_m2 ? m2 : t2);
+	assign e3 = dvv[3] && (g_m2 ? m3 : t3);
 	// (findings/storebuf/plan.md) not while a store still owes an
 	// invalidate: its second line's (winv) or one a snoop displaced
 	// (store_inv_lost).  The data bank may hold the line the store changed.
-	assign dfp_thit  = (e0 | e1 | e2 | e3) && !g_col && !d_busy_now &&
-	                   !store_inv_lost && !winv_pend && (cst != C_WINV);
-	assign dfp_rdata = lw_extract(e0 ? ddat_q0 : e1 ? ddat_q1 : e2 ? ddat_q2 : ddat_q3, g_size, g_off);
+	assign thit_now = (e0 | e1 | e2 | e3) && !g_col && !d_busy_now &&
+	                  !store_inv_lost && !winv_pend && (cst != C_WINV);
+	assign dsel     = e0 ? ddat_q0 : e1 ? ddat_q1 : e2 ? ddat_q2 : ddat_q3;
+	// (DFP_MIS) the first longword in the third clock: its line still valid
+	// (a snoop may have landed on any clock edge since), not being filled,
+	// and no write reaching its set at this edge
+	wire [3:0] dmask1_now  = (fill_d && r_row[5:0] == g_set1) ? (4'd1 << r_way) : 4'd0;
+	wire [3:0] dmask1_prev = (dm_v && dm_set == g_set1) ? (4'd1 << dm_way) : 4'd0;
+	wire       d1_busy     = (w_inv && inv_idx[5:0] == g_set1) ||
+	                         (w_tag && tag_widx[5:0] == g_set1) ||
+	                         (w_dat && cd_widx[7:2] == g_set1);
+	wire       h1_ok       = (DFP_MIS != 0) && g_h1 && !d1_busy &&
+	                         (|(vb[{1'b0, g_set1}] & ~dmask1_now & ~dmask1_prev & g_way1));
+	assign dfp_thit  = thit_now && (!g_m2 || h1_ok);
+	assign dfp_two   = (DFP_MIS != 0) && g_two;
+	assign dfp_rdata = lw_extract2(g_d1, dsel, g_size, g_off, g_m2);
 end else begin : g_nodfp
 	assign dfp_thit  = 1'b0;
+	assign dfp_two   = 1'b0;
 	assign dfp_rdata = 32'd0;
 	wire unused_dfp = dfp_en | (|dfp_addr) | (|dfp_size) | (|dfp_ptag);
 end

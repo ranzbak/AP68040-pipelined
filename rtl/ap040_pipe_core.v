@@ -94,7 +94,13 @@ module ap040_pipe_core
 	parameter         LDX                = 0,
 	// findings/loadstore/plan.md section 11: ID guesses a forward conditional
 	// Bcc not taken (backward taken, forward not taken).  0: all taken.
-	parameter         BTFN               = 0
+	parameter         BTFN               = 0,
+	// (DFP = 1; findings/loadstore/plan.md step 3) a misaligned word or
+	// longword read inside one 4K page is served by the data read path as
+	// two consecutive longword lookups, answered one clock after an aligned
+	// read's; the BCU holds the slot read for that clock.  Such a read is
+	// never dispatched late (LDX).  0: misaligned reads go out of the slot.
+	parameter         DFP_MIS            = 0
 )
 (
 	input  clk,
@@ -262,7 +268,11 @@ module ap040_pipe_core
 	output  [2:0] dfp_fc,
 	input         dfp_hit,
 	input         dfp_ram,       // (FWD) the looked-up read's location is RAM (dfp_hit without the tag hit)
-	input  [31:0] dfp_data
+	input  [31:0] dfp_data,
+	// (DFP_MIS) in the answer clock: the read spans two longwords, the
+	// first hits and the second is being looked up; the whole answer comes
+	// in dfp_hit/dfp_data the clock after.  Tie low without the feature.
+	input         dfp_two
 );
 
 //--------------------------------------------------------------- stage wires
@@ -601,7 +611,7 @@ generate if (BUS == 0) begin : g_l1
 	assign d_rd_err = 1'b0; assign d_rd_atc = 1'b0; assign d_rd_ma = 1'b0;
 	assign f_err = 1'b0; assign f_atc = 1'b0;
 	assign ifp_req = 1'b0; assign ifp_addr = 32'd0; assign ifp_s = 1'b0;
-	wire unused_ifp_l1 = ifp_hit | ifp_try | (|ifp_data) | dfp_hit | (|dfp_data);
+	wire unused_ifp_l1 = ifp_hit | ifp_try | (|ifp_data) | dfp_hit | (|dfp_data) | dfp_two;
 	assign dfp_req = 1'b0; assign dfp_addr = 32'd0; assign dfp_size = 2'd0; assign dfp_fc = 3'd0;
 end else begin : g_bus
 
@@ -617,6 +627,7 @@ end else begin : g_bus
 	// only in the next.  Anything else goes out of the slot as before, with
 	// no clock lost.
 	wire d_rd_fast;
+	wire d_rd_hold;     // (DFP_MIS) the slot read stays off the port this clock: the path answers next clock
 	// (STORE_BUF, findings/storebuf/plan.md stage 2) a POSTED store on the
 	// port or waiting in the FIFO blocks only a read that overlaps it: the
 	// BCU compares the lookup against the FIFO when it is launched
@@ -644,13 +655,24 @@ end else begin : g_bus
 	wire st_quiet_i = (PRECISE != 0) ? (!ex_st_iss && !wb_st_iss) : st_quiet;
 	wire st_quiet_a = (PRECISE != 0) ? !ex_st_ans : st_quiet;
 	if (DFP != 0) begin : g_dfp
-		reg dfp_look, dfp_q1, dfp_fq1;
+		reg dfp_look, dfp_q1, dfp_fq1, dfp_m2;
 		always @(posedge clk)
-			if (!nreset) begin dfp_look <= 1'b0; dfp_q1 <= 1'b0; dfp_fq1 <= 1'b0; end
+			if (!nreset) begin dfp_look <= 1'b0; dfp_q1 <= 1'b0; dfp_fq1 <= 1'b0; dfp_m2 <= 1'b0; end
 			else if (ce) begin
 				dfp_look <= d_rd_req; dfp_q1 <= st_quiet_i;
 				dfp_fq1 <= ((PRECISE != 0) ? !ex_st_iss : !older_store) || ex_push;
+				dfp_m2 <= d_rd_hold;
 			end
+		// (DFP_MIS) a misaligned read's answer clock: the read path says the
+		// first longword hits and it is fetching the second (dfp_two); with
+		// the store-order verdict of this clock as an aligned read needs it,
+		// the slot read is HELD off the port for one clock (d_rd_hold ->
+		// rd_hold) and the answer is taken in the next (dfp_m2) if the path
+		// then hits.  No store can enter EX or WB between the two clocks
+		// (the reading instruction is in EA-fetch, waiting), so the stores
+		// checked here are all there are; EX's is checked again anyway.
+		assign d_rd_hold = (DFP_MIS != 0) && dfp_look && dfp_q1 && st_quiet_a && dfp_two &&
+		                   !((STORE_BUF != 0) && sb_ovl) && !d_rd_fwd;
 		// (FWD) forwarded: no store in EX in the answer clock (one entering
 		// EX in the issue clock is seen only now), and none in the issue
 		// clock but a BSR/JSR push (its data is EX's input register, not ALU
@@ -658,7 +680,8 @@ end else begin : g_bus
 		// lookup (fw_ok)
 		assign d_rd_fwd  = (FWD != 0) && dfp_look && dfp_fq1 && ((PRECISE != 0) ? !ex_st_ans : !older_store) &&
 		                   dfp_ram && fw_ok;
-		assign d_rd_fast = dfp_look && dfp_q1 && st_quiet_a && dfp_hit && !((STORE_BUF != 0) && sb_ovl) && !d_rd_fwd;
+		assign d_rd_fast = (dfp_look && dfp_q1 && st_quiet_a && dfp_hit && !((STORE_BUF != 0) && sb_ovl) && !d_rd_fwd) ||
+		                   ((DFP_MIS != 0) && dfp_m2 && st_quiet_a && dfp_hit);
 		// a locked RMW's read never takes the fast path: it goes out of the
 		// BCU with mem_lock, where the MMU checks write protection on it
 		assign dfp_req  = d_rd_req && ce && !d_rd_lk;
@@ -666,13 +689,14 @@ end else begin : g_bus
 		assign dfp_size = d_rd_size;
 		assign dfp_fc   = d_rd_fc;
 	end else begin : g_nodfp
+		assign d_rd_hold = 1'b0;
 		assign d_rd_fast = 1'b0;
 		assign d_rd_fwd  = 1'b0;
 		assign dfp_req  = 1'b0;
 		assign dfp_addr = 32'd0;
 		assign dfp_size = 2'd0;
 		assign dfp_fc   = 3'd0;
-		wire unused_dfp = dfp_hit | st_quiet | sb_ovl | dfp_ram | fw_ok | (|fw_data) | st_quiet_i | st_quiet_a | ex_st_iss;
+		wire unused_dfp = dfp_hit | st_quiet | sb_ovl | dfp_ram | fw_ok | (|fw_data) | st_quiet_i | st_quiet_a | ex_st_iss | dfp_two;
 	end
 
 	// The BCU's fetch slot (b_f_*): IF's own request with IFP = 0; with
@@ -766,7 +790,7 @@ end else begin : g_bus
 		.fw_ok(fw_ok), .fw_data(fw_data), .rd_fwd(d_rd_fwd), .dq_a_o(slot_a), .dq_s_o(slot_s), .st_sync_ok(pg_rec),
 		.rd_req(d_rd_req), .rd_addr(d_rd_addr), .rd_size(d_rd_size), .rd_fc(d_rd_fc), .rd_lk(d_rd_lk),
 		.rd_ack(d_rd_ack), .rd_data(d_rd_data), .rd_err(d_rd_err),
-		.rd_fast(d_rd_fast), .rd_fast_data(dfp_data),
+		.rd_fast(d_rd_fast), .rd_fast_data(dfp_data), .rd_hold(d_rd_hold),
 		.rd_fast_now(d_rd_fast_now), .rd_data_c(d_rd_data_c),
 		.f_req(b_f_req), .f_addr(b_f_addr), .f_long(b_f_long), .f_fc(b_f_s ? 3'd6 : 3'd2),
 		.f_gnt(b_f_gnt), .f_ack(b_f_ack), .f_data(b_f_data), .f_err(b_f_err),
@@ -851,7 +875,7 @@ ap040_ea_calc #(.HAS_FPU(HAS_FPU)) u_eac
 
 
 ap040_ea_fetch #(.STFWD(BUS ? 0 : 1), .CAS2_DC_ORDER_020(CAS2_DC_ORDER_020), .HAS_FPU(HAS_FPU), .REDIR_REG(REDIR_REG),
-                 .MM_TAIL(BUS ? 1 : 0), .LDX(LDX)) u_eaf
+                 .MM_TAIL(BUS ? 1 : 0), .LDX(LDX), .DFP_MIS((BUS != 0 && DFP != 0) ? DFP_MIS : 0)) u_eaf
 (
 	.clk(clk), .nreset(nreset), .ce(ce), .stall_in(ex_stall), .flush(flush),
 	.keep_out(ex_redir_q && ex_stall),

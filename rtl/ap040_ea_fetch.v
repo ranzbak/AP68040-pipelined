@@ -71,7 +71,12 @@ module ap040_ea_fetch
 	// findings/loadstore/plan.md step 1: a load whose answer has not been
 	// seen yet is dispatched in its lookup clock (late operand); EX waits
 	// for the answer (ld_wait).  0 = as before.
-	parameter LDX = 0
+	parameter LDX = 0,
+	// (LDX; findings/loadstore/plan.md step 3) the data read path serves
+	// misaligned reads in two lookups: such a read is never dispatched late
+	// (its answer is a clock later than an aligned hit's, and EX would hold
+	// the instruction's own store against it).  0: alignment plays no part.
+	parameter DFP_MIS = 0
 )
 (
 	input             clk,
@@ -310,6 +315,7 @@ reg        ldx_pend;
 reg        ldx_fast_q;     // ... and it was answered in its dispatch clock
 reg        ldx_b;          // its value went to the micro-op's b (a destination load), else a
 reg [31:0] ldx_pc;         // its instruction's PC: an access error restarts it
+reg        ldx_mis_q;      // (DFP_MIS) the outstanding read spans two longwords: not dispatched late
 reg  [2:0] rd_tag;         // which read it is
 reg        done_smi, done_dmi, done_sld, done_dld;
 reg [31:0] s_addr, d_addr; // after memory indirect
@@ -617,7 +623,7 @@ wire ldx_cls = (i.cls == CL_ALU) || (i.cls == CL_SCC) || (i.cls == CL_SHIFT) || 
                (i.cls == CL_CCROP) || (i.cls == CL_MOVE2CCR) || (i.cls == CL_PACK) || (i.cls == CL_UNPK) ||
                (i.cls == CL_MULDIV && !i.imm[0]) || (i.cls == CL_UNLK);
 wire ldx_go  = (LDX != 0) && ldx_cls && eac_v_use && (ph == P_START || ph == P_OPS) &&
-               rd_pend && !rd_ack && !rd_drop && !ldx_pend && !vdep &&
+               rd_pend && !rd_ack && !rd_drop && !ldx_pend && !vdep && !ldx_mis_q &&
                !need_smi && !need_dmi && i.fcsel == 2'd0 && !two_uop && !is_bf &&
                !aer_lk &&   // TAS (a CL_ALU): a locked read-modify-write stays as it was (t_rmw_wp)
                ((rd_tag == T_SLD && i.src.kind == EK_MEM && needs_ld_src && !(needs_ld_dst && !done_dld)) ||
@@ -2479,7 +2485,7 @@ assign eaf_redir_pc = (REDIR_REG != 0) ? rdz_pc : redir_pc_now;
 always @(posedge clk) begin
 	if (!nreset) begin
 		ph <= P_START; rd_pend <= 1'b0; rd_tag <= 3'd0; rd_drop <= 1'b0;
-		ldx_pend <= 1'b0; ldx_fast_q <= 1'b0; ldx_b <= 1'b0; ldx_pc <= 32'd0;
+		ldx_pend <= 1'b0; ldx_fast_q <= 1'b0; ldx_b <= 1'b0; ldx_pc <= 32'd0; ldx_mis_q <= 1'b0;
 		done_smi <= 1'b0; done_dmi <= 1'b0; done_sld <= 1'b0; done_dld <= 1'b0;
 		s_addr <= 32'd0; d_addr <= 32'd0; s_val <= 32'd0; d_val <= 32'd0;
 		x_vec <= 8'd0; x_fmt <= 4'd0; x_pc <= 32'd0; x_addr <= 32'd0; x_step <= 3'd0; x_k <= 4'd0;
@@ -2525,6 +2531,10 @@ always @(posedge clk) begin
 		// is answered later; rd_drop throws that answer away.
 		if (rd_req) begin rd_pend <= 1'b1; rd_tag <= rd_t; rd_a_q <= rd_addr; rd_sz_q <= rd_size; rd_fc_q <= rd_fc; end
 		else if (rd_ack) begin rd_pend <= 1'b0; rd_drop <= 1'b0; end
+		// (DFP_MIS) a read spanning two longwords is answered from the read
+		// path a clock later than an aligned one and is not dispatched late
+		if (rd_req) ldx_mis_q <= (DFP_MIS != 0) &&
+		                         ((rd_size == SZ_L && rd_addr[1:0] != 2'b00) || (rd_size == SZ_W && rd_addr[1:0] == 2'b11));
 		// (LDX) a load dispatched before its answer.  The answer ends it: in its
 		// dispatch clock's edge the operand was already right (ldx_fast_q);
 		// later, it is written into EX's micro-op, which waits for it

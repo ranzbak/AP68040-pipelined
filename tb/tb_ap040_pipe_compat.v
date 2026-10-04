@@ -284,6 +284,9 @@ end
 `ifndef BTFN
 `define BTFN 0
 `endif
+`ifndef DFP_MIS
+`define DFP_MIS 0
+`endif
 ap040_pipe_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
                      .AP040_POST_STORES(POST),
                      .AP040_FILL_CHANNEL(FILLCH),
@@ -296,7 +299,8 @@ ap040_pipe_tg68k_compat #(.AP040_ENABLE_CACHE(`AP040_TB_CACHE),
                      .AP040_COPYBACK(`COPYBACK),
                      .AP040_BTB(`BTB),
                      .AP040_LDX(`LDX),
-                     .AP040_BTFN(`BTFN)) dut
+                     .AP040_BTFN(`BTFN),
+                     .AP040_DFP_MIS(`DFP_MIS)) dut
 (
 	.clk(clk),
 	.nreset(nreset),
@@ -1206,6 +1210,7 @@ task run_phase;
 		// only where the bench can deliver IPL
 		mem[16'hF160 >> 1] = 16'h0007;	// coarse + fine IPL + berr injection
 		mem[16'hF196 >> 1] = (`COPYBACK != 0) ? 16'h0001 : 16'h0000;	// copyback compiled in
+		mem[16'hF198 >> 1] = (`DFP_MIS != 0) ? 16'h0001 : 16'h0000;	// misaligned reads served by the data read path (t_dfpmis_pipe)
 
 		nreset = 0;
 		repeat (10) @(posedge clk);
