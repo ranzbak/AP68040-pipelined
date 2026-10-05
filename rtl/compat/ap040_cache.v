@@ -56,7 +56,20 @@ module ap040_cache
 	// as two consecutive longword lookups of the D-bank copy (the second in
 	// the clock after the first, dfp_two) assembled into the operand in the
 	// clock after that.  0: a misaligned read is never a hit, as before.
-	parameter DFP_MIS = 0
+	parameter DFP_MIS = 0,
+	// (MIS) a misaligned data access that stays inside one 4K page is
+	// CACHEABLE, as on the 68040 (M68040UM 4.x: a misaligned operand is one
+	// cache access per half-line it touches, filled on a miss, merged on a
+	// write hit): a read is served (or filled, then served) as two aligned
+	// longword pieces -- the two consecutive longwords it spans -- and a
+	// store merges its bytes into every resident longword it touches (two
+	// pieces, two sets when it crosses the line) instead of clearing the
+	// rows.  The memory transfer of a store is the same single misaligned
+	// transfer as before; a read miss fills the line(s) as an aligned miss
+	// does.  Page-crossing accesses (the next longword in the next page),
+	// instruction fetches and everything cache-inhibited keep bypassing
+	// exactly as before.  0: misaligned accesses bypass / clear rows.
+	parameter MIS = 0
 )
 (
 	input             clk,
@@ -276,7 +289,21 @@ wire        ena       = c_instr ? ie : de;
 wire        fits_long = (c_size == `AP040_SZ_B) ||
                         (c_size == `AP040_SZ_W && !c_addr[0]) ||
                         (c_size == `AP040_SZ_L && c_addr[1:0] == 2'b00);
-wire        bypass    = c_nocache || !ena || c_write || !fits_long;
+// (MIS) the window {LW0, LW1} a misaligned access lies in: LW0 is the
+// longword c_addr names, LW1 the next one.  mis_two: LW1 is touched (a
+// longword at offset 1..3, a word at offset 3); a word at offset 1 lies
+// inside LW0 and is a one-piece access (mis_one).  pgx: LW1 is in the next
+// 4K page -- a different translation / cache mode: such an access is NOT
+// cacheable here (with translation on the BCU has already split it into
+// bytes).  Instruction fetches are word-sized and word-aligned or aligned
+// longwords; they never take this path.
+wire        mis_two_c = (c_size == `AP040_SZ_L && c_addr[1:0] != 2'b00) ||
+                        (c_size == `AP040_SZ_W && c_addr[1:0] == 2'b11);
+wire        mis_one_c = (c_size == `AP040_SZ_W && c_addr[1:0] == 2'b01);
+wire        pgx       = (c_addr[11:2] == 10'h3FF);
+wire        mis_acc   = (MIS != 0) && !c_instr && (mis_one_c || (mis_two_c && !pgx));
+wire [31:0] mis_addr2_c = {c_addr[31:2], 2'b00} + 32'd4;
+wire        bypass    = c_nocache || !ena || c_write || (!fits_long && !mis_acc);
 // A store that fits one aligned longword, with the data cache enabled and
 // the page cacheable, UPDATES a resident line instead of clearing its row
 // (plan X3.2).  Everything else keeps the row invalidate: misaligned and
@@ -286,6 +313,9 @@ wire        bypass    = c_nocache || !ena || c_write || !fits_long;
 // moved past).  The instruction bank is never touched by a store: the
 // 68040 does not snoop its I-cache on CPU writes, CINV covers it.
 wire        st_upd_ok = c_write && fits_long && de && !c_nocache && !c_instr;
+// (MIS) a misaligned store on the update path: merges into LW0 and LW1
+wire        st_mis_ok = c_write && mis_acc && de && !c_nocache && !c_instr;
+wire        st_any_upd = st_upd_ok | st_mis_ok;
 
 // Number of bytes following the first byte.  Use a five-bit sum so a
 // transfer ending beyond offset 15 cannot wrap before the comparison.
@@ -317,6 +347,8 @@ localparam C_FILLC = 4'd8;   // A1: line requested over the fill channel
 localparam C_FILLW = 4'd9;   // A1: the delivered line goes into the way
 localparam C_PUSH  = 4'd10;  // (COPYBACK) write dirty ways of a data-bank set back
 localparam C_WLOOK = 4'd11;  // (COPYBACK) the walker's set: is its line dirty here?
+localparam C_MLNCH = 4'd12;  // (MIS) a misaligned read's second longword: its row and word are read
+localparam C_MST2  = 4'd13;  // (MIS) a misaligned store's second longword: merge decided
 
 // (COPYBACK) Dirty bits, one per data-bank line.  A row clear spares the
 // dirty ways (vb_keep): a dirty line is only ever dropped after it has been
@@ -375,6 +407,24 @@ reg         r_issued;
 reg  [31:0] r_addr;
 reg   [1:0] r_size;
 reg   [1:0] r_off;
+// (MIS) the two-piece access in progress.  mis_v: the request accepted is
+// misaligned (cacheable); mis_two_r: it touches LW1; mis_ph: piece 2 (LW1)
+// is the one in progress -- r_row/r_tag/r_word (and r_addr for a read) then
+// name LW1's line and word; mis_row1 keeps LW0's set for a store's error
+// fallback; mis_lw0 is LW0's data (a read); r_be/r_wd and mis_be2/mis_wd2
+// are the store's byte lanes and lane-aligned data for LW0 and LW1.
+reg         mis_v, mis_ph, mis_two_r;
+reg  [31:0] mis_lw0;
+reg   [6:0] mis_row2;
+reg  [21:0] mis_tag2;
+reg   [1:0] mis_word2;
+reg  [31:0] mis_addr2;
+reg   [5:0] mis_row1;
+reg   [3:0] r_be, mis_be2;
+reg  [31:0] r_wd, mis_wd2;
+reg         mis_merge1;             // (COPYBACK) LW0's piece merged into a line
+reg         st_chk2;                // the clock after st_chk: LW1's row and word have settled
+reg         st_snooped2;            // a snoop reached LW1's row since its read was launched
 reg  [31:0] fill_hold;           // requested longword captured during fill
 reg         ack_r;
 reg  [31:0] rdata_r;
@@ -449,6 +499,43 @@ function [31:0] lw_merge;
 			`AP040_SZ_W:
 				lw_merge = off[1] ? {lw[31:16], wd[15:0]} : {wd[15:0], lw[15:0]};
 			default: lw_merge = wd;
+		endcase
+	end
+endfunction
+
+// (MIS) byte-lane merge: be[3] is byte 0 (bits 31:24) .. be[0] byte 3
+function [31:0] merge_be;
+	input [31:0] lw;
+	input [31:0] wd;
+	input [3:0] be;
+	begin
+		merge_be = {be[3] ? wd[31:24] : lw[31:24], be[2] ? wd[23:16] : lw[23:16],
+		            be[1] ? wd[15:8]  : lw[15:8],  be[0] ? wd[7:0]   : lw[7:0]};
+	end
+endfunction
+// (MIS) a store's data placed in the 64-bit window {LW0, LW1} at byte
+// offset off (M68040UM figure 7-5: the operand is the big-endian bytes at
+// A..A+n-1), and the lanes it occupies ([7:4] LW0's, [3:0] LW1's)
+function [63:0] win_data;
+	input [31:0] wd;
+	input [1:0] size;
+	input [1:0] off;
+	begin
+		case (size)
+			`AP040_SZ_B: win_data = {wd[7:0], 56'd0} >> {off, 3'd0};
+			`AP040_SZ_W: win_data = {wd[15:0], 48'd0} >> {off, 3'd0};
+			default:     win_data = {wd, 32'd0} >> {off, 3'd0};
+		endcase
+	end
+endfunction
+function [7:0] win_be;
+	input [1:0] size;
+	input [1:0] off;
+	begin
+		case (size)
+			`AP040_SZ_B: win_be = 8'b1000_0000 >> off;
+			`AP040_SZ_W: win_be = 8'b1100_0000 >> off;
+			default:     win_be = 8'b1111_0000 >> off;
 		endcase
 	end
 endfunction
@@ -560,22 +647,36 @@ assign post_busy = st_posted | dr_active | (cst == C_PUSH) | sweep_push;
 // and the refill is always safe.  Both flags are set free-running --
 // the snoop is -- and consumed/cleared in the ce domain.
 wire snoop_fill_row = s_stb && !r_bank && (s_addr[9:4] == r_row[5:0]);
-wire snoop_look_row = s_stb && !c_instr && (s_addr[9:4] == a_set);
+// (MIS) outside C_IDLE the row under the compare is r_row's -- the same
+// set as a_set in a lookup's compare clock, LW1's in a misaligned read's
+// second piece
+wire snoop_look_row = s_stb && !c_instr &&
+                      (s_addr[9:4] == (((MIS != 0) && (cst != C_IDLE)) ? r_row[5:0] : a_set));
+// (MIS) the second piece's merge clock of a misaligned store, and a snoop
+// reaching LW1's row from the launch of its read (the st_chk clock) on
+wire mis_m2 = (MIS != 0) && mis_v && mis_two_r && (((cst == C_PASS) && st_chk2) || (cst == C_MST2));
+wire snoop_st_row2 = s_stb && (s_addr[9:4] == mis_row2[5:0]);
 reg  fill_snooped, look_snooped;
 always @(posedge clk) begin
 	if (!nreset) begin
 		fill_snooped <= 0;
 		look_snooped <= 0;
 		st_snooped <= 0;
+		st_snooped2 <= 0;
 	end
 	else begin
 		if (ce && cst == C_LOOK && !look_hit) fill_snooped <= 0;
 		if ((cst == C_FILL || cst == C_TAGW ||
 		     cst == C_FILLC || cst == C_FILLW) && snoop_fill_row)
 			fill_snooped <= 1;
-		if (ce && rd_accept) look_snooped <= 0;
-		if ((rd_accept || cst == C_LOOK) && snoop_look_row)
+		if (ce && (rd_accept || ((MIS != 0) && cst == C_MLNCH))) look_snooped <= 0;
+		if ((rd_accept || cst == C_LOOK || ((MIS != 0) && cst == C_MLNCH)) && snoop_look_row)
 			look_snooped <= 1;
+		// (MIS) LW1's window: from the clock its row is read (st_chk) to its
+		// merge; the set wins over the clear
+		if (ce && wr_accept_upd) st_snooped2 <= 0;
+		if (mis_v && mis_two_r && (((cst == C_PASS) && st_chk) || mis_m2) && snoop_st_row2)
+			st_snooped2 <= 1;
 		// the store's window runs from its acceptance to the merge
 		// cycle; the set wins over the clear, as for look_snooped
 		if (ce && wr_accept_upd) st_snooped <= 0;
@@ -687,7 +788,7 @@ wire  [3:0] wl_match = {db[p_set][3] && (t_w3 == wk_addr[31:10]),
 assign      sweep_busy = (COPYBACK != 0) && (cst == C_SWEEP);
 wire  [3:0] c_d1     = db[c_addr[9:4]];
 wire  [3:0] c_d2     = db[c_set2];
-wire        bp_acc   = c_write ? !st_upd_ok : (bypass && !c_instr);
+wire        bp_acc   = c_write ? !st_any_upd : (bypass && !c_instr);
 wire        need_push = (COPYBACK != 0) && (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
                         c_req && !ack_r && !err_hold && !dr_active && !walk_busy && bp_acc &&
                         ((c_d1 != 4'd0) || (write_cross_line && (c_d2 != 4'd0)));
@@ -705,10 +806,18 @@ assign rd_accept = (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
 // name exactly the cycle the C_IDLE write branch takes that path
 assign wr_accept_upd = (cst == C_IDLE) && !(cinv_req && !cinv_done) &&
                        c_req && !ack_r && !err_hold && !store_inv_lost &&
-                       !dr_active && st_upd_ok;
+                       !dr_active && st_any_upd;
 
 // a push reads its set's tags (the way's address) through port A
-assign tag_ridx  = ((cst == C_PUSH) || (cst == C_WLOOK)) ? {1'b0, p_set} : a_row;
+// (MIS) the second piece's row: read in the launch clock (C_MLNCH for a
+// read; a store's st_chk clock), and re-read -- instead of the request's
+// first row -- for as long as piece 2 is in progress (a fill of LW1's line
+// writes its row image back at C_TAGW; a miss waiting for the drain
+// re-reads it)
+wire        mis_launch2 = (MIS != 0) && ((cst == C_MLNCH) ||
+                          ((cst == C_PASS) && st_chk && mis_v && mis_two_r));
+assign tag_ridx  = ((cst == C_PUSH) || (cst == C_WLOOK)) ? {1'b0, p_set} :
+                   (mis_launch2 || ((MIS != 0) && mis_v && mis_ph)) ? mis_row2 : a_row;
 wire [87:0] tags_next = (r_way == 2'd0) ? {tag_q[87:22], r_tag} :
                         (r_way == 2'd1) ? {tag_q[87:44], r_tag, tag_q[21:0]} :
                         (r_way == 2'd2) ? {tag_q[87:66], r_tag, tag_q[43:0]} :
@@ -731,7 +840,7 @@ assign tag_wdat  = (cst == C_SWEEP) ? {ROWW{1'b0}}
 // An update-path store (st_upd_ok) owes no row invalidate at all: it
 // merges into the line on a hit and allocates nothing on a miss.
 wire store_inv = ((cst == C_IDLE) && c_req && c_write && !ack_r &&
-                  !store_inv_lost && !st_upd_ok && !dr_active && !need_push) ||
+                  !store_inv_lost && !st_any_upd && !dr_active && !need_push) ||
                  ((cst == C_PASS) && winv_pend) ||
                  (cst == C_WINV);
 // Snoop invalidates are FREE-RUNNING (5.1): a chipset write must land
@@ -781,13 +890,20 @@ wire [31:0] data_hit = (hit_way == 2'd0) ? data_q0 :
 // merge there, or the dirty line would later overwrite it in memory.
 wire hit_dirty = (COPYBACK != 0) && !r_row[6] && db[r_row[5:0]][hit_way];
 wire st_merge = (cst == C_PASS) && st_chk && look_hit && (!st_snooped || hit_dirty) && !m_err;
+// (MIS) the second piece's merge (LW1, mis_m2), decided on LW1's row image
+// against its tag, trusting its own snoop window -- a snoop to LW1's row in
+// this very clock too (the snoop would clear the way in the edge the merge
+// writes it: a copyback dirty bit on an invalid line).  st_mrg: either.
+wire st_merge2 = mis_m2 && look_hit && ((!st_snooped2 && !snoop_st_row2) || hit_dirty) && !m_err;
+wire st_mrg    = st_merge | st_merge2;
 
 // the data-array read runs with the acceptance of a cacheable read AND of
 // an update-path store (a store carries c_instr = 0, so its row is the
 // data bank's)
 wire   push_rd   = (cst == C_PUSH) && !p_ph;
-assign cd_rd_en  = rd_accept | wr_accept_upd | push_rd;
-assign cd_ridx   = push_rd ? {1'b0, p_set, p_rb[1:0]} : {c_instr, a_set, c_addr[3:2]};
+assign cd_rd_en  = rd_accept | wr_accept_upd | push_rd | mis_launch2;
+assign cd_ridx   = push_rd ? {1'b0, p_set, p_rb[1:0]} :
+                   mis_launch2 ? {1'b0, mis_row2[5:0], mis_word2} : {c_instr, a_set, c_addr[3:2]};
 // the pushed way's longword, one clock after its address
 wire [31:0] p_dsel = (p_way == 2'd0) ? data_q0 : (p_way == 2'd1) ? data_q1 :
                      (p_way == 2'd2) ? data_q2 : data_q3;
@@ -803,7 +919,7 @@ always @(posedge clk) begin
 	if (!nreset) begin
 		for (dbk = 0; dbk < 64; dbk = dbk + 1) db[dbk] <= 4'd0;
 	end else if (ce && (COPYBACK != 0)) begin
-		if (st_merge && r_cb) db[r_row[5:0]][hit_way] <= 1'b1;
+		if (st_mrg && r_cb) db[r_row[5:0]][hit_way] <= 1'b1;
 		if ((cst == C_PUSH) && push_out && m_err)
 			db[p_set] <= db[p_set] & ~p_mask;
 		else if ((cst == C_PUSH) && push_out && m_ack && (p_wb == 2'd3))
@@ -813,11 +929,12 @@ always @(posedge clk) begin
 end
 assign cd_we     = ((cst == C_FILL) && r_issued && m_ack) ? (4'd1 << r_way) :
                    (cst == C_FILLW)                        ? (4'd1 << r_way) :
-                   st_merge                                ? (4'd1 << hit_way) :
+                   st_mrg                                  ? (4'd1 << hit_way) :
                                                              4'd0;
-assign cd_widx   = st_merge ? {1'b0, r_row[5:0], r_addr[3:2]}
-                            : {r_bank, r_row[5:0], r_beat};
-assign cd_wdat   = st_merge         ? lw_merge(data_hit, r_wdata, r_size, r_off) :
+assign cd_widx   = st_mrg ? {1'b0, r_row[5:0], ((MIS != 0) ? r_word[1:0] : r_addr[3:2])}
+                          : {r_bank, r_row[5:0], r_beat};
+assign cd_wdat   = st_mrg           ? (((MIS != 0) && mis_v) ? merge_be(data_hit, r_wd, r_be)
+                                                             : lw_merge(data_hit, r_wdata, r_size, r_off)) :
                    (cst == C_FILLW) ? fill_beat :
                                       m_rdata;
 
@@ -855,6 +972,9 @@ always @(posedge clk) begin
 		store_inv_set <= 0;
 		cinv_done <= 0;
 		r_row <= 0; r_tag <= 0; r_word <= 0; r_way <= 0; r_bank <= 0;
+		mis_v <= 0; mis_ph <= 0; mis_two_r <= 0; mis_lw0 <= 0; mis_row2 <= 0; mis_tag2 <= 0;
+		mis_word2 <= 0; mis_addr2 <= 0; mis_row1 <= 0; r_be <= 0; mis_be2 <= 0; r_wd <= 0; mis_wd2 <= 0;
+		mis_merge1 <= 0; st_chk2 <= 0;
 		r_beat <= 0; r_issued <= 0; r_addr <= 0; r_size <= 0; r_off <= 0;
 		fill_hold <= 0; ack_r <= 0; rdata_r <= 0;
 	end
@@ -862,6 +982,7 @@ always @(posedge clk) begin
 		ack_r <= 0;
 		cinv_done <= 0;
 		post_err <= 0;
+		st_chk2 <= (MIS != 0) && (cst == C_PASS) && st_chk && mis_v && mis_two_r;
 		if (!wk_pend) wk_chk <= 1'b0;
 		if (ci_inv) ci_inv_pend <= 0;
 
@@ -881,7 +1002,7 @@ always @(posedge clk) begin
 		// (store_inv's !store_inv_lost term), so the single slot cannot
 		// be overwritten.
 		if (snoop_wr && (cst == C_IDLE) && c_req && c_write && !ack_r &&
-		    !store_inv_lost && !st_upd_ok && !dr_active && !need_push) begin
+		    !store_inv_lost && !st_any_upd && !dr_active && !need_push) begin
 			store_inv_lost <= 1;
 			store_inv_set  <= c_addr[9:4];
 		end
@@ -958,11 +1079,15 @@ always @(posedge clk) begin
 							// the one drain slot is taken: the next store
 							// waits, so stores reach memory in order
 						end
-						else if (st_upd_ok) begin
+						else if (st_any_upd) begin
 							// update path (X3.2): no row invalidate.  The
 							// tag row and the four ways' words are read
 							// alongside this acceptance (wr_accept_upd);
 							// the first C_PASS cycle decides the merge.
+							// (MIS) a misaligned store: LW0's piece in the
+							// first C_PASS clock, LW1's in the clock after
+							// (st_chk2 / C_MST2); winv_set2 names LW1's set
+							// for the fallback.
 							r_row <= a_row;
 							r_tag <= a_tag;
 							r_addr <= c_addr;
@@ -971,6 +1096,20 @@ always @(posedge clk) begin
 							r_wdata <= c_wdata;
 							r_fc <= c_fc;
 							r_cb <= (COPYBACK != 0) && c_cb && st_post_ok;
+							if (MIS != 0) begin
+								r_word <= {2'd0, c_addr[3:2]};
+								mis_v <= st_mis_ok;
+								mis_ph <= 1'b0;
+								mis_two_r <= mis_two_c;
+								mis_merge1 <= 1'b0;
+								mis_row1 <= c_addr[9:4];
+								mis_row2 <= {1'b0, mis_addr2_c[9:4]};
+								mis_tag2 <= mis_addr2_c[31:10];
+								mis_word2 <= mis_addr2_c[3:2];
+								{r_be, mis_be2} <= win_be(c_size, c_addr[1:0]);
+								{r_wd, mis_wd2} <= win_data(c_wdata, c_size, c_addr[1:0]);
+								winv_set2 <= mis_addr2_c[9:4];
+							end
 							st_chk <= 1;
 							st_flow <= 1;
 							winv_pend <= 0;
@@ -991,6 +1130,7 @@ always @(posedge clk) begin
 						// acknowledged from ack_r in the next cycle.
 						winv_set2 <= c_addr[9:4] + 6'd1;
 						winv_pend <= write_cross_line;
+						mis_v <= 1'b0;
 						r_addr <= c_addr;
 						r_size <= c_size;
 						r_wdata <= c_wdata;
@@ -1015,6 +1155,7 @@ always @(posedge clk) begin
 						// resident line while it bypasses
 						r_row <= a_row;
 						r_tag <= a_tag;
+						mis_v <= 1'b0;
 						pass_ci_chk <= c_nocache && !c_write;
 						cst <= C_PASS;
 						end
@@ -1028,6 +1169,15 @@ always @(posedge clk) begin
 						r_size <= c_size;
 						r_off <= c_addr[1:0];
 						r_word <= {2'd0, c_addr[3:2]};
+						// (MIS) a misaligned read: LW0's lookup first
+						mis_v <= mis_acc;
+						mis_ph <= 1'b0;
+						mis_two_r <= mis_two_c;
+						mis_row1 <= c_addr[9:4];
+						mis_row2 <= {1'b0, mis_addr2_c[9:4]};
+						mis_tag2 <= mis_addr2_c[31:10];
+						mis_word2 <= mis_addr2_c[3:2];
+						mis_addr2 <= mis_addr2_c;
 						cst <= C_LOOK;
 					end
 				end
@@ -1056,8 +1206,29 @@ always @(posedge clk) begin
 						store_inv_lost <= 1;
 						store_inv_set  <= r_row[5:0];
 					end
+					// (MIS) on to LW1: its row and word were read in this
+					// clock (mis_launch2); the compare in the next clock is
+					// against LW1's tag in LW1's row
+					if (mis_v && mis_two_r) begin
+						mis_ph <= 1'b1;
+						mis_merge1 <= st_merge;
+						r_row <= mis_row2;
+						r_tag <= mis_tag2;
+						r_word <= {2'd0, mis_word2};
+						r_be <= mis_be2;
+						r_wd <= mis_wd2;
+					end
 				end
-				if (st_posted && r_cb && st_merge) begin
+				// (MIS) LW1's merge clock of a synchronous misaligned store
+				// still waiting for its acknowledge: a snooped window drops
+				// LW1's row (winv) instead of trusting the compare
+				if (mis_m2 && st_snooped2 && !st_merge2) winv_pend <= 1;
+				if (st_chk && mis_v && mis_two_r && st_posted && r_cb) begin
+					// (MIS, COPYBACK) the memory write is decided by both
+					// pieces' verdicts: in C_MST2, with LW1's
+					cst <= C_MST2;
+				end
+				else if (st_posted && r_cb && st_merge) begin
 					// (COPYBACK) the store hit a line of a copyback page:
 					// it merged and the line is dirty; memory is not written
 					st_posted <= 0;
@@ -1079,7 +1250,9 @@ always @(posedge clk) begin
 					dr_fc     <= r_fc;
 					st_posted <= 0;
 					st_flow   <= 0;
-					cst <= (winv_pend && (s_stb || store_inv_lost))
+					// (MIS) LW1's merge still to come: C_MST2
+					cst <= (st_chk && mis_v && mis_two_r) ? C_MST2 :
+					       (winv_pend && (s_stb || store_inv_lost))
 					       ? C_WINV : C_IDLE;
 				end
 				else if (m_err) begin
@@ -1090,8 +1263,10 @@ always @(posedge clk) begin
 					if (st_flow) begin
 						// the line may hold a store memory never took:
 						// drop the row, the store restarts and re-merges
+						// (MIS: LW0's row here, LW1's through winv)
 						store_inv_lost <= 1;
-						store_inv_set  <= r_row[5:0];
+						store_inv_set  <= (mis_v && mis_ph) ? mis_row1 : r_row[5:0];
+						if (mis_v && mis_two_r) winv_pend <= 1;
 					end
 					// a posted store cannot restart: the core has already
 					// been acknowledged and has moved on.  Report it as
@@ -1099,14 +1274,21 @@ always @(posedge clk) begin
 					if (st_posted) post_err <= 1;
 					st_posted <= 0;
 					st_flow <= 0;
-					cst <= (winv_pend && (s_stb || store_inv_lost))
+					mis_v <= 0;
+					cst <= ((winv_pend && (s_stb || store_inv_lost)) || (st_flow && mis_v && mis_two_r))
 					       ? C_WINV : C_IDLE;
 				end
 				else if (m_ack) begin
 					st_posted <= 0;
 					st_flow <= 0;
-					cst <= (winv_pend && (s_stb || store_inv_lost))
-					       ? C_WINV : C_IDLE;
+					// (MIS) a synchronous misaligned store acknowledged in
+					// its first C_PASS clock: LW1's merge in C_MST2
+					if (st_chk && mis_v && mis_two_r) cst <= C_MST2;
+					else begin
+						mis_v <= 0;
+						cst <= (winv_pend && (s_stb || store_inv_lost))
+						       ? C_WINV : C_IDLE;
+					end
 				end
 			end
 
@@ -1116,6 +1298,7 @@ always @(posedge clk) begin
 				// Release the hold here too, or a request raised again
 				// before C_IDLE is reached is blocked forever.
 				if (!c_req) err_hold <= 0;
+				mis_v <= 0;   // (MIS) the two-piece request is abandoned whole
 				// a free-running snoop owns port B when it fires; retry
 				// until this row's invalidate is the one that lands
 				if (!snoop_wr) cst <= C_IDLE;
@@ -1126,6 +1309,39 @@ always @(posedge clk) begin
 					winv_pend <= 0;
 					cst <= C_IDLE;
 				end
+			end
+
+			C_MLNCH: begin
+				// (MIS) a misaligned read's second piece: LW1's row and
+				// word are read in this clock (mis_launch2 drives the
+				// addresses from mis_row2 / mis_word2; r_* already name LW1);
+				// the compare is C_LOOK's, as for any lookup
+				cst <= C_LOOK;
+			end
+
+			C_MST2: begin
+				// (MIS) a misaligned store's second piece, LW1: the merge
+				// is st_merge2 in this clock (mis_m2).  A snooped window
+				// drops LW1's row through winv instead.  A copyback store
+				// whose memory write was deferred to this verdict stays in
+				// the cache only if both pieces merged (both lines dirty);
+				// otherwise it drains to memory as before (the merged piece,
+				// if any, is in a line that is dirty or matches memory).
+				if (st_snooped2 && !st_merge2) winv_pend <= 1;
+				if (st_posted) begin
+					st_posted <= 0;
+					st_flow   <= 0;
+					r_cb      <= 0;
+					if (!(mis_merge1 && st_merge2 && r_cb)) begin
+						dr_active <= 1;
+						dr_addr   <= r_addr;
+						dr_wdata  <= r_wdata;
+						dr_size   <= r_size;
+						dr_fc     <= r_fc;
+					end
+				end
+				mis_v <= 0;
+				cst <= (st_snooped2 && !st_merge2) ? C_WINV : C_IDLE;
 			end
 
 			C_SWEEP: begin
@@ -1225,9 +1441,25 @@ always @(posedge clk) begin
 				if (look_hit && ((!look_snooped && !snoop_look_row) || look_dirty)) begin
 					// all four ways were read alongside the tags, so the
 					// hit completes here: two cycles request-to-ack
-					rdata_r <= lw_extract(data_hit, r_size, r_off);
-					ack_r <= 1;
-					cst <= C_IDLE;
+					if ((MIS != 0) && mis_v && mis_two_r && !mis_ph) begin
+						// (MIS) LW0 found: keep it, on to LW1 (its row and
+						// word are read in C_MLNCH; a miss there fills
+						// LW1's line through r_*)
+						mis_lw0 <= data_hit;
+						mis_ph  <= 1'b1;
+						r_row   <= mis_row2;
+						r_tag   <= mis_tag2;
+						r_addr  <= mis_addr2;
+						r_word  <= {2'd0, mis_word2};
+						cst <= C_MLNCH;
+					end
+					else begin
+						rdata_r <= ((MIS != 0) && mis_v) ? lw_extract2(mis_lw0, data_hit, r_size, r_off, mis_two_r)
+						                                 : lw_extract(data_hit, r_size, r_off);
+						ack_r <= 1;
+						mis_v <= 0;
+						cst <= C_IDLE;
+					end
 				end
 				else begin
 					r_way <= rq;   // round-robin victim
@@ -1322,9 +1554,24 @@ always @(posedge clk) begin
 			C_TAGW: begin
 				// the tag row write runs in parallel (tag_we): new tag,
 				// its valid bit, and the advanced round robin
-				rdata_r <= lw_extract(fill_hold, r_size, r_off);
-				ack_r <= 1;
-				cst <= C_IDLE;
+				if ((MIS != 0) && mis_v && mis_two_r && !mis_ph) begin
+					// (MIS) LW0's line filled: keep LW0, on to LW1 (the tag
+					// row write of this clock uses the old r_row, LW0's)
+					mis_lw0 <= fill_hold;
+					mis_ph  <= 1'b1;
+					r_row   <= mis_row2;
+					r_tag   <= mis_tag2;
+					r_addr  <= mis_addr2;
+					r_word  <= {2'd0, mis_word2};
+					cst <= C_MLNCH;
+				end
+				else begin
+					rdata_r <= ((MIS != 0) && mis_v) ? lw_extract2(mis_lw0, fill_hold, r_size, r_off, mis_two_r)
+					                                 : lw_extract(fill_hold, r_size, r_off);
+					ack_r <= 1;
+					mis_v <= 0;
+					cst <= C_IDLE;
+				end
 			end
 
 			default: cst <= C_IDLE;

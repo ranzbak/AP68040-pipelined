@@ -770,7 +770,10 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.FILL_CHANNEL(AP040_FILL_CHANNEL),
 		.IFP(IFP_ON ? 1 : 0),
 		.COPYBACK(AP040_COPYBACK),
-		.DFP_MIS(AP040_DFP_MIS)
+		.DFP_MIS(AP040_DFP_MIS),
+		// one switch: the cache's misaligned slow path (MIS) is what keeps
+		// the lines the fast path (DFP_MIS) serves resident; neither pays alone
+		.MIS(AP040_DFP_MIS)
 	) cache (
 		.clk(clk),
 		.nreset(nreset),
