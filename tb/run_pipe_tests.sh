@@ -225,7 +225,11 @@ fi
 # the wrapper (plan M5): ap040_pipe_tg68k_compat with the reference's cache,
 # MMU (M7) and 16-bit adapter, lib/AP68040's program bench (three wait
 # profiles) on the reference's t_integer.s, t_bitfield_mmu.s and t_mmu.s.  AP040_REF points at lib/AP68040.
-AP040_REF=${AP040_REF:-$(cd ../../MinimigAGA_TC64/lib/AP68040 2>/dev/null && pwd)}
+# (2026-10-05) lib/AP68040 next to this submodule (../../AP68040 from tb/)
+# first, then the old sibling-clone layout.  `|| true`: under set -eu a
+# failed command substitution in this assignment ended the script silently
+# right here -- no compat legs, no final line, yet no FAIL either.
+AP040_REF=${AP040_REF:-$( { cd ../../AP68040 2>/dev/null || cd ../../MinimigAGA_TC64/lib/AP68040 2>/dev/null; } && pwd || true)}
 if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v vasmm68k_mot > /dev/null; then
 	CSRC="$SRC $(ls $RTL/compat/*.v | tr '\n' ' ') $RTL/compat/primitives/dpram.v"
 	iverilog -g2012 $SBDEF -I "$RTL" -I "$RTL/compat" -o "$WORK/tb_compat.vvp" tb_ap040_pipe_compat.v tb_sb_check.v $CSRC > "$WORK/tb_compat.clog" 2>&1 || {
@@ -267,12 +271,12 @@ if [ -n "$AP040_REF" ] && [ -f "$AP040_REF/tb/asm/t_integer.s" ] && command -v v
 	# landing on an instruction past P_START with no read in flight.  The
 	# failure is a WEDGE, so it gets a short phase timeout (it passes in
 	# 180k clocks) instead of the bench's 20M default.
-	for t in t_integer t_cache t_bitfield_mmu t_mmu_m9s t_mmu_pipe t_rmw_wp texc_m9t t_irq_pipe t_mbit_pipe t_trirq_pipe t_ipend_pipe t_irqwedge_pipe t_irqlat_pipe t_icache_pipe t_earlydrop_pipe t_specread_pipe t_dcache_pipe t_sbuf_pipe t_fwd_pipe t_sbmmu_pipe t_cb_pipe t_cbtab_pipe t_cbsnp_pipe $TMR; do
+	for t in t_integer t_cache t_bitfield_mmu t_mmu_m9s t_mmu_pipe t_rmw_wp texc_m9t t_irq_pipe t_mbit_pipe t_trirq_pipe t_ipend_pipe t_irqwedge_pipe t_irqlat_pipe t_icache_pipe t_earlydrop_pipe t_specread_pipe t_dcache_pipe t_sbuf_pipe t_fwd_pipe t_sbmmu_pipe t_cb_pipe t_cbtab_pipe t_cbsnp_pipe t_specexc_pipe $TMR; do
 		if [ "$t" = t_mmu_m9s ] || [ "$t" = t_movem_restart_m9s ] || [ "$t" = texc_m9t ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "$WORK/$t.s"
 		elif [ "$t" = t_mmu_pipe ] || [ "$t" = t_rmw_wp ]; then
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "mmu_asm/$t.s"
-		elif [ "$t" = t_icache_pipe ] || [ "$t" = t_earlydrop_pipe ] || [ "$t" = t_specread_pipe ] || [ "$t" = t_dcache_pipe ] || [ "$t" = t_sbuf_pipe ] || [ "$t" = t_fwd_pipe ] || [ "$t" = t_sbmmu_pipe ] || [ "$t" = t_cb_pipe ] || [ "$t" = t_cbtab_pipe ] || [ "$t" = t_cbsnp_pipe ]; then
+		elif [ "$t" = t_icache_pipe ] || [ "$t" = t_earlydrop_pipe ] || [ "$t" = t_specread_pipe ] || [ "$t" = t_dcache_pipe ] || [ "$t" = t_sbuf_pipe ] || [ "$t" = t_fwd_pipe ] || [ "$t" = t_sbmmu_pipe ] || [ "$t" = t_cb_pipe ] || [ "$t" = t_cbtab_pipe ] || [ "$t" = t_cbsnp_pipe ] || [ "$t" = t_specexc_pipe ]; then
 			# plan M14: the pipelined instruction read path's coherency rules
 			vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o "$WORK/$t.bin" "cache_asm/$t.s"
 		elif [ "$t" = t_irq_pipe ] || [ "$t" = t_mbit_pipe ] || [ "$t" = t_trirq_pipe ] || [ "$t" = t_ipend_pipe ] || [ "$t" = t_irqwedge_pipe ] || [ "$t" = t_irqlat_pipe ]; then
