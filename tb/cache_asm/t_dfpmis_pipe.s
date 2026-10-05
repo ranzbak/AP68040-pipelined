@@ -22,8 +22,10 @@
 ;       5, 6, 7, 9, 10, 11 and words at 1, 3, 5, 7, 9, 11, 13 (served)
 ;   2x  across the line end, both lines resident: longwords at 13, 14, 15,
 ;       the word at 15 (served)
-;   3x  the second line not resident (a decoy line in its set): must fall
-;       back (mem), the first line still served
+;   3x  the second line not resident (a decoy line in its set): the fast
+;       path falls back; the cache (MIS, same switch) serves the resident
+;       line's bytes (P) and fills the other (Q) -- a mixed value, what a
+;       68040 returns -- and without the feature every byte is Q (mem)
 ;   4x  the first line not resident: the same the other way round
 ;   5x  across a 4K page end ($2FFD..$2FFF; the decoy line at $2000 holds
 ;       what a tag that forgot the carry would find): mem
@@ -41,6 +43,14 @@
 ;  10x  translation on (4K pages, logical page 2 -> physical $4000): the
 ;       path serves through the data ATC copy; the page made
 ;       cache-inhibited (CM = 10): mem; the 1K-bank case with translation
+;  12x  (MIS) a misaligned store MERGES into the resident line(s) -- inside a
+;       line, across two lines, an odd word -- instead of clearing the rows;
+;       memory gets the whole store either way (peeked)
+;  13x  (MIS) a misaligned read that misses FILLS its line(s): later aligned
+;       reads are served from them (memory changed behind the cache)
+;  14x  (MIS, copyback builds) a misaligned store to a copyback page: both
+;       pieces hit -> both lines dirty, memory untouched until CPUSHA; the
+;       second piece misses -> memory written whole, the hit line merged
 
 FAILREG	equ	$F100
 DONEREG	equ	$F102
@@ -49,6 +59,11 @@ DMA_D	equ	$F1E6
 DMA_GO	equ	$F1E8
 DMA_NS	equ	$F1EA
 FEAT	equ	$F198
+CBFEAT	equ	$F196
+PEEK_A	equ	$F190
+PEEK_D0	equ	$F192
+PEEK_D1	equ	$F194
+REFR	equ	$6380		; byte copy of R
 X	equ	$2100		; lines L0 $2100 (set $10) and L1 $2110 (set $11)
 DEC0	equ	$2500		; decoy lines in the same sets (pattern R)
 DEC1	equ	$2510
@@ -103,6 +118,58 @@ PL	macro
 	bsr	chkl
 	endm
 
+; (MIS) a probe across two lines of which ONE is resident: the cache serves
+; the resident line's longword and fills the other, so the bytes in the
+; resident line read P and the others Q (what a 68040 does).  Without the
+; feature every byte is Q (the whole read bypassed).  \4 = 0: the first
+; line (X..X+15) is resident, 1: the second.  d2 = the mixed value, d3 = Q.
+BX	macro
+	lsl.l	#8,d2
+	ifne	(((\1)<16)&1)-(\2)
+	move.b	REFP+\1,d2
+	else
+	move.b	REFQ+\1,d2
+	endif
+	endm
+PLX	macro
+	moveq	#0,d2
+	BX	\2+0,\4
+	BX	\2+1,\4
+	BX	\2+2,\4
+	BX	\2+3,\4
+	lea	REFQ+\2,a0
+	move.b	(a0)+,d3
+	lsl.l	#8,d3
+	move.b	(a0)+,d3
+	lsl.l	#8,d3
+	move.b	(a0)+,d3
+	lsl.l	#8,d3
+	move.b	(a0)+,d3
+	moveq	#1,d4
+	move.w	#\3,d7
+	moveq	#7,d1
+.w\@:	dbra	d1,.w\@
+	move.l	\1+\2,d0
+	bsr	chkl
+	endm
+PWX	macro
+	moveq	#0,d2
+	BX	\2+0,\4
+	BX	\2+1,\4
+	lea	REFQ+\2,a0
+	moveq	#0,d3
+	move.b	(a0)+,d3
+	lsl.w	#8,d3
+	move.b	(a0)+,d3
+	moveq	#1,d4
+	move.w	#\3,d7
+	moveq	#0,d0
+	moveq	#7,d1
+.w\@:	dbra	d1,.w\@
+	move.w	\1+\2,d0
+	bsr	chkw
+	endm
+
 ; a word probe, the same
 PW	macro
 	lea	REFP+\2,a0
@@ -146,6 +213,9 @@ start:	move.l	#CACR_ON,d0
 	lea	REFQ,a0
 	move.w	#QBASE,d0
 	bsr	wrpat
+	lea	REFR,a0
+	move.w	#RBASE,d0
+	bsr	wrpat
 
 ; ---- 1x/2x: X cached with P, memory Q
 	lea	X,a0
@@ -188,10 +258,10 @@ start:	move.l	#CACR_ON,d0
 	move.l	DEC1,d0			; the decoy in L1's set
 	lea	X,a0
 	bsr	patchQ
-	PL	X,13,0,41
-	PL	X,14,0,42
-	PL	X,15,0,43
-	PW	X,15,0,44
+	PLX	X,13,41,0
+	PLX	X,14,42,0
+	PLX	X,15,43,0
+	PWX	X,15,44,0
 	PL	X,1,1,45		; (control: the first line is served)
 	PL	X,10,1,46
 
@@ -210,10 +280,10 @@ start:	move.l	#CACR_ON,d0
 	move.l	DEC0,d0			; the decoy in L0's set
 	lea	X,a0
 	bsr	patchQ
-	PL	X,13,0,51
-	PL	X,14,0,52
-	PL	X,15,0,53
-	PW	X,15,0,54
+	PLX	X,13,51,1
+	PLX	X,14,52,1
+	PLX	X,15,53,1
+	PWX	X,15,54,1
 	PL	X,17,1,55		; (control: the second line is served)
 	PW	X,19,1,56
 
@@ -430,6 +500,10 @@ start:	move.l	#CACR_ON,d0
 .f90:	failt	90
 .c90:
 
+
+; ---- 12x/13x (MIS): in grp1213 (code placed at $6A00: the main code must stay below $2000, the data lines)
+	jsr	grp1213
+
 ; ---- 10x: translation on.  4K pages 0-15 identity except logical page 2
 ; -> physical $4000; the table setup of t_dcache_pipe.s.  P is written to
 ; the PHYSICAL homes with translation off; the tables walked, both lines
@@ -501,6 +575,8 @@ start:	move.l	#CACR_ON,d0
 	bsr	patchQ
 	PL	X,2,1,116
 	PL	X,14,1,117
+; ---- 14x (MIS, copyback): in grp14 ($6A00 section)
+	jsr	grp14
 	moveq	#0,d0
 	movec	d0,tc
 	pflusha
@@ -538,6 +614,58 @@ chkw:	tst.w	d4
 	rts
 .m:	cmp.w	d3,d0
 	bne	fail_all
+	rts
+
+; (MIS) helpers.  mk4: d2 = the longword of the 4 bytes at (a0); mk4b: the
+; same into d3; mk2s: d2 = {(a0), 1(a0), 0, 0}; chks: d0 must be d2 with the
+; feature (d5), d3 without; patchX: patchQ with the pattern at (a1)
+mk4:	move.b	(a0)+,d2
+	lsl.l	#8,d2
+	move.b	(a0)+,d2
+	lsl.l	#8,d2
+	move.b	(a0)+,d2
+	lsl.l	#8,d2
+	move.b	(a0)+,d2
+	rts
+mk4b:	move.b	(a0)+,d3
+	lsl.l	#8,d3
+	move.b	(a0)+,d3
+	lsl.l	#8,d3
+	move.b	(a0)+,d3
+	lsl.l	#8,d3
+	move.b	(a0)+,d3
+	rts
+mk2sb:	move.b	(a0)+,d3
+	lsl.l	#8,d3
+	move.b	(a0)+,d3
+	swap	d3
+	clr.w	d3
+	rts
+mk2s:	move.b	(a0)+,d2
+	lsl.l	#8,d2
+	move.b	(a0)+,d2
+	swap	d2
+	clr.w	d2
+	rts
+chks:	tst.w	d5
+	beq.s	.m
+	cmp.l	d2,d0
+	bne	fail_all
+	rts
+.m:	cmp.l	d3,d0
+	bne	fail_all
+	rts
+patchX:	move.w	#1,DMA_NS
+	moveq	#15,d1
+.p:	move.w	(a1)+,DMA_D
+	move.l	a0,d0
+	move.w	d0,DMA_A
+	move.w	#0,DMA_GO
+	moveq	#50,d0
+.w:	dbra	d0,.w
+	addq.l	#2,a0
+	dbra	d1,.p
+	clr.w	DMA_NS
 	rts
 
 ; wrpat: 32 bytes d0, d0+1, ... at (a0) (byte stores: write-through)
@@ -657,3 +785,257 @@ swp7s:	rept	24
 	move.l	X+14,(a1)+
 	endr
 	rts
+
+; ---- MIS groups, placed above the data lines (page 6, identity mapped)
+	org	$6A00
+; peekl: d0 = the longword memory holds at d1.w (the bench's peek registers,
+; $F190/$F192/$F194).  Their line is cacheable here and keeps an old copy:
+; a chipset word write with its snoop to the unused $F19E drops that set's
+; clean lines first, so the peek reads miss and fill afresh.
+peekl:	move.w	d1,PEEK_A
+	move.w	#$F19E,DMA_A
+	clr.w	DMA_D
+	clr.w	DMA_GO
+	moveq	#20,d0
+.w:	dbra	d0,.w
+	move.w	PEEK_D0,d0
+	swap	d0
+	move.w	PEEK_D1,d0
+	rts
+
+grp1213:
+; ---- 12x (MIS): a misaligned STORE merges into the resident lines instead
+; of clearing their rows.  Lines cached with P, memory Q behind the cache,
+; then a misaligned store S; an aligned read of a longword the store touched
+; gives {P.., S..} from the line with the feature (the line stayed resident),
+; {Q.., S..} without it (the row was cleared, the read refilled from memory).
+; Memory (peeked) holds {Q.., S..} either way: the memory transfer of the
+; store is unchanged.  A word store at an odd offset (one longword) too.
+	cpusha	dc
+	lea	X,a0
+	bsr	cacheP
+	lea	X,a0
+	bsr	patchQ
+	move.l	#$11223344,X+2		; inside L0
+	move.l	#$55667788,X+14		; across L0/L1
+	move.w	#$99AA,X+21		; odd word inside one longword
+	moveq	#7,d1
+.w12:	dbra	d1,.w12
+	move.w	#121,d7
+	move.l	X,d0
+	lea	REFP,a0
+	bsr	mk2s			; d2 = {P0,P1,$11,$22}
+	move.w	#$1122,d2
+	lea	REFQ,a0
+	bsr	mk2sb
+	move.w	#$1122,d3
+	bsr	chks
+	move.w	#122,d7
+	move.l	X+4,d0
+	move.l	#$33440000,d2
+	move.w	REFP+6,d2
+	move.l	#$33440000,d3
+	move.w	REFQ+6,d3
+	bsr	chks
+	move.w	#123,d7
+	move.l	X+12,d0
+	lea	REFP+12,a0
+	bsr	mk2s
+	move.w	#$5566,d2
+	lea	REFQ+12,a0
+	bsr	mk2sb
+	move.w	#$5566,d3
+	bsr	chks
+	move.w	#124,d7
+	move.l	X+16,d0
+	move.l	#$77880000,d2
+	move.w	REFP+18,d2
+	move.l	#$77880000,d3
+	move.w	REFQ+18,d3
+	bsr	chks
+	move.w	#125,d7
+	move.l	X+20,d0
+	moveq	#0,d2
+	move.b	REFP+20,d2
+	lsl.l	#8,d2
+	lsl.l	#8,d2
+	move.w	#$99AA,d2
+	lsl.l	#8,d2
+	move.b	REFP+23,d2
+	moveq	#0,d3
+	move.b	REFQ+20,d3
+	lsl.l	#8,d3
+	lsl.l	#8,d3
+	move.w	#$99AA,d3
+	lsl.l	#8,d3
+	move.b	REFQ+23,d3
+	bsr	chks
+	; memory: the whole store went out
+	move.w	#126,d7
+	move.w	#X,d1
+	bsr	peekl
+	lea	REFQ,a0
+	bsr	mk2s
+	move.w	#$1122,d2
+	cmp.l	d2,d0
+	bne	fail_all
+	move.w	#127,d7
+	move.w	#X+12,d1
+	bsr	peekl
+	lea	REFQ+12,a0
+	bsr	mk2s
+	move.w	#$5566,d2
+	cmp.l	d2,d0
+	bne	fail_all
+	move.w	#128,d7
+	move.w	#X+16,d1
+	bsr	peekl
+	move.l	#$77880000,d2
+	move.w	REFQ+18,d2
+	cmp.l	d2,d0
+	bne	fail_all
+
+; ---- 13x (MIS): a misaligned READ that misses fills the line(s).  Lines
+; not resident, memory Q; a misaligned read inside L0 and one across L0/L1
+; (right values), then memory changed to R behind the cache: aligned reads
+; of both lines give Q with the feature (served from the filled lines), R
+; without it (nothing was filled).
+	cpusha	dc
+	lea	X,a0
+	move.w	#QBASE,d0
+	bsr	wrpat
+	move.w	#131,d7
+	move.l	X+2,d0
+	lea	REFQ+2,a0
+	bsr	mk4
+	cmp.l	d2,d0
+	bne	fail_all
+	move.w	#132,d7
+	move.l	X+14,d0
+	lea	REFQ+14,a0
+	bsr	mk4
+	cmp.l	d2,d0
+	bne	fail_all
+	lea	X,a0
+	lea	REFR,a1
+	bsr	patchX
+	move.w	#133,d7
+	move.l	X,d0
+	lea	REFQ,a0
+	bsr	mk4
+	lea	REFR,a0
+	bsr	mk4b
+	bsr	chks
+	move.w	#134,d7
+	move.l	X+16,d0
+	lea	REFQ+16,a0
+	bsr	mk4
+	lea	REFR+16,a0
+	bsr	mk4b
+	bsr	chks
+	move.w	#135,d7
+	move.l	X+8,d0
+	lea	REFQ+8,a0
+	bsr	mk4
+	lea	REFR+8,a0
+	bsr	mk4b
+	bsr	chks
+
+
+	rts
+
+grp14:
+; ---- 14x (MIS, copyback builds only: $F196; translation on, logical page 2
+; made copyback, CM = 01, physical $4000): a misaligned store to a
+; copyback page whose two pieces both hit stays in the cache (memory not
+; written until CPUSHA); one whose second piece misses is written to memory
+; whole, the hitting line merged.
+	tst.w	CBFEAT
+	beq	.no14
+	move.l	#$4000|$21,PAGE+2*4	; copyback
+	pflusha
+	cpusha	dc
+	move.l	X,d0			; (walk; L0 now resident)
+	lea	X,a0
+	bsr	cacheP			; P (copyback: into the resident L0, dirty)
+	cpusha	dc			; memory P
+	lea	X,a0
+	bsr	cacheL			; L0 and L1 resident, clean
+	move.l	#$11223344,X+6		; inside L0 (bytes 6..9)
+	moveq	#20,d1
+.w14:	dbra	d1,.w14
+	move.w	#141,d7
+	move.w	#XM+4,d1
+	bsr	peekl
+	lea	REFP+4,a0
+	bsr	mk4			; d2 = P4..P7 (not written: both pieces hit)
+	move.l	d2,d3
+	move.w	#$1122,d3		; (without the feature: written through)
+	bsr	chks
+	move.w	#142,d7
+	move.l	X+4,d0
+	lea	REFP+4,a0
+	bsr	mk4
+	move.w	#$1122,d2
+	cmp.l	d2,d0
+	bne	fail_all
+	move.w	#143,d7
+	move.l	X+8,d0
+	lea	REFP+8,a0
+	bsr	mk4
+	swap	d2
+	move.w	#$3344,d2
+	swap	d2
+	cmp.l	d2,d0
+	bne	fail_all
+	cpusha	dc			; the dirty line reaches memory
+	move.w	#144,d7
+	move.w	#XM+4,d1
+	bsr	peekl
+	lea	REFP+4,a0
+	bsr	mk4
+	move.w	#$1122,d2
+	cmp.l	d2,d0
+	bne	fail_all
+	; L0 resident only, a store across L0/L1
+	lea	X,a0
+	move.w	#PBASE,d0
+	bsr	wrpat
+	cpusha	dc
+	move.l	X,d0
+	move.l	X+4,d0
+	move.l	X+8,d0
+	move.l	X+12,d0
+	move.l	#$55667788,X+14
+	moveq	#20,d1
+.w14b:	dbra	d1,.w14b
+	move.w	#145,d7
+	move.w	#XM+12,d1
+	bsr	peekl
+	lea	REFP+12,a0
+	bsr	mk4
+	move.w	#$5566,d2
+	cmp.l	d2,d0			; written whole (the second piece missed)
+	bne	fail_all
+	move.w	#146,d7
+	move.w	#XM+16,d1
+	bsr	peekl
+	move.l	#$77880000,d2
+	move.w	REFP+18,d2
+	cmp.l	d2,d0
+	bne	fail_all
+	move.w	#147,d7
+	move.l	X+12,d0
+	lea	REFP+12,a0
+	bsr	mk4
+	move.w	#$5566,d2
+	cmp.l	d2,d0
+	bne	fail_all
+	move.w	#148,d7
+	move.l	X+16,d0
+	move.l	#$77880000,d2
+	move.w	REFP+18,d2
+	cmp.l	d2,d0
+	bne	fail_all
+	cpusha	dc
+.no14:	rts
