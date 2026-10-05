@@ -572,8 +572,8 @@ start:	move.l	#CACR_ON,d0
 	PL	X,2,0,112
 	PL	X,14,0,113
 	PW	X,3,0,114
-	PL	XW,14,0,115
 	PL	XW,9,0,118		; (inside XW's first line, still resident: the second clock's qualification)
+	PL	XW,14,0,115
 	; back to cacheable, the ATC copy follows the new descriptor (the
 	; inhibited reads invalidated the lines they hit: P cached afresh
 	; through the logical address, memory patched again)
