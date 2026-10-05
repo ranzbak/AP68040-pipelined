@@ -91,6 +91,36 @@ always @(posedge `TB.clk) begin
 	// outstanding): if it ever does (an LDX change admitting a second early
 	// read, say), the second lookup is displaced and the path silently
 	// falls back -- fail loudly instead
+	// the slot read is HELD while the path works on its second lookup: it
+	// must not go out on the port in that clock (it would reach the cache's
+	// own misaligned path, which serves the same bytes -- invisible in the
+	// values, a protocol break all the same)
+	if (ce && `CO.d_rd_hold && `CO.u_bcu.go_rd) begin
+		n_viol = n_viol + 1;
+		`TB.errors = `TB.errors + 1;
+		$display("FAIL: dfpmis-check: the slot read issued in a held clock (t=%0d)", t);
+	end
+	// (cache MIS) the two-piece machinery's invariants: mis_v is 0 whenever
+	// the FSM is idle; C_MST2 never forwards a memory acknowledge to the
+	// core; the second piece's launch reads LW1's row and word; the second
+	// piece's merge writes LW1's word
+	if (ce && `CC.cst == 4'd0 && `CC.mis_v) begin
+		n_viol = n_viol + 1; `TB.errors = `TB.errors + 1;
+		$display("FAIL: dfpmis-check: mis_v set in C_IDLE (t=%0d)", t);
+	end
+	if (ce && `CC.cst == 4'd13 && (`CC.pass_active || (`CC.c_ack && !`CC.ack_r))) begin
+		n_viol = n_viol + 1; `TB.errors = `TB.errors + 1;
+		$display("FAIL: dfpmis-check: C_MST2 passes a memory acknowledge to the core (t=%0d)", t);
+	end
+	if (ce && `CC.mis_launch2 && (`CC.tag_ridx != `CC.mis_row2 || !`CC.cd_rd_en ||
+	                              `CC.cd_ridx != {1'b0, `CC.mis_row2[5:0], `CC.mis_word2})) begin
+		n_viol = n_viol + 1; `TB.errors = `TB.errors + 1;
+		$display("FAIL: dfpmis-check: the second piece's launch reads the wrong row/word (t=%0d)", t);
+	end
+	if (ce && `CC.st_merge2 && (`CC.cd_widx != {1'b0, `CC.mis_row2[5:0], `CC.mis_word2} || !`CC.mis_ph)) begin
+		n_viol = n_viol + 1; `TB.errors = `TB.errors + 1;
+		$display("FAIL: dfpmis-check: the second piece merges into the wrong word (t=%0d)", t);
+	end
 	if (ce && `GD.g_two && `TB.dut.dfp_req) begin
 		n_viol = n_viol + 1;
 		`TB.errors = `TB.errors + 1;

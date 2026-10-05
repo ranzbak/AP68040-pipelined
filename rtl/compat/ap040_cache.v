@@ -1234,6 +1234,7 @@ always @(posedge clk) begin
 					st_posted <= 0;
 					st_flow   <= 0;
 					r_cb      <= 0;
+					mis_v     <= 0;   // (MIS) a one-piece store: done
 					cst <= C_IDLE;
 				end
 				else if (st_posted) begin
@@ -1250,7 +1251,9 @@ always @(posedge clk) begin
 					dr_fc     <= r_fc;
 					st_posted <= 0;
 					st_flow   <= 0;
-					// (MIS) LW1's merge still to come: C_MST2
+					// (MIS) LW1's merge still to come: C_MST2; a one-piece
+					// store is done (mis_v is 0 whenever the FSM is idle)
+					mis_v     <= st_chk && mis_v && mis_two_r;
 					cst <= (st_chk && mis_v && mis_two_r) ? C_MST2 :
 					       (winv_pend && (s_stb || store_inv_lost))
 					       ? C_WINV : C_IDLE;
