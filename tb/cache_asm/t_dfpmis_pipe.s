@@ -311,12 +311,17 @@ start:	move.l	#CACR_ON,d0
 	PL	XP,17,1,66
 	PW	XP,19,1,67
 
-; ---- 6x: the 1K bank end, translation off
+; ---- 6x: the 1K bank end, translation off.  The decoy at $2000 (S, set 0
+; like $2400, tag $8 = $2400's tag minus the carry) resident too: a second
+; lookup that forgot the carry would hit it (a miss would just fall back
+; to the cache's slow path, which serves P as well)
 	cpusha	dc
 	lea	XW,a0
 	bsr	cacheP
 	lea	XW,a0
 	bsr	patchQ
+	move.l	XD,d0
+	move.l	XD+4,d0
 	PL	XW,13,1,71
 	PL	XW,14,1,72
 	PL	XW,15,1,73
