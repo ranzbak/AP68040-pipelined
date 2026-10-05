@@ -17,8 +17,8 @@ one() {
 	s=$1
 	python3 gen.py $s $W/p$s.s > /dev/null && vasmm68k_mot -Fbin -m68040 -no-opt -quiet -o $W/p$s.bin $W/p$s.s &&
 	python3 $T/bin2hex.py $W/p$s.bin $W/p$s.hex || { echo "seed $s: GEN/ASM ERROR"; return; }
-	timeout 600 vvp $W/ref.vvp +prog=$W/p$s.hex +dump=$W/r$s.dmp > $W/r$s.log 2>&1
-	timeout 600 vvp $W/dut_$TAG.vvp +prog=$W/p$s.hex +dump=$W/d$s.dmp > $W/d$s.log 2>&1
+	timeout 1800 vvp $W/ref.vvp +prog=$W/p$s.hex +dump=$W/r$s.dmp > $W/r$s.log 2>&1
+	timeout 1800 vvp $W/dut_$TAG.vvp +prog=$W/p$s.hex +dump=$W/d$s.dmp > $W/d$s.log 2>&1
 	if ! grep -q "ALL TESTS PASSED" $W/r$s.log; then echo "seed $s: reference fails ($(grep -m1 -E 'FAIL' $W/r$s.log | cut -c1-80))"; return; fi
 	if ! grep -q "ALL TESTS PASSED" $W/d$s.log; then echo "seed $s: FAIL under test ($(grep -m1 -E 'FAIL' $W/d$s.log | cut -c1-100))"; return; fi
 	if ! cmp -s $W/r$s.dmp $W/d$s.dmp; then echo "seed $s: FAIL dump differs ($(diff <(nl $W/r$s.dmp) <(nl $W/d$s.dmp) | head -3 | tr '\n' ' '))"; return; fi

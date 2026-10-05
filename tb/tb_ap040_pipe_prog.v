@@ -148,6 +148,9 @@ ap040_pipe_core #(
 `ifdef BTFN
 	, .BTFN(`BTFN)
 `endif
+`ifdef DFP_MIS
+	, .DFP_MIS(`DFP_MIS)
+`endif
 `ifdef RAS
 	, .RAS(`RAS)
 `endif

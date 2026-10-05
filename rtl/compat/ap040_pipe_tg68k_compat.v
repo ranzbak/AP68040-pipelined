@@ -75,7 +75,12 @@ module ap040_pipe_tg68k_compat
 	parameter AP040_LDX          = 0,
 	// findings/loadstore/plan.md section 11: forward conditional branches
 	// guessed not taken.  0: every Bcc guessed taken.
-	parameter AP040_BTFN         = 0
+	parameter AP040_BTFN         = 0,
+	// findings/loadstore/plan.md step 3: a misaligned word or longword read
+	// inside one 4K page is served by the data read path as two consecutive
+	// longword lookups of the cache copy (one clock more than an aligned
+	// read).  0: misaligned reads bypass the cache on the port, as before.
+	parameter AP040_DFP_MIS      = 0
 )
 (
 	input         clk,
@@ -356,7 +361,7 @@ localparam IFP_ON = (AP040_IFP != 0) && (AP040_ENABLE_CACHE != 0);
 wire        ifp_req, ifp_s, ifp_hit, ifp_try;
 wire [31:0] ifp_addr, ifp_data;
 // the data read path (plan M14 step 3)
-wire        dfp_req, dfp_hit, dfp_ram;
+wire        dfp_req, dfp_hit, dfp_ram, dfp_two;
 wire [31:0] dfp_addr, dfp_data;
 wire  [1:0] dfp_size;
 wire  [2:0] dfp_fc;
@@ -378,6 +383,7 @@ ap040_pipe_core #(
 	.BTB(AP040_BTB),
 	.LDX(AP040_LDX),
 	.BTFN(AP040_BTFN),
+	.DFP_MIS(AP040_DFP_MIS),
 	.PRECISE(AP040_PRECISE),
 	.MISPLIT(AP040_MISPLIT),
 	.SB_MMU(AP040_SB_MMU)
@@ -449,7 +455,7 @@ ap040_pipe_core #(
 	.ifp_req(ifp_req), .ifp_addr(ifp_addr), .ifp_s(ifp_s),
 	.ifp_try(ifp_try), .ifp_hit(ifp_hit), .ifp_data(ifp_data),
 	.dfp_req(dfp_req), .dfp_addr(dfp_addr), .dfp_size(dfp_size), .dfp_fc(dfp_fc),
-	.dfp_hit(dfp_hit), .dfp_ram(dfp_ram), .dfp_data(dfp_data)
+	.dfp_hit(dfp_hit), .dfp_ram(dfp_ram), .dfp_data(dfp_data), .dfp_two(dfp_two)
 );
 
 // the FPU (M10.1 step 3): lifted from the reference unchanged (02ebcee),
@@ -717,14 +723,28 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 	// gives without its request port (not cache-inhibited), and the physical
 	// address in the data-cacheable window (chip RAM included: the D side is
 	// snooped).  The core adds the store-order rule.
-	reg  dfp_ok_q, dfp_rok_q;
+	// (AP040_DFP_MIS, plan step 3) a misaligned read inside one 4K page
+	// is served too: a word at offset 1 lies in one longword and is
+	// answered as an aligned read (dfp_ok_q); one spanning two longwords
+	// (dfp_mok_q) is looked up twice and answered a clock later -- dfp_two
+	// says so in the first answer clock, with the first longword's verdict,
+	// and dfp_m2c_q carries that verdict and this qualification (the
+	// translation, cacheability and window of the one page both longwords
+	// share) into the second, where dfp_hit is the whole read's answer.
+	reg  dfp_ok_q, dfp_rok_q, dfp_mok_q, dfp_m2c_q;
+	wire dfp_two_c;   // the cache's: the second lookup is launched at this edge
 	always @(posedge clk)
-		if (!nreset) begin dfp_ok_q <= 1'b0; dfp_rok_q <= 1'b0; end
+		if (!nreset) begin dfp_ok_q <= 1'b0; dfp_rok_q <= 1'b0; dfp_mok_q <= 1'b0; dfp_m2c_q <= 1'b0; end
 		else if (ce_core) begin
 			dfp_ok_q <= dfp_req && cacr_out[31] &&
 				((dfp_size == `AP040_SZ_B) ||
 				 (dfp_size == `AP040_SZ_W && !dfp_addr[0]) ||
-				 (dfp_size == `AP040_SZ_L && dfp_addr[1:0] == 2'b00));
+				 (dfp_size == `AP040_SZ_L && dfp_addr[1:0] == 2'b00) ||
+				 ((AP040_DFP_MIS != 0) && dfp_size == `AP040_SZ_W && dfp_addr[1:0] == 2'b01));
+			dfp_mok_q <= (AP040_DFP_MIS != 0) && dfp_req && cacr_out[31] && (dfp_addr[11:2] != 10'h3FF) &&
+				((dfp_size == `AP040_SZ_L && dfp_addr[1:0] != 2'b00) ||
+				 (dfp_size == `AP040_SZ_W && dfp_addr[1:0] == 2'b11));
+			dfp_m2c_q <= dfp_two;
 			// (forwarding) any alignment, but inside one 4K page: the
 			// translation looked up is the whole read's
 			dfp_rok_q <= dfp_req && cacr_out[31] &&
@@ -738,8 +758,9 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		(!dfp_pa[31:24] && (dfp_pa[23] ^ |dfp_pa[22:21]) && w_z2e) ||
 		(dfp_pa[31:21] == 11'd0);
 	wire dfp_thit;
-	assign dfp_hit = IFP_ON && dfp_ok_q && dfp_tok && !dfp_tci &&
-	                 (cache_allow_all || da_win) && dfp_thit;
+	wire da_ok = dfp_tok && !dfp_tci && (cache_allow_all || da_win);
+	assign dfp_hit = IFP_ON && dfp_thit && ((dfp_ok_q && da_ok) || dfp_m2c_q);
+	assign dfp_two = IFP_ON && dfp_mok_q && da_ok && dfp_thit && dfp_two_c;
 	// (forwarding) the same without the tag hit: the location is RAM
 	// (forwarding: the store supplies the bytes, so any alignment)
 	assign dfp_ram = IFP_ON && dfp_rok_q && dfp_tok && !dfp_tci && (cache_allow_all || da_win);
@@ -748,7 +769,11 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.POST_STORES(AP040_POST_STORES),
 		.FILL_CHANNEL(AP040_FILL_CHANNEL),
 		.IFP(IFP_ON ? 1 : 0),
-		.COPYBACK(AP040_COPYBACK)
+		.COPYBACK(AP040_COPYBACK),
+		.DFP_MIS(AP040_DFP_MIS),
+		// one switch: the cache's misaligned slow path (MIS) is what keeps
+		// the lines the fast path (DFP_MIS) serves resident; neither pays alone
+		.MIS(AP040_DFP_MIS)
 	) cache (
 		.clk(clk),
 		.nreset(nreset),
@@ -813,7 +838,8 @@ if (AP040_ENABLE_CACHE != 0) begin : g_cache
 		.dfp_size(dfp_size),
 		.dfp_ptag(dfp_pa[31:10]),
 		.dfp_thit(dfp_thit),
-		.dfp_rdata(dfp_data)
+		.dfp_rdata(dfp_data),
+		.dfp_two(dfp_two_c)
 	);
 end
 else begin : g_nocache
@@ -835,6 +861,7 @@ else begin : g_nocache
 	assign ifp_try   = 1'b0;
 	assign dfp_hit   = 1'b0;
 	assign dfp_ram   = 1'b0;
+	assign dfp_two   = 1'b0;
 	assign dfp_data  = 32'd0;
 	wire unused_dfp = dfp_req | (|dfp_addr) | (|dfp_size) | (|dfp_fc);
 	assign ifp_data  = 32'd0;
