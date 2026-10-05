@@ -47,10 +47,15 @@
 ;       line, across two lines, an odd word -- instead of clearing the rows;
 ;       memory gets the whole store either way (peeked)
 ;  13x  (MIS) a misaligned read that misses FILLS its line(s): later aligned
-;       reads are served from them (memory changed behind the cache)
+;       reads are served from them (memory changed behind the cache); the
+;       second line's fill writes its own set's row (136/137)
 ;  14x  (MIS, copyback builds) a misaligned store to a copyback page: both
 ;       pieces hit -> both lines dirty, memory untouched until CPUSHA; the
-;       second piece misses -> memory written whole, the hit line merged
+;       second piece misses -> memory written whole, the hit line merged;
+;       the first misses -> the same (140, 149)
+;  15x  (MIS) a chipset write with its snoop to the second line of a
+;       line-crossing store, swept 0..47 clocks over a burst of such stores
+;       (translation on; copyback in copyback builds): cache and memory agree
 
 FAILREG	equ	$F100
 DONEREG	equ	$F102
@@ -577,6 +582,8 @@ start:	move.l	#CACR_ON,d0
 	PL	X,14,1,117
 ; ---- 14x (MIS, copyback): in grp14 ($6A00 section)
 	jsr	grp14
+; ---- 15x (MIS): a snoop over a misaligned store's second piece ($6A00 section)
+	jsr	grp15
 	moveq	#0,d0
 	movec	d0,tc
 	pflusha
@@ -940,6 +947,27 @@ grp1213:
 	lea	REFR+8,a0
 	bsr	mk4b
 	bsr	chks
+	; LW1's fill must write LW1's row image back: a decoy (R) in way 0 of
+	; L1's set, L0 in way 0 of its own; the read across fills L1 into way
+	; 1 -- with L0's row image copied there, way 0 would hit X+16 with R
+	cpusha	dc
+	lea	X,a0
+	move.w	#QBASE,d0
+	bsr	wrpat
+	move.l	DEC1,d0			; set $11 way 0: the decoy
+	move.l	X,d0			; set $10 way 0: L0
+	move.w	#136,d7
+	move.l	X+14,d0			; LW0 hits, LW1 fills (way 1)
+	lea	REFQ+14,a0
+	bsr	mk4
+	cmp.l	d2,d0
+	bne	fail_all
+	move.w	#137,d7
+	move.l	X+16,d0
+	lea	REFQ+16,a0
+	bsr	mk4
+	cmp.l	d2,d0
+	bne	fail_all
 
 
 	rts
@@ -1037,5 +1065,126 @@ grp14:
 	move.w	REFP+18,d2
 	cmp.l	d2,d0
 	bne	fail_all
+	; L1 resident only: the first piece misses, the second merges (dirty);
+	; memory is written whole all the same
+	cpusha	dc
+	lea	X,a0
+	move.w	#PBASE,d0
+	bsr	wrpat			; memory P (nothing resident: no allocate)
+	cpusha	dc
+	move.l	X+16,d0
+	move.l	X+20,d0
+	move.l	X+24,d0
+	move.l	X+28,d0
+	move.l	#$55667788,X+14
+	moveq	#20,d1
+.w14c:	dbra	d1,.w14c
+	move.w	#149,d7
+	move.w	#XM+12,d1
+	bsr	peekl
+	lea	REFP+12,a0
+	bsr	mk4
+	move.w	#$5566,d2
+	cmp.l	d2,d0
+	bne	fail_all
+	move.w	#140,d7
+	move.w	#XM+16,d1
+	bsr	peekl
+	move.l	#$77880000,d2
+	move.w	REFP+18,d2
+	cmp.l	d2,d0
+	bne	fail_all
 	cpusha	dc
 .no14:	rts
+
+grp15:
+; ---- 15x (MIS): a chipset write (DMA with its snoop) to the SET of the
+; SECOND line of a line-crossing misaligned store, landing 0..47 clocks
+; after it is armed, across a burst of eight stores to X+14 (L0 bytes
+; 14-15, L1 bytes 16-17).  The DMA word goes to physical DEC1 ($2510, set
+; $11 like L1, a line nothing caches): its snoop drops L1 while it is clean
+; and spares it once a store made it dirty (copyback) -- a DMA write INTO a
+; dirty copyback line is outside this design (only the CPU writes the
+; copyback window).  Translation on, logical page 2 -> physical $4000;
+; copyback (CM = 01) in copyback builds, write-through otherwise.  Whatever
+; the order, afterwards the cache and memory agree on the last store's
+; bytes, read through the cache and, after CPUSHA, peeked in memory.  A merge of the
+; second piece into a line the snoop just dropped -- a dirty bit on an
+; invalid way (copyback) -- loses the store's L1 bytes (st_snooped2 and the
+; merge clock's own snoop check, ap040_cache.v st_merge2).
+	move.l	#$4000|1,PAGE+2*4	; write-through
+	tst.w	CBFEAT
+	beq.s	.wt15
+	move.l	#$4000|$21,PAGE+2*4	; copyback
+.wt15:	pflusha
+	cpusha	dc
+	move.l	X,d0			; (walk)
+	moveq	#0,d4			; the delay
+.l15:	move.l	#$11223344,X+12
+	move.l	#$55667788,X+16
+	move.l	#$99AABBCC,X+28
+	cpusha	dc			; memory has them, nothing resident
+	move.l	X+12,d0			; L0 and L1 resident, clean
+	move.l	X+16,d0
+	move.l	#$A1B2C3D4,d6
+	move.w	#DEC1,DMA_A
+	move.w	#$DDEE,DMA_D
+	move.w	d4,DMA_GO
+	rept	8
+	move.l	d6,X+14
+	add.l	#$01010101,d6
+	endr
+	sub.l	#$01010101,d6		; the last value stored
+	moveq	#30,d1
+.w15:	dbra	d1,.w15
+	move.w	#151,d7
+	move.l	X+12,d0			; {$11, $22, last[31:16]}
+	move.l	d6,d2
+	swap	d2
+	and.l	#$FFFF,d2
+	or.l	#$11220000,d2
+	cmp.l	d2,d0
+	bne	fail_all
+	move.w	#152,d7
+	move.l	X+16,d0			; {last[15:0], $77, $88}
+	move.l	d6,d2
+	swap	d2
+	clr.w	d2
+	or.w	#$7788,d2
+	cmp.l	d2,d0
+	bne	fail_all
+	move.w	#153,d7
+	move.l	X+28,d0
+	cmp.l	#$99AABBCC,d0
+	bne	fail_all
+	cpusha	dc			; dirty lines (copyback) reach memory
+	move.w	#154,d7
+	move.w	#XM+12,d1
+	bsr	peekl
+	move.l	d6,d2
+	swap	d2
+	and.l	#$FFFF,d2
+	or.l	#$11220000,d2
+	cmp.l	d2,d0
+	bne	fail_all
+	move.w	#155,d7
+	move.w	#XM+16,d1
+	bsr	peekl
+	move.l	d6,d2
+	swap	d2
+	clr.w	d2
+	or.w	#$7788,d2
+	cmp.l	d2,d0
+	bne	fail_all
+	move.w	#156,d7
+	move.w	#XM+28,d1
+	bsr	peekl
+	cmp.l	#$99AABBCC,d0
+	bne	fail_all
+	addq.l	#1,d4
+	cmp.l	#48,d4
+	bne	.l15
+	move.l	#$4000|1,PAGE+2*4
+	pflusha
+	cpusha	dc
+	rts
