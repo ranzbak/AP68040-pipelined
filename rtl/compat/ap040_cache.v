@@ -730,7 +730,18 @@ wire [31:0] data_hit = (hit_way == 2'd0) ? data_q0 :
 // hit on a dirty way is trusted even in a snooped window: the store must
 // merge there, or the dirty line would later overwrite it in memory.
 wire hit_dirty = (COPYBACK != 0) && !r_row[6] && db[r_row[5:0]][hit_way];
-wire st_merge = (cst == C_PASS) && st_chk && look_hit && (!st_snooped || hit_dirty) && !m_err;
+// A snoop landing IN the merge clock (snoop_st_row_pass) refuses the merge
+// too, as C_LOOK's snoop_look_row refuses a hit: st_snooped only records it
+// for the clock after.  Without this a copyback store merged into a clean
+// way and set its dirty bit in the same edge the snoop cleared the way's
+// valid bit (vb_keep reads the dirty bits before the edge): the line went
+// invalid-but-dirty, the next read refilled the stale line from memory
+// into another way, and the store was lost (t_cbsnp_pipe.s).  Refused, the
+// store drains to memory as a write-through and the snoop drops the clean
+// line -- what the snoop does to every clean way of its set.  A hit on a
+// dirty way is still trusted: a snoop spares it.
+wire st_merge = (cst == C_PASS) && st_chk && look_hit &&
+                ((!st_snooped && !snoop_st_row_pass) || hit_dirty) && !m_err;
 
 // the data-array read runs with the acceptance of a cacheable read AND of
 // an update-path store (a store carries c_instr = 0, so its row is the
