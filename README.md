@@ -24,7 +24,8 @@ the pipelined branch completed, verified and brought up on hardware.
 - Hardware (QMTech XC7A100T, MinimigAGA_TC64): boots Kickstart 3.1.4 to
   Workbench, and cputest `ct040_01` passes. The wider board test campaign is
   still in progress.
-- Simulation: 210/210 bench legs (`tb/run_pipe_tests.sh`). WinUAE cputest
+- Simulation: `tb/run_pipe_tests.sh` passes all legs with the board's switches
+  (324, or 328 with `PIPE_COPYBACK=1`; October 2026). WinUAE cputest
   Basic 670/670 plus six further groups. Kickstart 3.1.4 boots in the
   differential bench against the original core.
 - Split instruction/data read paths (plan M14): a cache hit is answered the
@@ -50,12 +51,17 @@ against an A4000/040 at 25 MHz.
 | before the store buffer and branch work | 21,721 | 0.66 |
 | + store buffer, store-to-load forwarding, return-address stack | 22,185 | 0.67 |
 | + address-precise fast reads | 28,938 | 0.88 |
-| **+ stores posted with the MMU on (current)** | **33,287** | **1.01** |
+| + stores posted with the MMU on | 33,287 | 1.01 |
+| + forward branches guessed not taken (release 0.1) | 36,256 | 1.10 |
+| + late-operand load dispatch | 37,316 | 1.13 |
+| + copyback data cache (DDR3 fast RAM set to CopyBack) | 41,656 | 1.26 |
+| **+ misaligned accesses served from the data cache (current)** | **47,413** | **1.44** |
 
-That is about 880 Dhrystones/s per MHz (0.50 DMIPS/MHz), against about 1,320
-for a real 68040: the core matches a 25 MHz 68040 by running at 38 MHz.
-The real chip is ahead per clock mainly because it runs fast RAM in copyback
-mode, while this data cache is write-through.
+That is about 1,250 Dhrystones/s per MHz (0.71 DMIPS/MHz), against about
+1,320 for a real 68040: within about 5 % of the real chip per clock, and
+ahead of a 25 MHz 68040 by running at 38 MHz. The last two rows need the
+fast RAM marked CopyBack in the MMU configuration (MMULib); in
+write-through the copyback hardware stores through like the earlier rows.
 
 The features behind the table are parameters of `ap040_pipe_tg68k_compat`,
 all 0 (off) by default:
@@ -67,12 +73,18 @@ all 0 (off) by default:
 | `AP040_RAS` | an 8-entry return-address stack predicts RTS in ID | 1 |
 | `AP040_PRECISE` | fast reads compare addresses with the stores in flight, instead of waiting for all of them | 1 |
 | `AP040_SB_MMU` | with translation on, stores to a page a synchronous store proved writable are posted too | 1 |
+| `AP040_BTFN` | ID guesses a forward conditional branch not taken | 1 |
+| `AP040_LDX` | an eligible load goes to EX in the clock it is looked up | 1 |
+| `AP040_COPYBACK` | the data cache keeps stores to CM = 01 pages (copyback), DDR3 board only | 1 |
+| `AP040_DFP_MIS` | a misaligned access inside a 4K page is served from (or fills, or merges into) the data cache | 1 |
+| `AP040_BTB` | IF's branch target buffer | 0 |
 | `AP040_MISPLIT` | splits misaligned transfers into aligned pieces | 0 |
 
 With the MMU on, `AP040_SB_MMU` posts only into the DDR3 board's window
 (`mem_postok` in `ap040_pipe_tg68k_compat.v`): posting into the SDRAM as well
 corrupted data on the board while every simulation passed, and that cause is
-still open. `AP040_MISPLIT` gains nothing on the board and is not used.
+still open. `AP040_MISPLIT` gains nothing on the board and is not used;
+`AP040_DFP_MIS` replaces it.
 
 ## What is here
 
