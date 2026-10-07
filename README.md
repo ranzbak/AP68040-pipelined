@@ -55,13 +55,17 @@ against an A4000/040 at 25 MHz.
 | + forward branches guessed not taken (release 0.1) | 36,256 | 1.10 |
 | + late-operand load dispatch | 37,316 | 1.13 |
 | + copyback data cache (DDR3 fast RAM set to CopyBack) | 41,656 | 1.26 |
-| **+ misaligned accesses served from the data cache (current)** | **47,413** | **1.44** |
+| **+ misaligned accesses served from the data cache (current main)** | **47,413** | **1.44** |
+| + write-allocate on a copyback store miss (prototype, in development) | 49,444 | 1.50 |
 
-That is about 1,250 Dhrystones/s per MHz (0.71 DMIPS/MHz), against about
-1,320 for a real 68040: within about 5 % of the real chip per clock, and
-ahead of a 25 MHz 68040 by running at 38 MHz. The last two rows need the
-fast RAM marked CopyBack in the MMU configuration (MMULib); in
-write-through the copyback hardware stores through like the earlier rows.
+With write-allocate that is about 1,310 Dhrystones/s per MHz (0.74
+DMIPS/MHz), against about 1,320 for a real 68040: about 99 % of the real
+chip per clock, and 1.5x a 25 MHz 68040 by running at 38 MHz (the current
+main, 47,413: about 1,250 per MHz). The last three rows need the fast RAM
+marked CopyBack in the MMU configuration (MMULib); in write-through the
+copyback hardware stores through like the earlier rows. The write-allocate
+row was measured on a prototype board image; the parameter (AP040_WALLOC)
+lands on main once its tests are complete.
 
 The features behind the table are parameters of `ap040_pipe_tg68k_compat`,
 all 0 (off) by default:
